@@ -10,7 +10,8 @@ spec:
         app: assisted-service
     spec:
       containers:
-      - env:
-        - name: DEPLOY_TARGET
-          value: k8s
-        name: assisted-service
+        volumeMounts:
+        - mountPath: /data
+          name: s3-filesystem
+      volumes:
+      - name: s3-filesystem

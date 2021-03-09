@@ -359,8 +359,6 @@ clean:
 	-rm config/rbac/ocp_role.yaml
 	-rm config/rbac/kube_api_roles.yaml
 	-rm config/rbac/controller_roles.yaml
-	-rm config/assisted-service/scality-secret.yaml
-	-rm config/assisted-service/scality-public-secret.yaml
 	-rm config/assisted-service/postgres-deployment.yaml
 	-rm config/assisted-service/assisted-installer-sso.yaml
 	-rm config/assisted-service/assisted-service-configmap.yaml
@@ -404,8 +402,6 @@ operator-bundle: create-ocp-manifests
 	cp ./build/assisted-installer/ocp_role.yaml config/rbac
 	cp ./build/assisted-installer/kube_api_roles.yaml config/rbac
 	cp ./build/assisted-installer/controller_roles.yaml config/rbac
-	cp ./build/assisted-installer/scality-secret.yaml config/assisted-service
-	cp ./build/assisted-installer/scality-public-secret.yaml config/assisted-service
 	cp ./build/assisted-installer/postgres-deployment.yaml config/assisted-service
 	cp ./build/assisted-installer/assisted-installer-sso.yaml config/assisted-service
 	cp ./build/assisted-installer/assisted-service-configmap.yaml config/assisted-service
