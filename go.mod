@@ -6,7 +6,7 @@ require (
 	github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d
 	github.com/alessio/shellescape v1.4.1
 	github.com/asaskevich/govalidator v0.0.0-20210307081110-f21760c49a8d
-	github.com/aws/aws-sdk-go v1.34.28
+	github.com/aws/aws-sdk-go v1.43.21
 	github.com/buger/jsonparser v1.1.1
 	github.com/cavaliercoder/go-cpio v0.0.0-20180626203310-925f9528c45e
 	github.com/containers/image/v5 v5.7.0
@@ -53,7 +53,7 @@ require (
 	github.com/ory/dockertest/v3 v3.8.1
 	github.com/ovirt/go-ovirt-client v0.7.1
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/pelletier/go-toml v1.9.3
+	github.com/pelletier/go-toml v1.9.4
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.55.0
 	github.com/prometheus/client_golang v1.12.1
