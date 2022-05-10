@@ -32,6 +32,9 @@ var pathTreeData = `{
             }
           }
         },
+        "cloud_resources": {
+          "-": null
+        },
         "cluster_authorizations": null,
         "cluster_registrations": null,
         "current_access": {
@@ -51,7 +54,6 @@ var pathTreeData = `{
               "-": null
             },
             "quota_cost": null,
-            "quota_summary": null,
             "resource_quota": {
               "-": null
             },
@@ -82,9 +84,6 @@ var pathTreeData = `{
         "sku_rules": {
           "-": null
         },
-        "skus": {
-          "-": null
-        },
         "subscriptions": {
           "-": {
             "labels": {
@@ -92,6 +91,9 @@ var pathTreeData = `{
             },
             "notify": null,
             "reserved_resources": {
+              "-": null
+            },
+            "role_bindings": {
               "-": null
             }
           },
@@ -122,13 +124,18 @@ var pathTreeData = `{
     "clusters_mgmt": {
       "v1": {
         "addons": {
-          "-": null
+          "-": {
+            "versions": {
+              "-": null
+            }
+          }
         },
         "aws_infrastructure_access_roles": {
           "-": null
         },
         "aws_inquiries": {
           "regions": null,
+          "sts_policies": null,
           "vpcs": null
         },
         "cloud_providers": {
@@ -160,6 +167,9 @@ var pathTreeData = `{
                 "-": null
               }
             },
+            "gate_agreements": {
+              "-": null
+            },
             "groups": {
               "-": {
                 "users": {
@@ -169,7 +179,12 @@ var pathTreeData = `{
             },
             "hibernate": null,
             "identity_providers": {
-              "-": null
+              "-": {
+                "htpasswd_users": {
+                  "-": null,
+                  "import": null
+                }
+              }
             },
             "ingresses": {
               "-": null
@@ -198,6 +213,9 @@ var pathTreeData = `{
             },
             "resume": null,
             "status": null,
+            "sts_operator_roles": {
+              "-": null
+            },
             "upgrade_policies": {
               "-": {
                 "state": null
@@ -205,6 +223,7 @@ var pathTreeData = `{
             }
           }
         },
+        "environment": null,
         "events": null,
         "flavours": {
           "-": null
@@ -223,6 +242,9 @@ var pathTreeData = `{
           "-": null
         },
         "provision_shards": {
+          "-": null
+        },
+        "version_gates": {
           "-": null
         },
         "versions": {
@@ -249,6 +271,100 @@ var pathTreeData = `{
     "service_logs": {
       "v1": {
         "cluster_logs": {
+          "-": null
+        },
+        "clusters": {
+          "-": {
+            "cluster_logs": null
+          }
+        }
+      }
+    },
+    "service_mgmt": {
+      "v1": {
+        "services": {
+          "-": null
+        }
+      }
+    },
+    "status_board": {
+      "v1": {
+        "application_dependencies": {
+          "-": null
+        },
+        "applications": {
+          "-": {
+            "services": {
+              "-": {
+                "statuses": {
+                  "-": null
+                }
+              }
+            }
+          }
+        },
+        "errors": {
+          "-": null
+        },
+        "peer_dependencies": {
+          "-": null
+        },
+        "products": {
+          "-": {
+            "applications": {
+              "-": {
+                "services": {
+                  "-": {
+                    "statuses": {
+                      "-": null
+                    }
+                  }
+                }
+              }
+            },
+            "updates": {
+              "-": null
+            }
+          }
+        },
+        "services": {
+          "-": {
+            "statuses": {
+              "-": null
+            }
+          }
+        },
+        "status_updates": {
+          "-": null
+        },
+        "statuses": {
+          "-": null
+        }
+      }
+    },
+    "web_rca": {
+      "v1": {
+        "errors": {
+          "-": null
+        },
+        "incidents": {
+          "-": {
+            "events": {
+              "-": {
+                "attachments": {
+                  "-": null
+                }
+              }
+            },
+            "follow_ups": {
+              "-": null
+            },
+            "notifications": {
+              "-": null
+            }
+          }
+        },
+        "users": {
           "-": null
         }
       }
