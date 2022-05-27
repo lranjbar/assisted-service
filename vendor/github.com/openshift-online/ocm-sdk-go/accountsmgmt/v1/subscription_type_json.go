@@ -21,7 +21,6 @@ package v1 // github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1
 
 import (
 	"io"
-	"net/http"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -32,7 +31,10 @@ import (
 func MarshalSubscription(object *Subscription, writer io.Writer) error {
 	stream := helpers.NewStream(writer)
 	writeSubscription(object, stream)
-	stream.Flush()
+	err := stream.Flush()
+	if err != nil {
+		return err
+	}
 	return stream.Error
 }
 
@@ -359,7 +361,6 @@ func writeSubscription(object *Subscription, stream *jsoniter.Stream) {
 		}
 		stream.WriteObjectField("usage")
 		stream.WriteString(object.usage)
-		count++
 	}
 	stream.WriteObjectEnd()
 }
@@ -367,9 +368,6 @@ func writeSubscription(object *Subscription, stream *jsoniter.Stream) {
 // UnmarshalSubscription reads a value of the 'subscription' type from the given
 // source, which can be an slice of bytes, a string or a reader.
 func UnmarshalSubscription(source interface{}) (object *Subscription, err error) {
-	if source == http.NoBody {
-		return
-	}
 	iterator, err := helpers.NewIterator(source)
 	if err != nil {
 		return
