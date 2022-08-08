@@ -3565,6 +3565,9 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: fsType
       type:
         scalar: string
+    - name: nodeExpandSecretRef
+      type:
+        namedType: io.k8s.api.core.v1.SecretReference
     - name: nodePublishSecretRef
       type:
         namedType: io.k8s.api.core.v1.SecretReference
@@ -5430,6 +5433,7 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: claimRef
       type:
         namedType: io.k8s.api.core.v1.ObjectReference
+        elementRelationship: separable
     - name: csi
       type:
         namedType: io.k8s.api.core.v1.CSIPersistentVolumeSource
@@ -5757,6 +5761,9 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         scalar: boolean
     - name: hostPID
+      type:
+        scalar: boolean
+    - name: hostUsers
       type:
         scalar: boolean
     - name: hostname
@@ -6855,6 +6862,12 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: labelSelector
       type:
         namedType: io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelector
+    - name: matchLabelKeys
+      type:
+        list:
+          elementType:
+            scalar: string
+          elementRelationship: atomic
     - name: maxSkew
       type:
         scalar: numeric
@@ -6862,6 +6875,12 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: minDomains
       type:
         scalar: numeric
+    - name: nodeAffinityPolicy
+      type:
+        scalar: string
+    - name: nodeTaintsPolicy
+      type:
+        scalar: string
     - name: topologyKey
       type:
         scalar: string
@@ -10824,6 +10843,9 @@ var schemaYAML = typed.YAMLObject(`types:
     - name: requiresRepublish
       type:
         scalar: boolean
+    - name: seLinuxMount
+      type:
+        scalar: boolean
     - name: storageCapacity
       type:
         scalar: boolean
@@ -11174,6 +11196,9 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         scalar: boolean
     - name: requiresRepublish
+      type:
+        scalar: boolean
+    - name: seLinuxMount
       type:
         scalar: boolean
     - name: storageCapacity
@@ -11530,9 +11555,6 @@ var schemaYAML = typed.YAMLObject(`types:
         map:
           elementType:
             scalar: string
-    - name: clusterName
-      type:
-        scalar: string
     - name: creationTimestamp
       type:
         namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
