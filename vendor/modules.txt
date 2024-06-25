@@ -119,6 +119,9 @@ github.com/chai2010/gettext-go/po
 # github.com/containerd/continuity v0.3.0
 ## explicit; go 1.17
 github.com/containerd/continuity/pathdriver
+# github.com/containerd/log v0.1.0
+## explicit; go 1.20
+github.com/containerd/log
 # github.com/containers/image/v5 v5.21.1
 ## explicit; go 1.16
 github.com/containers/image/v5/docker/reference
@@ -519,7 +522,7 @@ github.com/mitchellh/go-wordwrap
 # github.com/mitchellh/mapstructure v1.5.0
 ## explicit; go 1.14
 github.com/mitchellh/mapstructure
-# github.com/moby/moby v25.0.0+incompatible
+# github.com/moby/moby v27.0.1+incompatible
 ## explicit
 github.com/moby/moby/pkg/ioutils
 # github.com/moby/spdystream v0.2.0
