@@ -8,11 +8,15 @@ import (
 	"github.com/go-openapi/swag"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/host"
+	"github.com/openshift/assisted-service/internal/testing"
 	"github.com/openshift/assisted-service/models"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 )
 
 var _ = Describe("isNetworksSameAddressFamilies", func() {
@@ -31,12 +35,12 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationPending when cluster and service network are unset and required", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 		}}
 
 		status, message := validator.isNetworksSameAddressFamilies(preprocessContext)
@@ -46,12 +50,12 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationPending when machine, cluster and service network are unset and required", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeNone
+		controlPlaneCount := int64(1)
 
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 		}}
 
 		status, message := validator.isNetworksSameAddressFamilies(preprocessContext)
@@ -61,7 +65,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationError when service networks contain an invalid CIDR", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -76,7 +80,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 		}}
@@ -88,7 +92,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationError when clusterNetworks contain an invalid CIDR", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -103,7 +107,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 		}}
@@ -115,7 +119,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationError cluster and service network address families match but there is an invalid CIDR in machine network", func() {
 		userManagedNetworking := false
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -135,7 +139,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 			MachineNetworks:       machineNetworks,
@@ -148,7 +152,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationFailure when the address families of service and cluster networks do not match", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -161,7 +165,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 		}}
@@ -173,7 +177,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationFailure cluster and service network address families match but mismatch for machine network families", func() {
 		userManagedNetworking := false
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -192,7 +196,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 			MachineNetworks:       machineNetworks,
@@ -205,7 +209,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationSuccess when machine, service and cluster network families match and they are all required", func() {
 		userManagedNetworking := false
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -224,7 +228,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 			MachineNetworks:       machineNetworks,
@@ -237,7 +241,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 
 	It("Returns ValidationSuccess when service and cluster network families match and machine network is not required", func() {
 		userManagedNetworking := true
-		highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+		controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 
 		serviceNetworks := []*models.ServiceNetwork{
 			{Cidr: "192.168.20.1/24", ClusterID: clusterID},
@@ -249,7 +253,7 @@ var _ = Describe("isNetworksSameAddressFamilies", func() {
 		preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                    &clusterID,
 			UserManagedNetworking: &userManagedNetworking,
-			HighAvailabilityMode:  &highAvailabilityMode,
+			ControlPlaneCount:     controlPlaneCount,
 			ServiceNetworks:       serviceNetworks,
 			ClusterNetworks:       clusterNetworks,
 		}}
@@ -329,8 +333,30 @@ var _ = Describe("areVipsValid", func() {
 	ingressContext := loopContext{name: "Ingress", function: validator.areIngressVipsValid}
 	for _, lc := range []loopContext{apiContext, ingressContext} {
 		lcontext := lc
-		Context(fmt.Sprintf("%s vips validation", lcontext.name), func() {
-			It("Vips undefined", func() {
+		Context(fmt.Sprintf("- %s vips validation:", lcontext.name), func() {
+			It("user-managed networking", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:                    &clusterID,
+					UserManagedNetworking: swag.Bool(true),
+				}}
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(Equal(fmt.Sprintf("%s virtual IPs are not required: User Managed Networking", lcontext.name)))
+			})
+
+			It("SNO", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:                &clusterID,
+					ControlPlaneCount: 1,
+				}}
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(Equal(fmt.Sprintf("%s virtual IPs are not required: SNO", lcontext.name)))
+			})
+
+			It("vips undefined", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID: &clusterID,
 				}}
@@ -339,6 +365,7 @@ var _ = Describe("areVipsValid", func() {
 				Expect(status).Should(Equal(ValidationPending))
 				Expect(message).Should(Equal(fmt.Sprintf("%s virtual IPs are undefined.", lcontext.name)))
 			})
+
 			It("vips defined - no hosts", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID:          &clusterID,
@@ -350,12 +377,43 @@ var _ = Describe("areVipsValid", func() {
 				Expect(status).Should(Equal(ValidationPending))
 				Expect(message).Should(Equal("Hosts have not been discovered yet"))
 			})
-			It("vips defined - with hosts", func() {
+
+			It("cluster-managed load balancer - vip outside machine network", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: []*models.MachineNetwork{{Cidr: "1.2.4.0/24"}},
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
+					Hosts:           hosts,
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationFailure))
+				Expect(message).Should(ContainSubstring("does not belong to machine-network-cidr"))
+			})
+
+			It("cluster-managed load balancer - vip is the broadcast address in machine network", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}},
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.255"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.255"}},
+					Hosts:           hosts,
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationFailure))
+				Expect(message).Should(ContainSubstring("is the broadcast address of machine-network-cidr"))
+			})
+
+			It("cluster-managed load balancer - no free addresses", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID:              &clusterID,
 					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
-					APIVips:         clearApiVipsVerfication(common.TestDualStackNetworking.APIVips),
-					IngressVips:     clearIngressVIpsVerification(common.TestDualStackNetworking.IngressVips),
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
 					Hosts:           hosts,
 				}}
 				preprocessContext.hasHostsWithInventories = true
@@ -364,7 +422,183 @@ var _ = Describe("areVipsValid", func() {
 				Expect(status).Should(Equal(ValidationFailure))
 				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips <1.2.3.[56]> are not verified yet", strings.ToLower(lcontext.name))))
 			})
-			It("ipv4 vips verified", func() {
+
+			It("cluster-managed load balancer - vips in the free addresses list", func() {
+				hosts = []*models.Host{
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+				}
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
+					Hosts:           hosts,
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips 1.2.3.[56] belongs to the Machine CIDR and is not in use.", strings.ToLower(lcontext.name))))
+			})
+
+			It("cluster-managed load balancer - verification succeeded already", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5", Verification: models.NewVipVerification(models.VipVerificationSucceeded)}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6", Verification: models.NewVipVerification(models.VipVerificationSucceeded)}},
+					Hosts:           hosts,
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips 1.2.3.[56] belongs to the Machine CIDR and is not in use.", strings.ToLower(lcontext.name))))
+			})
+
+			It("cluster-managed load balancer - verification failed already", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5", Verification: models.NewVipVerification(models.VipVerificationFailed)}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6", Verification: models.NewVipVerification(models.VipVerificationFailed)}},
+					Hosts:           hosts,
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationFailure))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips <1.2.3.[56]> is already in use in cidr 1.2.3.0/24", strings.ToLower(lcontext.name))))
+			})
+
+			It("user-managed load balancer - vip outside machine network", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: []*models.MachineNetwork{{Cidr: "1.2.4.0/24"}},
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationFailure))
+				Expect(message).Should(ContainSubstring("does not belong to machine-network-cidr"))
+			})
+
+			It("user-managed load balancer - vip is the broadcast address in machine network", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}},
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.255"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.255"}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationFailure))
+				Expect(message).Should(ContainSubstring("is the broadcast address of machine-network-cidr"))
+			})
+
+			It("user-managed load balancer - no free addresses", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vip 1.2.3.[56] is valid", strings.ToLower(lcontext.name))))
+			})
+
+			It("user-managed load balancer - vips in the free addresses list", func() {
+				hosts = []*models.Host{
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+					{
+						FreeAddresses: makeFreeNetworksAddressesStr(makeFreeAddresses(
+							"1.2.3.0/24", "1.2.3.5", "1.2.3.6",
+						)),
+					},
+				}
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5"}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6"}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vip 1.2.3.[56] is valid", strings.ToLower(lcontext.name))))
+			})
+
+			It("user-managed load balancer - verification succeeded already", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5", Verification: models.NewVipVerification(models.VipVerificationSucceeded)}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6", Verification: models.NewVipVerification(models.VipVerificationSucceeded)}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vip 1.2.3.[56] is valid", strings.ToLower(lcontext.name))))
+			})
+
+			It("user-managed load balancer - verification failed already", func() {
+				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
+					APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "1.2.3.5", Verification: models.NewVipVerification(models.VipVerificationFailed)}},
+					IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "1.2.3.6", Verification: models.NewVipVerification(models.VipVerificationFailed)}},
+					Hosts:           hosts,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				}}
+				preprocessContext.hasHostsWithInventories = true
+
+				status, message := lcontext.function(preprocessContext)
+				Expect(status).Should(Equal(ValidationSuccess))
+				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vip 1.2.3.[56] is valid", strings.ToLower(lcontext.name))))
+			})
+
+			It("ipv6 vips verified", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID:              &clusterID,
 					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
@@ -378,20 +612,7 @@ var _ = Describe("areVipsValid", func() {
 				Expect(status).Should(Equal(ValidationFailure))
 				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips <1001:db8::6[45]> are not verified yet", strings.ToLower(lcontext.name))))
 			})
-			It("ipv4 vips verified", func() {
-				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
-					ID:              &clusterID,
-					MachineNetworks: common.TestDualStackNetworking.MachineNetworks,
-					APIVips:         append(common.TestIPv4Networking.APIVips, clearApiVipsVerfication(common.TestIPv6Networking.APIVips)...),
-					IngressVips:     append(common.TestIPv4Networking.IngressVips, clearIngressVIpsVerification(common.TestIPv6Networking.IngressVips)...),
-					Hosts:           hosts,
-				}}
-				preprocessContext.hasHostsWithInventories = true
 
-				status, message := lcontext.function(preprocessContext)
-				Expect(status).Should(Equal(ValidationFailure))
-				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips <1001:db8::6[45]> are not verified yet", strings.ToLower(lcontext.name))))
-			})
 			It("all successful", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID:              &clusterID,
@@ -406,6 +627,7 @@ var _ = Describe("areVipsValid", func() {
 				Expect(status).Should(Equal(ValidationSuccess))
 				Expect(message).Should(MatchRegexp(fmt.Sprintf("%s vips 1.2.3.[56], 1001:db8::6[45] belongs to the Machine CIDR and is not in use", strings.ToLower(lcontext.name))))
 			})
+
 			It("ipv4 verification failed", func() {
 				preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
 					ID:              &clusterID,
@@ -425,66 +647,149 @@ var _ = Describe("areVipsValid", func() {
 	}
 })
 
-var _ = Describe("Network type matches high availability mode", func() {
+var _ = Describe("Network type matches high control plane count", func() {
 	tests := []struct {
-		highAvailabilityMode *string
-		networkType          *string
-		invalid              bool
+		controlPlaneCount int64
+		networkType       *string
+		invalid           bool
 	}{
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeNone),
-			networkType:          swag.String(models.ClusterNetworkTypeOVNKubernetes),
-			invalid:              false,
+			controlPlaneCount: 1,
+			networkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeNone),
-			networkType:          swag.String("CalicoOrWhatever"),
-			invalid:              false,
+			controlPlaneCount: 1,
+			networkType:       swag.String("CalicoOrWhatever"),
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeNone),
-			networkType:          swag.String(models.ClusterNetworkTypeOpenShiftSDN),
-			invalid:              true,
+			controlPlaneCount: 1,
+			networkType:       swag.String(models.ClusterNetworkTypeOpenShiftSDN),
+			invalid:           true,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
-			networkType:          swag.String(models.ClusterNetworkTypeOVNKubernetes),
-			invalid:              false,
+			controlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			networkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
-			networkType:          swag.String(models.ClusterNetworkTypeOpenShiftSDN),
-			invalid:              false,
+			controlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			networkType:       swag.String(models.ClusterNetworkTypeOpenShiftSDN),
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
-			networkType:          swag.String("CalicoOrWhatever"),
-			invalid:              false,
+			controlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			networkType:       swag.String("CalicoOrWhatever"),
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeNone),
-			networkType:          nil,
-			invalid:              false,
+			controlPlaneCount: 1,
+			networkType:       nil,
+			invalid:           false,
 		},
 		{
-			highAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
-			networkType:          nil,
-			invalid:              false,
+			controlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			networkType:       nil,
+			invalid:           false,
 		},
 	}
 	for _, test := range tests {
 		t := test
-		It(fmt.Sprintf("Availability mode: %s, network type: %s", swag.StringValue(t.highAvailabilityMode), swag.StringValue(t.networkType)),
+		It(fmt.Sprintf("Control plane count: %d, network type: %s", t.controlPlaneCount, swag.StringValue(t.networkType)),
 			func() {
 				cluster := common.Cluster{
 					Cluster: models.Cluster{
-						HighAvailabilityMode: t.highAvailabilityMode,
-						NetworkType:          t.networkType,
+						ControlPlaneCount: t.controlPlaneCount,
+						NetworkType:       t.networkType,
 					},
 				}
-				Expect(isHighAvailabilityModeUnsupportedByNetworkType(&cluster)).To(Equal(t.invalid))
+				Expect(isControlPlaneCountUnsupportedByNetworkType(&cluster)).To(Equal(t.invalid))
 			})
 	}
+})
+
+var _ = Describe("Third-Party CNI Network Type Validation", func() {
+	var (
+		validator         clusterValidator
+		preprocessContext *clusterPreprocessContext
+		clusterID         strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		validator = clusterValidator{log: logrus.New()}
+		preprocessContext = &clusterPreprocessContext{}
+		clusterID = strfmt.UUID(uuid.New().String())
+	})
+
+	DescribeTable("validates network types",
+		func(networkType string, expectedStatus ValidationStatus, expectedMessage string) {
+			preprocessContext.cluster = &common.Cluster{Cluster: models.Cluster{
+				ID:          &clusterID,
+				NetworkType: &networkType,
+			}}
+			status, message := validator.isNetworkTypeValid(preprocessContext)
+			Expect(status).Should(Equal(expectedStatus))
+			Expect(message).Should(ContainSubstring(expectedMessage))
+		},
+		Entry("Cilium is valid", models.ClusterNetworkTypeCilium, ValidationSuccess, "valid network type"),
+		Entry("Calico is valid", models.ClusterNetworkTypeCalico, ValidationSuccess, "valid network type"),
+		Entry("CiscoACI is valid", models.ClusterNetworkTypeCiscoACI, ValidationSuccess, "valid network type"),
+		Entry("None is valid", models.ClusterNetworkTypeNone, ValidationSuccess, "valid network type"),
+		Entry("Invalid type fails", "InvalidNetworkType", ValidationFailure, "not valid"),
+	)
+})
+
+var _ = Describe("IPv6 Network Type Compatibility", func() {
+	var (
+		clusterID strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		clusterID = strfmt.UUID(uuid.New().String())
+	})
+
+	It("Allows IPv6 with Cilium network type", func() {
+		networkType := models.ClusterNetworkTypeCilium
+		clusterNetworks := []*models.ClusterNetwork{
+			{Cidr: "2001:db8::/64", ClusterID: clusterID},
+		}
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:              &clusterID,
+			NetworkType:     &networkType,
+			ClusterNetworks: clusterNetworks,
+		}}
+		result := hasClusterNetworksUnsupportedByNetworkType(cluster)
+		Expect(result).Should(BeFalse())
+	})
+
+	It("Allows IPv6 with None (custom CNI) network type", func() {
+		networkType := models.ClusterNetworkTypeNone
+		clusterNetworks := []*models.ClusterNetwork{
+			{Cidr: "2001:db8::/64", ClusterID: clusterID},
+		}
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:              &clusterID,
+			NetworkType:     &networkType,
+			ClusterNetworks: clusterNetworks,
+		}}
+		result := hasClusterNetworksUnsupportedByNetworkType(cluster)
+		Expect(result).Should(BeFalse())
+	})
+
+	It("Rejects IPv6 with OpenShiftSDN network type", func() {
+		networkType := models.ClusterNetworkTypeOpenShiftSDN
+		clusterNetworks := []*models.ClusterNetwork{
+			{Cidr: "2001:db8::/64", ClusterID: clusterID},
+		}
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:              &clusterID,
+			NetworkType:     &networkType,
+			ClusterNetworks: clusterNetworks,
+		}}
+		result := hasClusterNetworksUnsupportedByNetworkType(cluster)
+		Expect(result).Should(BeTrue())
+	})
 })
 
 var _ = Describe("Validator tests", func() {
@@ -666,5 +971,564 @@ var _ = Describe("skipNetworkHostPrefixCheck", func() {
 
 		skipped := validator.skipNetworkHostPrefixCheck(preprocessContext)
 		Expect(skipped).Should(Equal(true))
+	})
+})
+
+var _ = Describe("getEffectiveNetworkType", func() {
+	var (
+		validator clusterValidator
+		clusterID strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		validator = clusterValidator{log: logrus.New()}
+		clusterID = strfmt.UUID(uuid.New().String())
+	})
+
+	It("Returns cluster NetworkType when no InstallConfigOverrides are set", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:          &clusterID,
+			NetworkType: &networkType,
+		}}
+
+		result := validator.getEffectiveNetworkType(cluster)
+		Expect(result).Should(Equal(models.ClusterNetworkTypeOVNKubernetes))
+	})
+
+	It("Returns InstallConfigOverrides networkType when set", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		installCfgOverrides := "{\"networking\":{\"networkType\":\"Calico\"}}"
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:                     &clusterID,
+			NetworkType:            &networkType,
+			InstallConfigOverrides: installCfgOverrides,
+		}}
+
+		result := validator.getEffectiveNetworkType(cluster)
+		Expect(result).Should(Equal("Calico"))
+	})
+
+	It("Returns cluster NetworkType when InstallConfigOverrides has no networkType", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		installCfgOverrides := "{\"baseDomain\":\"example.com\"}"
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:                     &clusterID,
+			NetworkType:            &networkType,
+			InstallConfigOverrides: installCfgOverrides,
+		}}
+
+		result := validator.getEffectiveNetworkType(cluster)
+		Expect(result).Should(Equal(models.ClusterNetworkTypeOVNKubernetes))
+	})
+
+	It("Returns cluster NetworkType when InstallConfigOverrides is invalid JSON", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		installCfgOverrides := "invalid-json"
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:                     &clusterID,
+			NetworkType:            &networkType,
+			InstallConfigOverrides: installCfgOverrides,
+		}}
+
+		result := validator.getEffectiveNetworkType(cluster)
+		Expect(result).Should(Equal(models.ClusterNetworkTypeOVNKubernetes))
+	})
+})
+
+var _ = Describe("getCustomManifestRequirements with InstallConfigOverrides", func() {
+	var (
+		validator clusterValidator
+		clusterID strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		validator = clusterValidator{log: logrus.New()}
+		clusterID = strfmt.UUID(uuid.New().String())
+	})
+
+	It("Does not require manifests when cluster NetworkType is None but override is OVN", func() {
+		networkType := models.ClusterNetworkTypeNone
+		installCfgOverrides := "{\"networking\":{\"networkType\":\"OVNKubernetes\"}}"
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:                     &clusterID,
+			NetworkType:            &networkType,
+			InstallConfigOverrides: installCfgOverrides,
+		}}
+
+		requirements := validator.getCustomManifestRequirements(cluster)
+		Expect(requirements).Should(BeEmpty())
+	})
+
+	It("Requires manifests when cluster NetworkType is OVN but override is Calico", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		installCfgOverrides := "{\"networking\":{\"networkType\":\"Calico\"}}"
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:                     &clusterID,
+			NetworkType:            &networkType,
+			InstallConfigOverrides: installCfgOverrides,
+		}}
+
+		requirements := validator.getCustomManifestRequirements(cluster)
+		Expect(requirements).Should(HaveLen(1))
+		Expect(requirements[0]).Should(Equal("Calico network type"))
+	})
+
+	It("Requires manifests when cluster NetworkType is None and no overrides", func() {
+		networkType := models.ClusterNetworkTypeNone
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:          &clusterID,
+			NetworkType: &networkType,
+		}}
+
+		requirements := validator.getCustomManifestRequirements(cluster)
+		Expect(requirements).Should(HaveLen(1))
+		Expect(requirements[0]).Should(Equal("None network type"))
+	})
+
+	It("Does not require manifests when cluster NetworkType is OVN and no overrides", func() {
+		networkType := models.ClusterNetworkTypeOVNKubernetes
+		cluster := &common.Cluster{Cluster: models.Cluster{
+			ID:          &clusterID,
+			NetworkType: &networkType,
+		}}
+
+		requirements := validator.getCustomManifestRequirements(cluster)
+		Expect(requirements).Should(BeEmpty())
+	})
+})
+
+var _ = Describe("SufficientMastersCount", func() {
+	var (
+		validator   clusterValidator
+		clusterID   strfmt.UUID
+		mockHostAPI *host.MockAPI
+		ctrl        *gomock.Controller
+	)
+
+	BeforeEach(func() {
+		clusterID = strfmt.UUID(uuid.New().String())
+		ctrl = gomock.NewController(GinkgoT())
+		mockHostAPI = host.NewMockAPI(ctrl)
+		validator = clusterValidator{log: logrus.New(), hostAPI: mockHostAPI}
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	Context("pass validation", func() {
+		It("with matching counts, set ControlPlaneCount", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 3,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(message).To(Equal("The cluster has the exact amount of dedicated control plane nodes."))
+		})
+
+		It("with SNO cluster, set controlPlaneCount", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 1,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(message).To(Equal("The cluster has the exact amount of dedicated control plane nodes."))
+		})
+
+		It("with multi-node cluster, 5 masters", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 5,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(message).To(Equal("The cluster has the exact amount of dedicated control plane nodes."))
+		})
+
+		It("with TNA Cluster, 2 masters with arbiter", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  common.MinimumVersionForArbiterClusters,
+						ControlPlaneCount: 2,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleArbiter,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(message).To(Equal("The cluster has the exact amount of dedicated control plane nodes."))
+		})
+
+		It("with TNF Cluster, 2 masters with fencing credentials", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+						ControlPlaneCount: 2,
+						Hosts: []*models.Host{
+							{
+								FencingCredentials: "credentials",
+								Role:               models.HostRoleMaster,
+							},
+							{
+								FencingCredentials: "credentials",
+								Role:               models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(message).To(Equal("The cluster has the exact amount of dedicated control plane nodes."))
+		})
+	})
+
+	Context("fails validation", func() {
+		It("with multi node cluster, 5 masters but expected 3", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 3,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(Equal("The cluster must have exactly 3 dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement."))
+		})
+
+		It("with SNO cluster, 2 masters 0 workers", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 1,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(Equal("Single-node clusters must have a single control plane node and no workers."))
+		})
+
+		It("with SNO cluster, 1 masters 1 workers", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 1,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleWorker,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(Equal("Single-node clusters must have a single control plane node and no workers."))
+		})
+
+		It("with TNA cluster, 2 masters without arbiter", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  common.MinimumVersionForArbiterClusters,
+						ControlPlaneCount: 2,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(Equal("The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."))
+		})
+
+		It("with invalid TNF cluster", func() {
+			mockHostAPI.EXPECT().
+				IsValidCandidate(
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+				).Return(true, nil).AnyTimes()
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId: clusterID,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:                &clusterID,
+						OpenshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+						ControlPlaneCount: 2,
+						Hosts: []*models.Host{
+							{
+								Role: models.HostRoleMaster,
+							},
+							{
+								Role: models.HostRoleMaster,
+							},
+						},
+					}},
+			}
+
+			status, message := validator.SufficientMastersCount(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(Equal("The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."))
+		})
+	})
+})
+
+var _ = Describe("isMachineCidrEqualsToCalculatedCidr", func() {
+	var (
+		validator clusterValidator
+		clusterID strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		clusterID = strfmt.UUID(uuid.New().String())
+		validator = clusterValidator{log: logrus.New()}
+	})
+
+	It("should pass validation with user-managed load balancer cluster", func() {
+		preprocessContext := &clusterPreprocessContext{
+			clusterId: clusterID,
+			cluster: &common.Cluster{
+				Cluster: models.Cluster{
+					ID:           &clusterID,
+					LoadBalancer: &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				},
+			},
+		}
+
+		status, msg := validator.isMachineCidrEqualsToCalculatedCidr(preprocessContext)
+		Expect(status).To(Equal(ValidationSuccess))
+		Expect(msg).To(Equal("Calculating machine network CIDR is not enabled: User Managed Load Balancer"))
+	})
+	Context("Normalized CIDR", func() {
+		var (
+			hosts []*models.Host
+		)
+		BeforeEach(func() {
+			// Create hosts with IPv6 interfaces with Uppercase and leading zero
+			newId := func() strfmt.UUID {
+				return strfmt.UUID(uuid.New().String())
+			}
+			newIdPtr := func() *strfmt.UUID {
+				ret := newId()
+				return &ret
+			}
+			hosts = []*models.Host{
+				{
+					ClusterID:  &clusterID,
+					InfraEnvID: clusterID,
+					ID:         newIdPtr(),
+					Inventory:  common.GenerateTestInventoryWithUnnormalizedIPv6(),
+				},
+			}
+		})
+		It("should pass validation when machine CIDR contains IPv6 with uppercase and leading zeros", func() {
+			// User provides:
+			// Interface IP: "2A00:8A00:4000:0d80::1/64" (uppercase, leading zeros)
+			// VIP: "2A00:8A00:4000:0d80::77"
+			// Calculated CIDR becomes: "2a00:8a00:4000:d80::/64" (normalized by net.ParseCIDR)
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId:               clusterID,
+				hasHostsWithInventories: true,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:              &clusterID,
+						MachineNetworks: []*models.MachineNetwork{{Cidr: "2A00:8A00:4000:0d80::/64"}},                // User provided - unnormalized with uppercase and leading zeros
+						APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "2A00:8A00:4000:0d80::77"}},     // VIP in same network
+						IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "2A00:8A00:4000:0d80::88"}}, // Ingress VIP in same network
+						Hosts:           hosts,
+					},
+				},
+			}
+
+			status, msg := validator.isMachineCidrEqualsToCalculatedCidr(preprocessContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("The Cluster Machine CIDR is equivalent to the calculated CIDR."))
+		})
+
+		It("should fail validation when machine CIDR contains invalid format and cannot be normalized", func() {
+			// Test the error case when NormalizeCIDR fails with invalid input
+			// This ensures our error handling works correctly
+
+			preprocessContext := &clusterPreprocessContext{
+				clusterId:               clusterID,
+				hasHostsWithInventories: true,
+				cluster: &common.Cluster{
+					Cluster: models.Cluster{
+						ID:              &clusterID,
+						MachineNetworks: []*models.MachineNetwork{{Cidr: "invalid-ipv6-cidr"}}, // Invalid CIDR that will cause normalization to fail
+						APIVips:         []*models.APIVip{{ClusterID: clusterID, IP: "2A00:8A00:4000:0d80::77"}},
+						IngressVips:     []*models.IngressVip{{ClusterID: clusterID, IP: "2A00:8A00:4000:0d80::88"}},
+						Hosts:           hosts,
+					},
+				},
+			}
+
+			status, msg := validator.isMachineCidrEqualsToCalculatedCidr(preprocessContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(ContainSubstring("failed to normalize user machine CIDR invalid-ipv6-cidr"))
+		})
 	})
 })

@@ -13,28 +13,39 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/constants"
 	"github.com/openshift/assisted-service/internal/manifests"
+	"github.com/openshift/assisted-service/internal/stream"
 	"github.com/openshift/assisted-service/internal/usage"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/filemiddleware"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
 func TestValidator(t *testing.T) {
 	RegisterFailHandler(Fail)
-
-	common.InitializeDBTest()
-	defer common.TerminateDBTest()
 	RunSpecs(t, "manifests_test")
 }
+
+var _ = BeforeSuite(func() {
+	common.InitializeDBTest()
+})
+
+var _ = AfterSuite(func() {
+	common.TerminateDBTest()
+})
+
+const contentAsYAMLPatch = `---
+- op: replace
+  path: /status/infrastructureTopology
+  value: HighlyAvailable`
 
 const contentAsYAML = `apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfig
@@ -61,19 +72,22 @@ const contentAsJSON = `{
 
 var _ = Describe("ClusterManifestTests", func() {
 	var (
-		manifestsAPI  *manifests.Manifests
-		db            *gorm.DB
-		ctx           = context.Background()
-		ctrl          *gomock.Controller
-		mockS3Client  *s3wrapper.MockAPI
-		dbName        string
-		fileNameYaml  = "99-openshift-machineconfig-master-kargs.yaml"
-		fileNameJson  = "99-openshift-machineconfig-master-kargs.json"
-		validFolder   = "openshift"
-		defaultFolder = "manifests"
-		contentYaml   = encodeToBase64(contentAsYAML)
-		contentJson   = encodeToBase64(contentAsJSON)
-		mockUsageAPI  *usage.MockAPI
+		manifestsAPI      *manifests.Manifests
+		db                *gorm.DB
+		ctx               = context.Background()
+		ctrl              *gomock.Controller
+		mockS3Client      *s3wrapper.MockAPI
+		dbName            string
+		fileNameYaml      = "99-openshift-machineconfig-master-kargs.yaml"
+		fileNameYamlPatch = "99-openshift-machineconfig-master-kargs.yaml.patch_foobar"
+		fileNameYmlPatch  = "99-openshift-machineconfig-master-kargs.yml.patch_foobar"
+		fileNameJson      = "99-openshift-machineconfig-master-kargs.json"
+		validFolder       = "openshift"
+		defaultFolder     = "manifests"
+		contentYaml       = encodeToBase64(contentAsYAML)
+		contentYamlPatch  = encodeToBase64(contentAsYAMLPatch)
+		contentJson       = encodeToBase64(contentAsJSON)
+		mockUsageAPI      *usage.MockAPI
 	)
 
 	BeforeEach(func() {
@@ -122,25 +136,22 @@ var _ = Describe("ClusterManifestTests", func() {
 		return fmt.Sprintf("%s/manifests/%s/%s", *clusterID, folderName, fileName)
 	}
 
-	getMetadataObjectName := func(clusterID *strfmt.UUID, folderName, fileName string, manifestSource string) string {
-		return fmt.Sprintf("%s/manifest-attributes/%s/%s/%s", *clusterID, folderName, fileName, manifestSource)
-	}
-
 	mockObjectExists := func(exists bool) {
 		mockS3Client.EXPECT().DoesObjectExist(ctx, gomock.Any()).Return(exists, nil).AnyTimes()
 	}
 
 	mockUpload := func(times int) {
-		mockS3Client.EXPECT().Upload(ctx, gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockS3Client.EXPECT().UploadWithMetadata(ctx, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	}
 
 	mockDownloadFailure := func() {
 		mockS3Client.EXPECT().Download(gomock.Any(), gomock.Any()).Return(nil, int64(0), errors.New("Simulated download failure")).MinTimes(0)
 	}
 
-	mockListByPrefix := func(clusterID *strfmt.UUID, files []string) {
+	mockListByPrefix := func(clusterID *strfmt.UUID, files []s3wrapper.ObjectInfo) {
+		mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, filepath.Join(clusterID.String(), constants.ManifestMetadataFolder)).Times(1)
 		prefix := fmt.Sprintf("%s/manifests", *clusterID)
-		mockS3Client.EXPECT().ListObjectsByPrefix(ctx, prefix).Return(files, nil).Times(1)
+		mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, prefix).Return(files, nil).Times(1)
 	}
 
 	Context("CreateClusterManifest", func() {
@@ -261,7 +272,7 @@ var _ = Describe("ClusterManifestTests", func() {
 			It("Does not accept a filename that does not contain a name before the extension", func() {
 				clusterID := registerCluster().ID
 				content := "{}"
-				fileName := ".yaml"
+				fileName := ".yaml.patch"
 				response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
 					ClusterID: *clusterID,
 					CreateManifestParams: &models.CreateManifestParams{
@@ -395,6 +406,49 @@ spec:
 				Expect(responsePayload.Payload.Folder).To(Equal(defaultFolder))
 			})
 
+			It("fails for manifest with empty content", func() {
+				clusterID := registerCluster().ID
+				fileNames := []string{"99-test.yaml", "99-test.json", "99-test.yaml.patch_foobar"}
+				for i := range fileNames {
+					invalidContent := "   "
+					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileNames[i])).Return(false, nil).AnyTimes()
+					response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+						ClusterID: *clusterID,
+						CreateManifestParams: &models.CreateManifestParams{
+							Content:  &invalidContent,
+							FileName: &fileNames[i],
+						},
+					})
+					Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
+					err := response.(*common.ApiErrorResponse)
+					Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+					Expect(err.Error()).To(ContainSubstring(
+						fmt.Sprintf("Manifest content of file manifests/%s for cluster ID %s is empty", fileNames[i], clusterID.String()),
+					))
+				}
+			})
+
+			It("fails gracefully for nil manifest", func() {
+				clusterID := registerCluster().ID
+				fileNames := []string{"99-test.yaml", "99-test.json", "99-test.yaml.patch_foobar"}
+				for i := range fileNames {
+					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileNames[i])).Return(false, nil).AnyTimes()
+					response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+						ClusterID: *clusterID,
+						CreateManifestParams: &models.CreateManifestParams{
+							Content:  nil,
+							FileName: &fileNames[i],
+						},
+					})
+					Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
+					err := response.(*common.ApiErrorResponse)
+					Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+					Expect(err.Error()).To(ContainSubstring(
+						fmt.Sprintf("Manifest content of file manifests/%s for cluster ID %s is nil", fileNames[i], clusterID.String()),
+					))
+				}
+			})
+
 			It("fails for manifest with invalid json format", func() {
 				clusterID := registerCluster().ID
 				fileName := "99-test.json"
@@ -431,6 +485,24 @@ spec:
 				Expect(err.Error()).To(Equal("Manifest content of file manifests/99-test.yml for cluster ID " + clusterID.String() + " has an invalid YAML format: yaml: line 1: did not find expected node content"))
 			})
 
+			It("fails for yaml patch with invalid patch format", func() {
+				clusterID := registerCluster().ID
+				fileName := "99-test.yml.patch"
+				invalidPatchContent := contentYaml
+				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileName)).Return(false, nil).AnyTimes()
+				response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+					ClusterID: *clusterID,
+					CreateManifestParams: &models.CreateManifestParams{
+						Content:  &invalidPatchContent,
+						FileName: &fileName,
+					},
+				})
+				Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
+				err := response.(*common.ApiErrorResponse)
+				Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+				Expect(err.Error()).To(ContainSubstring("Patch content of file manifests/99-test.yml.patch for cluster ID " + clusterID.String() + " is invalid:"))
+			})
+
 			It("fails for manifest with unsupported extension", func() {
 				clusterID := registerCluster().ID
 				fileName := "99-test.txt"
@@ -445,7 +517,82 @@ spec:
 				Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
 				err := response.(*common.ApiErrorResponse)
 				Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
-				Expect(err.Error()).To(ContainSubstring("Manifest filename of file manifests/99-test.txt for cluster ID " + clusterID.String() + " is invalid. Only json, yaml and yml extensions are supported"))
+				Expect(err.Error()).To(ContainSubstring("Manifest filename of file manifests/99-test.txt for cluster ID " + clusterID.String() + " is invalid. Only json, yaml and yml or patch extensions are supported"))
+			})
+
+			It("manifest creation does not fail for yaml patch files", func() {
+				mockUpload(1)
+				expectUsageCalls()
+				clusterID := registerCluster().ID
+				fileName := fileNameYamlPatch
+				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileName)).Return(false, nil).AnyTimes()
+				response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+					ClusterID: *clusterID,
+					CreateManifestParams: &models.CreateManifestParams{
+						Content:  &contentYamlPatch,
+						FileName: &fileName,
+					},
+				})
+				Expect(response).Should(BeAssignableToTypeOf(operations.NewV2CreateClusterManifestCreated()))
+			})
+
+			It("manifest creation does not fail for yml patch files", func() {
+				mockUpload(1)
+				expectUsageCalls()
+				clusterID := registerCluster().ID
+				fileName := fileNameYmlPatch
+				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileName)).Return(false, nil).AnyTimes()
+				response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+					ClusterID: *clusterID,
+					CreateManifestParams: &models.CreateManifestParams{
+						Content:  &contentYamlPatch,
+						FileName: &fileName,
+					},
+				})
+				Expect(response).Should(BeAssignableToTypeOf(operations.NewV2CreateClusterManifestCreated()))
+			})
+
+			It("manifest creation will succeed for patch files if filename is valid", func() {
+				clusterID := registerCluster().ID
+				validFileNames := []string{
+					"something.patch",
+					"something.patch_something_else",
+					"something.patch.patch_something",
+				}
+				for i, fileName := range validFileNames {
+					mockUpload(1)
+					expectUsageCalls()
+					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", fileName)).Return(false, nil).AnyTimes()
+					response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+						ClusterID: *clusterID,
+						CreateManifestParams: &models.CreateManifestParams{
+							Content:  &contentYamlPatch,
+							FileName: &validFileNames[i],
+						},
+					})
+					Expect(response).Should(BeAssignableToTypeOf(operations.NewV2CreateClusterManifestCreated()))
+				}
+			})
+
+			It("manifest creation will fail for patch files if filename is invalid", func() {
+				clusterID := registerCluster().ID
+				invalidFileNames := []string{
+					"something.patch.something",
+					"something.patch.something.else",
+				}
+				for i, fileName := range invalidFileNames {
+					response := manifestsAPI.V2CreateClusterManifest(ctx, operations.V2CreateClusterManifestParams{
+						ClusterID: *clusterID,
+						CreateManifestParams: &models.CreateManifestParams{
+							Content:  &contentYaml,
+							FileName: &invalidFileNames[i],
+						},
+					})
+					Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
+					err := response.(*common.ApiErrorResponse)
+					Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+					Expect(err.Error()).To(ContainSubstring("Manifest filename of file manifests/%s for cluster ID %s is invalid. Only json, yaml and yml or patch extensions are supported", fileName, clusterID.String()))
+				}
 			})
 
 			It("fails for filename that contains folder in the name", func() {
@@ -601,40 +748,86 @@ invalid YAML content: {
 		})
 	})
 
+	Context("CreateClusterManifestInternal usage tracking", func() {
+		It("creating a non-custom manifest does not affect usage when custom manifests exist", func() {
+			mockNotifier := stream.NewMockNotifier(ctrl)
+			mockNotifier.EXPECT().Notify(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			realUsageAPI := usage.NewManager(common.GetTestLog(), mockNotifier)
+			manifestsWithRealUsage := manifests.NewManifestsAPI(db, common.GetTestLog(), mockS3Client, realUsageAPI)
+
+			clusterID := registerCluster().ID
+
+			mockUpload(2)
+			mockS3Client.EXPECT().DoesObjectExist(ctx, gomock.Any()).Return(false, nil).AnyTimes()
+
+			_, err := manifestsWithRealUsage.CreateClusterManifestInternal(ctx, operations.V2CreateClusterManifestParams{
+				ClusterID: *clusterID,
+				CreateManifestParams: &models.CreateManifestParams{
+					Content:  &contentYaml,
+					FileName: &fileNameYaml,
+				},
+			}, true)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			cluster, err := common.GetClusterFromDB(db, *clusterID, common.SkipEagerLoading)
+			Expect(err).ShouldNot(HaveOccurred())
+			usages, err := usage.Unmarshal(cluster.Cluster.FeatureUsage)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(usages).To(HaveKey(usage.CustomManifest))
+
+			systemFile := "system-manifest.yaml"
+			_, err = manifestsWithRealUsage.CreateClusterManifestInternal(ctx, operations.V2CreateClusterManifestParams{
+				ClusterID: *clusterID,
+				CreateManifestParams: &models.CreateManifestParams{
+					Content:  &contentYaml,
+					FileName: &systemFile,
+				},
+			}, false)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			cluster, err = common.GetClusterFromDB(db, *clusterID, common.SkipEagerLoading)
+			Expect(err).ShouldNot(HaveOccurred())
+			usages, err = usage.Unmarshal(cluster.Cluster.FeatureUsage)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(usages).To(HaveKey(usage.CustomManifest))
+		})
+	})
+
 	Context("V2ListClusterManifests", func() {
 
 		It("should not filter system manifests if requested to show all", func() {
 			manifests := []models.Manifest{
 				{
-					FileName: "file-1.yaml",
-					Folder:   validFolder,
+					FileName:       "file-1.yaml",
+					Folder:         validFolder,
+					ManifestSource: constants.ManifestSourceUserSupplied,
 				},
 				{
-					FileName: "file-2.yaml",
-					Folder:   defaultFolder,
+					FileName:       "file-2.yaml",
+					Folder:         defaultFolder,
+					ManifestSource: constants.ManifestSourceSystemGenerated,
 				},
 				{
-					FileName: "file-3.yaml",
-					Folder:   defaultFolder,
+					FileName:       "file-3.yaml",
+					Folder:         defaultFolder,
+					ManifestSource: constants.ManifestSourceUserSupplied,
 				},
 			}
 
 			clusterID := registerCluster().ID
-			files := make([]string, 0)
+			files := make([]s3wrapper.ObjectInfo, 0)
 
 			mockUpload(len(manifests))
 
-			manifestMetadataPrefix := filepath.Join(clusterID.String(), "manifest-attributes")
 			for _, file := range manifests {
 				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", file.FileName)).Return(false, nil).AnyTimes()
 				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "manifests", file.FileName)).Return(false, nil).AnyTimes()
-				files = append(files, getObjectName(clusterID, file.Folder, file.FileName))
-				addManifestToCluster(clusterID, contentYaml, file.FileName, file.Folder)
-				if file.FileName == "file-2.yaml" {
-					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(manifestMetadataPrefix, file.Folder, file.FileName, constants.ManifestSourceUserSupplied)).Return(false, nil).Times(1)
-				} else {
-					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(manifestMetadataPrefix, file.Folder, file.FileName, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
+				metadata := make(map[string]string)
+				if file.FileName != "file-2.yaml" {
+					metadata = map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}
 				}
+				files = append(files, s3wrapper.ObjectInfo{Path: getObjectName(clusterID, file.Folder, file.FileName), Metadata: metadata})
+				addManifestToCluster(clusterID, contentYaml, file.FileName, file.Folder)
 			}
 			mockListByPrefix(clusterID, files)
 
@@ -656,31 +849,31 @@ invalid YAML content: {
 		It("lists manifest from different folders", func() {
 			manifests := []models.Manifest{
 				{
-					FileName: "file-1.yaml",
-					Folder:   validFolder,
+					FileName:       "file-1.yaml",
+					Folder:         validFolder,
+					ManifestSource: constants.ManifestSourceUserSupplied,
 				},
 				{
-					FileName: "file-3.yaml",
-					Folder:   defaultFolder,
+					FileName:       "file-3.yaml",
+					Folder:         defaultFolder,
+					ManifestSource: constants.ManifestSourceUserSupplied,
 				},
 			}
 
 			clusterID := registerCluster().ID
-			files := make([]string, 0)
+			files := make([]s3wrapper.ObjectInfo, 0)
 
 			mockUpload(len(manifests))
 
-			manifestMetadataPrefix := filepath.Join(clusterID.String(), "manifest-attributes")
 			for _, file := range manifests {
 				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", file.FileName)).Return(false, nil).AnyTimes()
 				mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "manifests", file.FileName)).Return(false, nil).AnyTimes()
-				files = append(files, getObjectName(clusterID, file.Folder, file.FileName))
-				addManifestToCluster(clusterID, contentYaml, file.FileName, file.Folder)
-				if file.FileName == "file-2.yaml" {
-					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(manifestMetadataPrefix, file.Folder, file.FileName, constants.ManifestSourceUserSupplied)).Return(false, nil).Times(1)
-				} else {
-					mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(manifestMetadataPrefix, file.Folder, file.FileName, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
+				metadata := make(map[string]string)
+				if file.FileName != "file-2.yaml" {
+					metadata = map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}
 				}
+				files = append(files, s3wrapper.ObjectInfo{Path: getObjectName(clusterID, file.Folder, file.FileName), Metadata: metadata})
+				addManifestToCluster(clusterID, contentYaml, file.FileName, file.Folder)
 			}
 			mockListByPrefix(clusterID, files)
 
@@ -699,7 +892,7 @@ invalid YAML content: {
 
 		It("list manifests for new cluster", func() {
 			clusterID := registerCluster().ID
-			mockListByPrefix(clusterID, []string{})
+			mockListByPrefix(clusterID, nil)
 			response := manifestsAPI.V2ListClusterManifests(ctx, operations.V2ListClusterManifestsParams{
 				ClusterID: *clusterID,
 			})
@@ -724,11 +917,9 @@ invalid YAML content: {
 		It("deletes manifest from default folder", func() {
 			clusterID := registerCluster().ID
 			mockUpload(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, defaultFolder, "file-1.yaml")).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, defaultFolder, "file-1.yaml")).Return(true, nil).Times(1)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, defaultFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
-			mockListByPrefix(clusterID, []string{})
+			mockListByPrefix(clusterID, nil)
 			mockUsageAPI.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(1)
 			mockUsageAPI.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", "file-1.yaml")).Return(false, nil).AnyTimes()
@@ -743,11 +934,10 @@ invalid YAML content: {
 		It("deletes one of two manifests", func() {
 			clusterID := registerCluster().ID
 			mockUpload(2)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, defaultFolder, "file-1.yaml")).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, defaultFolder, "file-1.yaml")).Return(true, nil).Times(1)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, defaultFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
-			mockListByPrefix(clusterID, []string{"file-2.yaml"})
+			metadata := map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}
+			mockListByPrefix(clusterID, []s3wrapper.ObjectInfo{{Path: getObjectName(clusterID, defaultFolder, "file-2.yaml"), Metadata: metadata}})
 			mockUsageAPI.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(0)
 			mockUsageAPI.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", "file-1.yaml")).Return(false, nil).AnyTimes()
@@ -765,11 +955,9 @@ invalid YAML content: {
 		It("deletes manifest from a different folder", func() {
 			clusterID := registerCluster().ID
 			mockUpload(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, validFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, validFolder, "file-1.yaml")).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, validFolder, "file-1.yaml")).Return(true, nil)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, validFolder, "file-1.yaml", constants.ManifestSourceUserSupplied)).Return(true, nil)
-			mockListByPrefix(clusterID, []string{})
+			mockListByPrefix(clusterID, nil)
 			mockUsageAPI.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(1)
 			mockUsageAPI.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "manifests", "file-1.yaml")).Return(false, nil).AnyTimes()
@@ -786,10 +974,9 @@ invalid YAML content: {
 		It("deletes missing manifest", func() {
 			clusterID := registerCluster().ID
 			mockObjectExists(false)
-			mockListByPrefix(clusterID, []string{})
+			mockListByPrefix(clusterID, nil)
 			mockUsageAPI.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(1)
 			mockUsageAPI.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
-
 			response := manifestsAPI.V2DeleteClusterManifest(ctx, operations.V2DeleteClusterManifestParams{
 				ClusterID: *clusterID,
 				FileName:  "file-1.yaml",
@@ -806,6 +993,15 @@ invalid YAML content: {
 			Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusNotFound, errors.New(""))))
 			err := response.(*common.ApiErrorResponse)
 			Expect(err.StatusCode()).To(Equal(int32(http.StatusNotFound)))
+		})
+
+		It("rejects path traversal in file_name", func() {
+			clusterID := registerCluster().ID
+			response := manifestsAPI.V2DeleteClusterManifest(ctx, operations.V2DeleteClusterManifestParams{
+				ClusterID: *clusterID,
+				FileName:  "../../other-cluster/kubeconfig",
+			})
+			Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusUnprocessableEntity, errors.New(""))))
 		})
 
 		It("deletes after installation has been started", func() {
@@ -863,9 +1059,37 @@ invalid YAML content: {
 			err := response.(*common.ApiErrorResponse)
 			Expect(err.StatusCode()).To(Equal(int32(http.StatusNotFound)))
 		})
+
+		It("rejects path traversal in file_name", func() {
+			clusterID := registerCluster().ID
+			response := manifestsAPI.V2DownloadClusterManifest(ctx, operations.V2DownloadClusterManifestParams{
+				ClusterID: *clusterID,
+				FileName:  "../../other-cluster/kubeconfig",
+			})
+			Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusUnprocessableEntity, errors.New(""))))
+		})
 	})
 
 	Context("UpdateClusterManifest", func() {
+		It("fails for manifest with empty content", func() {
+			clusterID := registerCluster().ID
+			mockUpload(1)
+			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
+				ClusterID: *clusterID,
+				UpdateManifestParams: &models.UpdateManifestParams{
+					UpdatedContent: swag.String("  "),
+					FileName:       fileNameYaml,
+					Folder:         defaultFolder,
+				},
+			})
+			Expect(response).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.New(""))))
+			err := response.(*common.ApiErrorResponse)
+			Expect(err.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+			Expect(err.Error()).To(ContainSubstring(
+				fmt.Sprintf("Manifest content of file manifests/%s for cluster ID %s is empty", fileNameYaml, clusterID.String()),
+			))
+		})
+
 		It("Does not accept a filename that contains spaces", func() {
 			clusterID := registerCluster().ID
 			destFolder := "manifests"
@@ -891,12 +1115,9 @@ invalid YAML content: {
 			destFileName := "destFileName"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, destFolder, destFileName, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil).Times(1)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", destFileName)).Return(false, nil).AnyTimes()
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
@@ -938,7 +1159,6 @@ invalid YAML content: {
 		It("updates existing file with new content if content is correct for yaml", func() {
 			clusterID := registerCluster().ID
 			mockUpload(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
 				UpdateManifestParams: &models.UpdateManifestParams{
@@ -954,10 +1174,45 @@ invalid YAML content: {
 			Expect(responsePayload.Payload.Folder).To(Equal(defaultFolder))
 		})
 
+		It("updates existing file with new content if content is correct for yaml patch", func() {
+			clusterID := registerCluster().ID
+			mockUpload(1)
+			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
+				ClusterID: *clusterID,
+				UpdateManifestParams: &models.UpdateManifestParams{
+					UpdatedContent: &contentYamlPatch,
+					FileName:       fileNameYamlPatch,
+					Folder:         defaultFolder,
+				},
+			})
+			Expect(response).Should(BeAssignableToTypeOf(operations.NewV2UpdateClusterManifestOK()))
+			responsePayload := response.(*operations.V2UpdateClusterManifestOK)
+			Expect(responsePayload.Payload).ShouldNot(BeNil())
+			Expect(responsePayload.Payload.FileName).To(Equal(fileNameYamlPatch))
+			Expect(responsePayload.Payload.Folder).To(Equal(defaultFolder))
+		})
+
+		It("updates existing file with new content if content is correct for yml patch", func() {
+			clusterID := registerCluster().ID
+			mockUpload(1)
+			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
+				ClusterID: *clusterID,
+				UpdateManifestParams: &models.UpdateManifestParams{
+					UpdatedContent: &contentYamlPatch,
+					FileName:       fileNameYmlPatch,
+					Folder:         defaultFolder,
+				},
+			})
+			Expect(response).Should(BeAssignableToTypeOf(operations.NewV2UpdateClusterManifestOK()))
+			responsePayload := response.(*operations.V2UpdateClusterManifestOK)
+			Expect(responsePayload.Payload).ShouldNot(BeNil())
+			Expect(responsePayload.Payload.FileName).To(Equal(fileNameYmlPatch))
+			Expect(responsePayload.Payload.Folder).To(Equal(defaultFolder))
+		})
+
 		It("updates existing file with new content if content is correct for json", func() {
 			clusterID := registerCluster().ID
 			mockUpload(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameJson, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
 				UpdateManifestParams: &models.UpdateManifestParams{
@@ -994,12 +1249,9 @@ invalid YAML content: {
 			destFolder := "openshift"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, fileNameYaml)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, destFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, fileNameYaml), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
 				UpdateManifestParams: &models.UpdateManifestParams{
@@ -1020,12 +1272,9 @@ invalid YAML content: {
 			destFileName := "destFileName.yaml"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, defaultFolder, destFileName)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, defaultFolder, destFileName, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, defaultFolder, destFileName), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, defaultFolder, fileNameYaml)).Return(true, nil)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, defaultFolder, fileNameYaml, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", destFileName)).Return(false, nil).AnyTimes()
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
@@ -1072,12 +1321,9 @@ invalid YAML content: {
 			destFileName := "test2.json"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName)).Return(nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, destFolder, destFileName, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, srcFolder, srcFileName, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(true, nil)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, srcFolder, srcFileName, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", "test2.json")).Return(false, nil).AnyTimes()
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
@@ -1122,12 +1368,9 @@ invalid YAML content: {
 			destFileName := "test2.json"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName)).Return(nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, destFolder, destFileName, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, srcFolder, srcFileName, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(true, nil).AnyTimes()
 			mockS3Client.EXPECT().DeleteObject(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(true, nil)
-			mockS3Client.EXPECT().DeleteObject(ctx, getMetadataObjectName(clusterID, srcFolder, srcFileName, constants.ManifestSourceUserSupplied)).Return(true, nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, filepath.Join(clusterID.String(), constants.ManifestFolder, "openshift", "test2.json")).Return(false, nil).AnyTimes()
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
@@ -1150,9 +1393,7 @@ invalid YAML content: {
 			destFileName := "test.json"
 			reader := io.NopCloser(strings.NewReader(contentAsYAML))
 			mockS3Client.EXPECT().Download(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(reader, int64(0), nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName)).Return(nil).Times(1)
-			mockS3Client.EXPECT().Upload(ctx, []byte{}, getMetadataObjectName(clusterID, destFolder, destFileName, constants.ManifestSourceUserSupplied)).Return(nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(ctx, getMetadataObjectName(clusterID, srcFolder, srcFileName, constants.ManifestSourceUserSupplied)).Return(true, nil).AnyTimes()
+			mockS3Client.EXPECT().UploadWithMetadata(ctx, []byte(contentAsYAML), getObjectName(clusterID, destFolder, destFileName), gomock.Any()).Return(nil).Times(1)
 			mockS3Client.EXPECT().DoesObjectExist(ctx, getObjectName(clusterID, srcFolder, srcFileName)).Return(true, nil).AnyTimes()
 			response := manifestsAPI.V2UpdateClusterManifest(ctx, operations.V2UpdateClusterManifestParams{
 				ClusterID: *clusterID,
@@ -1193,98 +1434,43 @@ invalid YAML content: {
 		})
 	})
 
-	Describe("IsUserManifest", func() {
-		BeforeEach(func() {
-			ctrl = gomock.NewController(GinkgoT())
-			mockS3Client = s3wrapper.NewMockAPI(ctrl)
-			mockUsageAPI = usage.NewMockAPI(ctrl)
-			manifestsAPI = manifests.NewManifestsAPI(db, common.GetTestLog(), mockS3Client, mockUsageAPI)
-		})
-
-		It("Should determine that a manifest is user generated if there is a metadata file for it", func() {
-			clusterId := strfmt.UUID(uuid.New().String())
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"user-defined-manifest.yaml", "user-supplied")).Return(true, nil).Times(1)
-			Expect(manifestsAPI.IsUserManifest(ctx, clusterId, "openshift", "user-defined-manifest.yaml")).To(BeTrue())
-		})
-
-		It("Should determine that a manifest is not user generated if there is no metadata file for it", func() {
-			clusterId := strfmt.UUID(uuid.New().String())
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"system-generated-manifest.yaml", "user-supplied")).Return(false, nil).Times(1)
-			Expect(manifestsAPI.IsUserManifest(ctx, clusterId, "openshift", "system-generated-manifest.yaml")).To(BeFalse())
-		})
-	})
-
 	Describe("ListClusterManifestsInternal", func() {
 
 		It("Should list both system generated and user manifests if IncludeSystemGenerated is true", func() {
 			clusterId := registerCluster().ID
-			manifests := []string{
-				filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest.yaml"),
-				filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "user-generated-manifest.yaml"),
+			manifests := []s3wrapper.ObjectInfo{
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest.yaml"), Metadata: make(map[string]string)},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest-2.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceSystemGenerated}},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "user-generated-manifest.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}},
 			}
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, filepath.Join(clusterId.String(), constants.ManifestMetadataFolder)).Times(1)
 			objectName := filepath.Join(clusterId.String(), constants.ManifestFolder)
-			mockS3Client.EXPECT().ListObjectsByPrefix(ctx, objectName).Return(manifests, nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"system-generated-manifest.yaml", "user-supplied")).Return(false, nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"user-generated-manifest.yaml", "user-supplied")).Return(true, nil).Times(1)
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, objectName).Return(manifests, nil).Times(1)
 			includeSystemGenerated := true
 			listedManifests, err := manifestsAPI.ListClusterManifestsInternal(ctx, operations.V2ListClusterManifestsParams{
 				ClusterID:              *clusterId,
 				IncludeSystemGenerated: &includeSystemGenerated,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(len(listedManifests)).To(Equal(2))
+			Expect(len(listedManifests)).To(Equal(3))
 			Expect(listedManifests[0].Folder).To(Equal("openshift"))
 			Expect(listedManifests[0].FileName).To(Equal("system-generated-manifest.yaml"))
 			Expect(listedManifests[1].Folder).To(Equal("openshift"))
-			Expect(listedManifests[1].FileName).To(Equal("user-generated-manifest.yaml"))
+			Expect(listedManifests[1].FileName).To(Equal("system-generated-manifest-2.yaml"))
+			Expect(listedManifests[2].Folder).To(Equal("openshift"))
+			Expect(listedManifests[2].FileName).To(Equal("user-generated-manifest.yaml"))
 		})
 
 		It("Should be able to list only user manifests if user and non user manifests are present", func() {
 			clusterId := registerCluster().ID
-			manifests := []string{
-				filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest.yaml"),
-				filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "user-generated-manifest.yaml"),
+			manifests := []s3wrapper.ObjectInfo{
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest.yaml"), Metadata: make(map[string]string)},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest-2.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceSystemGenerated}},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "user-generated-manifest.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}},
 			}
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, filepath.Join(clusterId.String(), constants.ManifestMetadataFolder)).Times(1)
 			objectName := filepath.Join(clusterId.String(), constants.ManifestFolder)
-			mockS3Client.EXPECT().ListObjectsByPrefix(ctx, objectName).Return(manifests, nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"system-generated-manifest.yaml", "user-supplied")).Return(false, nil).Times(1)
-			mockS3Client.EXPECT().DoesObjectExist(
-				ctx,
-				filepath.Join(
-					clusterId.String(),
-					constants.ManifestMetadataFolder,
-					"openshift",
-					"user-generated-manifest.yaml", "user-supplied")).Return(true, nil).Times(1)
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, objectName).Return(manifests, nil).Times(1)
 			includeSystemGenerated := false
 			listedManifests, err := manifestsAPI.ListClusterManifestsInternal(ctx, operations.V2ListClusterManifestsParams{
 				ClusterID:              *clusterId,
@@ -1295,77 +1481,33 @@ invalid YAML content: {
 			Expect(listedManifests[0].Folder).To(Equal("openshift"))
 			Expect(listedManifests[0].FileName).To(Equal("user-generated-manifest.yaml"))
 		})
-	})
 
-	Context("GetManifestMetadata", func() {
-		It("Should be able to list manifest metadata", func() {
+		It("Should check legacy filesystem metadata if no S3/Xattr metata present", func() {
 			clusterId := registerCluster().ID
-			s3Metadata := []string{
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "first.yaml", constants.ManifestSourceUserSupplied),
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "openshift", "second.yaml", constants.ManifestSourceUserSupplied),
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "third.yaml", "some-other-manifest-source"),
+			manifests := []s3wrapper.ObjectInfo{
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "no-new-metadata.yaml"), Metadata: make(map[string]string)},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "system-generated-manifest-2.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceSystemGenerated}},
+				{Path: filepath.Join(clusterId.String(), constants.ManifestFolder, "openshift", "user-generated-manifest.yaml"), Metadata: map[string]string{constants.ManifestSourceAttribute: constants.ManifestSourceUserSupplied}},
 			}
-			mockS3Client.EXPECT().ListObjectsByPrefix(ctx, filepath.Join(clusterId.String(), constants.ManifestMetadataFolder)).Return(s3Metadata, nil).Times(1)
-			userManifests, err := manifests.GetManifestMetadata(ctx, clusterId, mockS3Client)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(userManifests).To(ConsistOf(s3Metadata))
-		})
-	})
-	Context("FilterMetadataOnManifestSource", func() {
-		It("returns metadata paths when matching manifest source", func() {
-			clusterId := registerCluster().ID
-			firstMetadata := filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "first.yaml", constants.ManifestSourceUserSupplied)
-			secondMetadata := filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "openshift", "second.yaml", constants.ManifestSourceUserSupplied)
-			s3Metadata := []string{
-				firstMetadata,
-				secondMetadata,
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "third.yaml", "some-other-manifest-source"),
-			}
-			filteredMetadata := manifests.FilterMetadataOnManifestSource(s3Metadata, constants.ManifestSourceUserSupplied)
-			Expect(filteredMetadata).To(ConsistOf(firstMetadata, secondMetadata))
-		})
-		It("returns an empty list when no metadata have matched the manifest seource", func() {
-			clusterId := registerCluster().ID
-			s3Metadata := []string{
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "first.yaml", constants.ManifestSourceUserSupplied),
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "openshift", "second.yaml", constants.ManifestSourceUserSupplied),
-			}
-			filteredMetadata := manifests.FilterMetadataOnManifestSource(s3Metadata, "some-other-manifest-source")
-			Expect(filteredMetadata).To(ConsistOf())
-		})
-		It("returns an empty list when metadata are malformed", func() {
-			s3Metadata := []string{
-				"first.yaml",
-				"",
-			}
-			filteredMetadata := manifests.FilterMetadataOnManifestSource(s3Metadata, "some-other-manifest-source")
-			Expect(filteredMetadata).To(ConsistOf())
-		})
-	})
-	Context("ResolveManifestNamesFromMetadata", func() {
-		It("returns manifest names when metadata paths are valid", func() {
-			clusterId := registerCluster().ID
-			s3Metadata := []string{
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "first.yaml", constants.ManifestSourceUserSupplied),
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "openshift", "second.yaml", constants.ManifestSourceUserSupplied),
-				filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "manifests", "third.yaml", "some-other-manifest-source"),
-			}
-			manifestNames, err := manifests.ResolveManifestNamesFromMetadata(s3Metadata)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(manifestNames).To(ConsistOf("manifests/first.yaml", "openshift/second.yaml", "manifests/third.yaml"))
-		})
-
-		for _, invalidMetadata := range []string{"foo.yaml", "foo/bar", ""} {
-			invalidMetadata_ := invalidMetadata
-			It("returns an error when metadata are malformed", func() {
-				_, err := manifests.ResolveManifestNamesFromMetadata([]string{invalidMetadata_})
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(Equal(
-					fmt.Sprintf("Failed to extract manifest name from metadata path %s", invalidMetadata_),
-				))
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, filepath.Join(clusterId.String(), constants.ManifestMetadataFolder)).Return(
+				[]s3wrapper.ObjectInfo{{
+					Path:     filepath.Join(clusterId.String(), constants.ManifestMetadataFolder, "openshift", "no-new-metadata.yaml", constants.LegacyManifestSourceUserSupplied),
+					Metadata: make(map[string]string),
+				}}, nil).Times(1)
+			objectName := filepath.Join(clusterId.String(), constants.ManifestFolder)
+			mockS3Client.EXPECT().ListObjectsByPrefixWithMetadata(ctx, objectName).Return(manifests, nil).Times(1)
+			includeSystemGenerated := false
+			listedManifests, err := manifestsAPI.ListClusterManifestsInternal(ctx, operations.V2ListClusterManifestsParams{
+				ClusterID:              *clusterId,
+				IncludeSystemGenerated: &includeSystemGenerated,
 			})
-		}
-
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(listedManifests)).To(Equal(2))
+			Expect(listedManifests[0].Folder).To(Equal("openshift"))
+			Expect(listedManifests[0].FileName).To(Equal("no-new-metadata.yaml"))
+			Expect(listedManifests[1].Folder).To(Equal("openshift"))
+			Expect(listedManifests[1].FileName).To(Equal("user-generated-manifest.yaml"))
+		})
 	})
 })
 

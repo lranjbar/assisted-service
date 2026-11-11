@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	errpkg "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,6 +41,7 @@ import (
 	"github.com/openshift/assisted-service/internal/cluster/validations"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/constants"
+	"github.com/openshift/assisted-service/internal/controller/controllers/mirrorregistry"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/internal/host"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
@@ -50,9 +52,11 @@ import (
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
 	logutil "github.com/openshift/assisted-service/pkg/log"
+	"github.com/openshift/assisted-service/pkg/mirrorregistries"
 	"github.com/openshift/assisted-service/restapi/operations/installer"
 	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
+	imageReference "github.com/openshift/library-go/pkg/image/reference"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
@@ -76,20 +80,28 @@ import (
 )
 
 const (
-	adminPasswordSecretStringTemplate = "%s-admin-password"
-	adminKubeConfigStringTemplate     = "%s-admin-kubeconfig"
-	InstallConfigOverrides            = aiv1beta1.Group + "/install-config-overrides"
-	ClusterDeploymentFinalizerName    = "clusterdeployments." + aiv1beta1.Group + "/ai-deprovision"
-	AgentClusterInstallFinalizerName  = "agentclusterinstall." + aiv1beta1.Group + "/ai-deprovision"
+	adminPasswordSecretStringTemplate   = "%s-admin-password"
+	adminKubeConfigStringTemplate       = "%s-admin-kubeconfig"
+	InstallConfigOverrides              = aiv1beta1.Group + "/install-config-overrides"
+	IgnoredClusterValidationsAnnotation = aiv1beta1.Group + "/ignored-cluster-validations"
+	IgnoredHostValidationsAnnotation    = aiv1beta1.Group + "/ignored-host-validations"
+	ClusterDeploymentFinalizerName      = "clusterdeployments." + aiv1beta1.Group + "/ai-deprovision"
+	AgentClusterInstallFinalizerName    = "agentclusterinstall." + aiv1beta1.Group + "/ai-deprovision"
 )
 
 const HighAvailabilityModeNone = "None"
 const defaultRequeueAfterOnError = 10 * time.Second
 const longerRequeueAfterOnError = 1 * time.Minute
+const ManifestConfigMapIndexField = "spec.manifestsConfigMapNames"
 
 // from https://github.com/openshift/hive/blob/04f2f4f8768b4d8aa413feb5dc5410b5f6e3dcfa/pkg/constants/constants.go#L153
 // not importing this code because it will create a lot of vendoring issues
 const ReconcilePauseAnnotation = "hive.openshift.io/reconcile-pause"
+
+var mapLoadBalancerTypes = map[hiveext.LoadBalancerType]string{
+	hiveext.LoadBalancerTypeClusterManaged: models.LoadBalancerTypeClusterManaged,
+	hiveext.LoadBalancerTypeUserManaged:    models.LoadBalancerTypeUserManaged,
+}
 
 // ClusterDeploymentsReconciler reconciles a Cluster object
 type ClusterDeploymentsReconciler struct {
@@ -104,9 +116,10 @@ type ClusterDeploymentsReconciler struct {
 	Manifests        manifestsapi.ClusterManifestsInternals
 	ServiceBaseURL   string
 	PullSecretHandler
-	AuthType              auth.AuthType
-	VersionsHandler       versions.Handler
-	SpokeK8sClientFactory spoke_k8s_client.SpokeK8sClientFactory
+	AuthType                      auth.AuthType
+	VersionsHandler               versions.Handler
+	SpokeK8sClientFactory         spoke_k8s_client.SpokeK8sClientFactory
+	MirrorRegistriesConfigBuilder mirrorregistries.ServiceMirrorRegistriesConfigBuilder
 }
 
 const minimalOpenShiftVersionForDefaultNetworkTypeOVNKubernetes = "4.12.0-0.0"
@@ -120,7 +133,6 @@ const minimalOpenShiftVersionForDefaultNetworkTypeOVNKubernetes = "4.12.0-0.0"
 // +kubebuilder:rbac:groups=extensions.hive.openshift.io,resources=agentclusterinstalls,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=extensions.hive.openshift.io,resources=agentclusterinstalls/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=extensions.hive.openshift.io,resources=agentclusterinstalls/finalizers,verbs=update
-// +kubebuilder:rbac:groups=config.openshift.io,resources=dnses,verbs=get
 // +kubebuilder:rbac:groups=cluster.open-cluster-management.io,resources=managedclustersets/join,verbs=create
 
 func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -132,10 +144,10 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 	log := logutil.FromContext(ctx, r.Log).WithFields(logFields)
 
 	defer func() {
-		log.Info("ClusterDeployment Reconcile ended")
+		log.Debug("ClusterDeployment Reconcile ended")
 	}()
 
-	log.Info("ClusterDeployment Reconcile started")
+	log.Debug("ClusterDeployment Reconcile started")
 
 	clusterDeployment := &hivev1.ClusterDeployment{}
 	clusterInstallDeleted := false
@@ -152,7 +164,7 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 
 	clusterInstall := &hiveext.AgentClusterInstall{}
 	if clusterDeployment.Spec.ClusterInstallRef == nil {
-		log.Infof("AgentClusterInstall not set for ClusterDeployment %s", clusterDeployment.Name)
+		log.Debugf("AgentClusterInstall not set for ClusterDeployment %s", clusterDeployment.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -167,14 +179,14 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 		if k8serrors.IsNotFound(err) {
 			// mark that clusterInstall was already deleted so we skip it if needed.
 			clusterInstallDeleted = true
-			log.WithField("AgentClusterInstall", aciName).Infof("AgentClusterInstall does not exist for ClusterDeployment %s", clusterDeployment.Name)
+			log.WithField("AgentClusterInstall", aciName).Debugf("AgentClusterInstall does not exist for ClusterDeployment %s", clusterDeployment.Name)
 			if clusterDeployment.ObjectMeta.DeletionTimestamp.IsZero() {
 				// we have no agentClusterInstall and clusterDeployment is not being deleted. stop reconciliation.
 				return ctrl.Result{}, nil
 			}
 		} else {
 			log.WithError(err).Errorf("failed to get AgentClusterInstall name=%s namespace=%s", aciName, clusterDeployment.Namespace)
-			return ctrl.Result{Requeue: true}, err
+			return ctrl.Result{}, err
 		}
 	}
 
@@ -196,38 +208,81 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 	err = r.ensureOwnerRef(ctx, log, clusterDeployment, clusterInstall)
 	if err != nil {
 		log.WithError(err).Error("error setting owner reference")
-		return ctrl.Result{Requeue: true}, err
+		return ctrl.Result{}, err
+	}
+	pullSecret, err := r.getPullSecret(ctx, clusterDeployment, clusterInstall)
+	if err != nil {
+		log.WithError(err).Errorf("failed to get pull secret for cluster deployment %s", clusterDeployment.Name)
+		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
+	}
+
+	clusterImageSet, err := r.ensureClusterImageSetRef(ctx, log, clusterDeployment, clusterInstall)
+	if err != nil {
+		log.WithError(err).Errorf("failed to ensure release image for cluster %s, AgentClusterInstall.Spec.ImageSetRef must reference a valid ClusterImageSet", clusterDeployment.Name)
+		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
+	}
+
+	var mirrorRegistryConfiguration *common.MirrorRegistryConfiguration
+	if clusterInstall.Spec.MirrorRegistryRef != nil {
+		log.Infof("Found MirrorRegistry referenace on AgentClusterInstall %s %s", clusterInstall.Name, clusterInstall.Namespace)
+		mirrorRegistryConfiguration, err = r.processMirrorRegistryConfig(ctx, log, clusterInstall)
+		if err != nil {
+			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, newInputError("%s", err.Error()))
+		}
 	}
 
 	cluster, err := r.Installer.GetClusterByKubeKey(req.NamespacedName)
-	if err1 := r.validateClusterDeployment(clusterDeployment, clusterInstall); err1 != nil {
-		log.Error(err1)
-		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err1)
-	}
 	if errors.Is(err, gorm.ErrRecordNotFound) {
+		releaseImage, releaseImageErr := r.getReleaseImage(ctx, clusterImageSet, pullSecret)
+		if releaseImageErr != nil {
+			log.WithError(releaseImageErr).Errorf("failed to get release image for cluster %s", clusterDeployment.Name)
+			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, releaseImageErr)
+		}
 		if !isInstalled(clusterDeployment, clusterInstall) {
-			return r.createNewCluster(ctx, log, req.NamespacedName, clusterDeployment, clusterInstall)
+			return r.createNewCluster(ctx, log, req.NamespacedName, pullSecret, releaseImage, clusterDeployment, clusterInstall, mirrorRegistryConfiguration)
 		}
 
-		return r.createNewDay2Cluster(ctx, log, req.NamespacedName, clusterDeployment, clusterInstall)
+		return r.createNewDay2Cluster(ctx, log, req.NamespacedName, releaseImage, clusterDeployment, clusterInstall)
 	}
 	if err != nil {
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
 	}
 
+	if cluster.ID == nil {
+		return ctrl.Result{}, fmt.Errorf("cluster associated with namespace '%s', name '%s' is missing ID", req.Namespace, req.Name)
+	}
+
 	// check for updates from user, compare spec and update if needed
-	cluster, err = r.updateIfNeeded(ctx, log, clusterDeployment, clusterInstall, cluster)
+	cluster, err = r.updateIfNeeded(ctx, log, clusterDeployment, clusterInstall, cluster, mirrorRegistryConfiguration)
 	if err != nil {
 		log.WithError(err).Error("failed to update cluster")
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
 	}
 
-	// check for install config overrides and update if needed
-	err = r.updateInstallConfigOverrides(ctx, log, clusterInstall, cluster)
+	err = r.applyClusterInstallAnnotations(ctx, log, clusterInstall, cluster)
 	if err != nil {
-		log.WithError(err).Error("failed to update install config overrides")
+		log.WithError(err).Error("failed to apply AgentClusterInstall annotations")
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
 	}
+
+	if !common.IsDay2Cluster(cluster) && r.Manifests != nil {
+		r.ensureManifestConfigMapsLabelled(ctx, log, clusterInstall)
+
+		if err = r.addCustomManifests(ctx, log, clusterInstall, cluster); err != nil {
+			log.WithError(err).Error("failed to sync custom manifests")
+			// We decided to requeue with one minute timeout in order to give user a chance to fix manifest
+			// this timeout allows us not to run reconcile too much time and
+			// still have a nice feedback when user will fix the error
+			_, _ = r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
+			return ctrl.Result{RequeueAfter: longerRequeueAfterOnError}, nil
+		}
+	}
+
+	return r.reconcileExistingCluster(ctx, log, clusterDeployment, clusterInstall, cluster)
+}
+
+func (r *ClusterDeploymentsReconciler) reconcileExistingCluster(ctx context.Context, log logrus.FieldLogger,
+	clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) (ctrl.Result, error) {
 
 	// In case the Cluster is a Day 1 cluster and is installed, update the Metadata and create secrets for credentials
 	if *cluster.Status == models.ClusterStatusInstalled && swag.StringValue(cluster.Kind) == models.ClusterKindCluster {
@@ -236,9 +291,9 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 
 	// Create Kubeconfig no-ingress if needed
 	if *cluster.Status == models.ClusterStatusInstalling || *cluster.Status == models.ClusterStatusFinalizing {
-		if err1 := r.createNoIngressKubeConfig(ctx, log, clusterDeployment, cluster, clusterInstall); err1 != nil {
-			log.WithError(err1).Error("failed to create kubeconfig no-ingress secret")
-			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err1)
+		if err := r.createNoIngressKubeConfig(ctx, log, clusterDeployment, cluster, clusterInstall); err != nil {
+			log.WithError(err).Error("failed to create kubeconfig no-ingress secret")
+			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
 		}
 	}
 
@@ -254,15 +309,20 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 	return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, nil)
 }
 
-func (r *ClusterDeploymentsReconciler) validateClusterDeployment(clusterDeployment *hivev1.ClusterDeployment,
-	clusterInstall *hiveext.AgentClusterInstall) error {
-
-	// Make sure that the ImageSetRef is set for clusters not already installed
-	if clusterInstall.Spec.ImageSetRef == nil && !clusterDeployment.Spec.Installed {
-		return newInputError("missing ImageSetRef for cluster that is not installed")
+func (r *ClusterDeploymentsReconciler) getPullSecret(ctx context.Context, clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall) (string, error) {
+	if clusterDeployment.Spec.PullSecretRef == nil || clusterDeployment.Spec.PullSecretRef.Name == "" {
+		// Pull secret is not required for already installed clusters
+		if isInstalled(clusterDeployment, clusterInstall) {
+			return "", nil
+		}
+		return "", newInputError("PullSecret is required for ClusterDeployment %s/%s", clusterDeployment.Name, clusterDeployment.Namespace)
 	}
-
-	return nil
+	// Ensure the pull secret is valid
+	pullSecret, err := r.PullSecretHandler.GetValidPullSecret(ctx, getPullSecretKey(clusterDeployment.Namespace, clusterDeployment.Spec.PullSecretRef))
+	if err != nil {
+		return "", errors.WithMessagef(err, "failed to validate pull secret for ClusterDeployment %s/%s", clusterDeployment.Name, clusterDeployment.Namespace)
+	}
+	return pullSecret, nil
 }
 
 func (r *ClusterDeploymentsReconciler) agentClusterInstallFinalizer(ctx context.Context, log logrus.FieldLogger, req ctrl.Request,
@@ -283,14 +343,20 @@ func (r *ClusterDeploymentsReconciler) agentClusterInstallFinalizer(ctx context.
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return &ctrl.Result{Requeue: true}, err
 			}
-			if err == nil {
-				if swag.StringValue(cluster.Status) == models.ClusterStatusInstalling || swag.StringValue(cluster.Status) == models.ClusterStatusPreparingForInstallation {
-					log.Infof("ClusterInstall is being deleted, cancel installation for cluster %s", *cluster.ID)
-					if _, err = r.Installer.CancelInstallationInternal(ctx, installer.V2CancelInstallationParams{
-						ClusterID: *cluster.ID,
-					}); err != nil {
-						return &ctrl.Result{Requeue: true}, err
-					}
+			// these should match the valid source states for the cancel installation transition
+			cancelStates := []string{
+				models.ClusterStatusInstalling,
+				models.ClusterStatusPreparingForInstallation,
+				models.ClusterStatusInstallingPendingUserAction,
+				models.ClusterStatusFinalizing,
+				models.ClusterStatusError,
+			}
+			if err == nil && funk.Contains(cancelStates, swag.StringValue(cluster.Status)) {
+				log.Infof("ClusterInstall is being deleted, cancel installation for cluster %s", *cluster.ID)
+				if _, err = r.Installer.CancelInstallationInternal(ctx, installer.V2CancelInstallationParams{
+					ClusterID: *cluster.ID,
+				}); err != nil {
+					return &ctrl.Result{Requeue: true}, err
 				}
 			}
 			//Unbind agents
@@ -364,25 +430,47 @@ func isInstalled(clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hi
 	return cond != nil && cond.Reason == hiveext.ClusterInstalledReason
 }
 
+// getHostSuggestedRoleCount returns the amount of suggested masters and workers for the given cluster.
+// It counts from DB as the hosts are not loaded to memory, and we want to avoid loading them.
+func getHostSuggestedRoleCount(clusterAPI cluster.API, clusterID strfmt.UUID) (*int64, *int64, *int64, error) {
+	var combinedErr error
+
+	mastersCountPtr, err := clusterAPI.GetHostCountByRole(clusterID, models.HostRoleMaster, true)
+	if err != nil {
+		combinedErr = errpkg.Join(combinedErr, err)
+	}
+
+	arbiterCountPtr, err := clusterAPI.GetHostCountByRole(clusterID, models.HostRoleArbiter, true)
+	if err != nil {
+		combinedErr = errpkg.Join(combinedErr, err)
+	}
+
+	workersCountPtr, err := clusterAPI.GetHostCountByRole(clusterID, models.HostRoleWorker, true)
+	if err != nil {
+		combinedErr = errpkg.Join(combinedErr, err)
+	}
+
+	if combinedErr != nil {
+		// convert the err to one line
+		combinedErr = errors.New(strings.ReplaceAll(combinedErr.Error(), "\n", ", "))
+		return nil, nil, nil, combinedErr
+	}
+
+	return mastersCountPtr, arbiterCountPtr, workersCountPtr, nil
+}
+
 func (r *ClusterDeploymentsReconciler) installDay1(ctx context.Context, log logrus.FieldLogger, clusterDeployment *hivev1.ClusterDeployment,
 	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) (ctrl.Result, error) {
-	ready, err := r.isReadyForInstallation(ctx, log, clusterInstall, cluster)
+
+	ready, err := r.isReadyForInstallation(
+		ctx, log, clusterInstall, cluster,
+	)
 	if err != nil {
 		log.WithError(err).Error("failed to check if cluster ready for installation")
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
 	}
-	if ready {
-		// create custom manifests if needed before installation
-		err = r.addCustomManifests(ctx, log, clusterInstall, cluster)
-		if err != nil {
-			log.WithError(err).Error("failed to add custom manifests")
-			_, _ = r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, err)
-			// We decided to requeue with one minute timeout in order to give user a chance to fix manifest
-			// this timeout allows us not to run reconcile too much time and
-			// still have a nice feedback when user will fix the error
-			return ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}, nil
-		}
 
+	if ready {
 		log.Infof("Installing clusterDeployment %s %s", clusterDeployment.Name, clusterDeployment.Namespace)
 		var ic *common.Cluster
 		ic, err = r.Installer.InstallClusterInternal(ctx, installer.V2InstallClusterParams{
@@ -394,6 +482,7 @@ func (r *ClusterDeploymentsReconciler) installDay1(ctx context.Context, log logr
 		}
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, ic, err)
 	}
+
 	return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, cluster, nil)
 }
 
@@ -414,7 +503,7 @@ func (r *ClusterDeploymentsReconciler) spokeKubeClient(ctx context.Context, clus
 		r.Log.WithError(err).Errorf("failed to label kubeconfig secret %s", namespacedName)
 		return nil, err
 	}
-	return r.SpokeK8sClientFactory.CreateFromSecret(secret)
+	return r.SpokeK8sClientFactory.CreateFromSecret(clusterDeployment, secret)
 }
 
 func (r *ClusterDeploymentsReconciler) updateWorkerMcpPaused(ctx context.Context, log logrus.FieldLogger, clusterInstall *hiveext.AgentClusterInstall, clusterDeployment *hivev1.ClusterDeployment) error {
@@ -550,6 +639,7 @@ func (r *ClusterDeploymentsReconciler) updateKubeConfigSecret(ctx context.Contex
 	if err != nil {
 		return nil, err
 	}
+	defer respBody.Close()
 	respBytes, err := io.ReadAll(respBody)
 	if err != nil {
 		return nil, err
@@ -578,6 +668,7 @@ func (r *ClusterDeploymentsReconciler) ensureKubeConfigNoIngressSecret(ctx conte
 	if err != nil {
 		return nil, err
 	}
+	defer respBody.Close()
 	respBytes, err := io.ReadAll(respBody)
 	if err != nil {
 		return nil, err
@@ -617,7 +708,12 @@ func (r *ClusterDeploymentsReconciler) createClusterCredentialSecret(ctx context
 	return s, r.Create(ctx, s)
 }
 
-func (r *ClusterDeploymentsReconciler) isReadyForInstallation(ctx context.Context, log logrus.FieldLogger, clusterInstall *hiveext.AgentClusterInstall, c *common.Cluster) (bool, error) {
+func (r *ClusterDeploymentsReconciler) isReadyForInstallation(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	clusterInstall *hiveext.AgentClusterInstall,
+	c *common.Cluster,
+) (bool, error) {
 	if ready, _ := r.ClusterApi.IsReadyForInstallation(c); !ready {
 		return false, nil
 	}
@@ -636,9 +732,25 @@ func (r *ClusterDeploymentsReconciler) isReadyForInstallation(ctx context.Contex
 
 	unsyncedHosts := getNumOfUnsyncedAgents(agents)
 	log.Debugf("Calculating installation readiness, found %d unsynced agents out of total of %d agents", unsyncedHosts, len(agents))
-	expectedHosts := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents +
-		clusterInstall.Spec.ProvisionRequirements.WorkerAgents
-	return approvedHosts == expectedHosts && registered == approvedHosts && unsyncedHosts == 0, nil
+
+	expectedMasterCount := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents
+	expectedArbiterCount := clusterInstall.Spec.ProvisionRequirements.ArbiterAgents
+	expectedWorkerCount := clusterInstall.Spec.ProvisionRequirements.WorkerAgents
+	expectedHostCount := expectedMasterCount + expectedWorkerCount + expectedArbiterCount
+
+	masterCountPtr, arbiterCountPtr, workerCountPtr, err := getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
+	if err != nil {
+		// will be shown as a SpecSynced error
+		log.WithError(err).Error("failed to fetch host suggested role count")
+		return false, err
+	}
+
+	return approvedHosts == expectedHostCount &&
+		registered == expectedHostCount &&
+		int(swag.Int64Value(masterCountPtr)) == expectedMasterCount &&
+		int(swag.Int64Value(arbiterCountPtr)) == expectedArbiterCount &&
+		int(swag.Int64Value(workerCountPtr)) == expectedWorkerCount &&
+		unsyncedHosts == 0, nil
 }
 
 func isSupportedPlatform(cluster *hivev1.ClusterDeployment) bool {
@@ -659,24 +771,11 @@ func isUserManagedNetwork(clusterInstall *hiveext.AgentClusterInstall) bool {
 		clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents == 1 && clusterInstall.Spec.ProvisionRequirements.WorkerAgents == 0
 }
 
-func isDiskEncryptionEnabled(clusterInstall *hiveext.AgentClusterInstall) bool {
-	if clusterInstall.Spec.DiskEncryption == nil {
-		return false
-	}
-	switch swag.StringValue(clusterInstall.Spec.DiskEncryption.EnableOn) {
-	case models.DiskEncryptionEnableOnAll, models.DiskEncryptionEnableOnMasters, models.DiskEncryptionEnableOnWorkers:
-		return true
-	case models.DiskEncryptionEnableOnNone:
-		return false
-	default:
-		return false
-	}
-}
-
 // see https://docs.openshift.com/container-platform/4.7/installing/installing_platform_agnostic/installing-platform-agnostic.html#installation-bare-metal-config-yaml_installing-platform-agnostic
 func hyperthreadingInSpec(clusterInstall *hiveext.AgentClusterInstall) bool {
 	//check if either master or worker pool hyperthreading settings are explicitly specified
 	return clusterInstall.Spec.ControlPlane != nil ||
+		clusterInstall.Spec.Arbiter != nil ||
 		funk.Contains(clusterInstall.Spec.Compute, func(pool hiveext.AgentMachinePool) bool {
 			return pool.Name == hiveext.WorkerAgentMachinePool
 		})
@@ -746,45 +845,43 @@ func getPlatformType(platform *models.Platform) hiveext.PlatformType {
 }
 
 func getHyperthreading(clusterInstall *hiveext.AgentClusterInstall) *string {
-	const (
-		None    = 0
-		Workers = 1
-		Masters = 2
-		All     = 3
-	)
-	var config uint = 0
-
 	//if there is no configuration of hyperthreading in the Spec then
 	//we are opting of the default behavior which is all enabled
 	if !hyperthreadingInSpec(clusterInstall) {
-		config = All
+		return swag.String(models.ClusterHyperthreadingAll)
+	}
+
+	//will keep the enabled pools in the order defined in the enum
+	//first masters and then arbiters and then workers
+	pools := make([]string, 0)
+
+	//check if the Spec enables hyperthreading for masters
+	if clusterInstall.Spec.ControlPlane != nil {
+		if clusterInstall.Spec.ControlPlane.Hyperthreading == hiveext.HyperthreadingEnabled {
+			pools = append(pools, models.ClusterHyperthreadingMasters)
+		}
+	}
+
+	//check if the Spec enables hyperthreading for arbiters
+	if clusterInstall.Spec.Arbiter != nil {
+		if clusterInstall.Spec.Arbiter.Hyperthreading == hiveext.HyperthreadingEnabled {
+			pools = append(pools, models.ClusterHyperthreadingArbiters)
+		}
 	}
 
 	//check if the Spec enables hyperthreading for workers
 	for _, machinePool := range clusterInstall.Spec.Compute {
 		if machinePool.Name == hiveext.WorkerAgentMachinePool && machinePool.Hyperthreading == hiveext.HyperthreadingEnabled {
-			config = config | Workers
+			pools = append(pools, models.ClusterHyperthreadingWorkers)
+			break
 		}
 	}
 
-	//check if the Spec enables hyperthreading for masters
-	if clusterInstall.Spec.ControlPlane != nil {
-		if clusterInstall.Spec.ControlPlane.Hyperthreading == hiveext.HyperthreadingEnabled {
-			config = config | Masters
-		}
-	}
-
-	//map between CRD Spec and cluster API
-	switch config {
-	case None:
+	if funk.IsEmpty(pools) {
 		return swag.String(models.ClusterHyperthreadingNone)
-	case Workers:
-		return swag.String(models.ClusterHyperthreadingWorkers)
-	case Masters:
-		return swag.String(models.ClusterHyperthreadingMasters)
-	default:
-		return swag.String(models.ClusterHyperthreadingAll)
 	}
+
+	return swag.String(strings.Join(pools, ","))
 }
 
 func (r *ClusterDeploymentsReconciler) getEncodedCACert(ctx context.Context,
@@ -966,14 +1063,38 @@ func (r *ClusterDeploymentsReconciler) updateNetworkParams(clusterDeployment *hi
 		params.UserManagedNetworking = swag.Bool(userManagedNetwork)
 		update = true
 	}
+
+	if shouldUpdateLoadBalancer(clusterInstall, cluster) {
+		update = true
+		params.LoadBalancer = &models.LoadBalancer{Type: mapLoadBalancerTypes[clusterInstall.Spec.LoadBalancer.Type]}
+	}
+
 	return swag.Bool(update), nil
 }
 
-func (r *ClusterDeploymentsReconciler) updateIfNeeded(ctx context.Context,
+func shouldUpdateLoadBalancer(
+	clusterInstall *hiveext.AgentClusterInstall,
+	cluster *common.Cluster,
+) bool {
+	if clusterInstall.Spec.LoadBalancer == nil {
+		return false
+	}
+
+	convertedLoadBalancer, ok := mapLoadBalancerTypes[clusterInstall.Spec.LoadBalancer.Type]
+	if !ok {
+		return false
+	}
+
+	return cluster.LoadBalancer == nil || convertedLoadBalancer != cluster.LoadBalancer.Type
+}
+
+func (r *ClusterDeploymentsReconciler) updateIfNeeded(
+	ctx context.Context,
 	log logrus.FieldLogger,
 	clusterDeployment *hivev1.ClusterDeployment,
 	clusterInstall *hiveext.AgentClusterInstall,
-	cluster *common.Cluster) (*common.Cluster, error) {
+	cluster *common.Cluster,
+	mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) (*common.Cluster, error) {
 
 	update := false
 	params := &models.V2ClusterUpdateParams{}
@@ -997,6 +1118,9 @@ func (r *ClusterDeploymentsReconciler) updateIfNeeded(ctx context.Context,
 	// Trim key before comparing as done in RegisterClusterInternal
 	sshPublicKey := strings.TrimSpace(clusterInstall.Spec.SSHPublicKey)
 	updateString(sshPublicKey, cluster.SSHPublicKey, &params.SSHPublicKey)
+	updateString(clusterInstall.Spec.OSStream, cluster.OsStream, &params.OsStream)
+
+	updateString(strings.Join(clusterInstall.Spec.NTPSources, ","), cluster.NtpSources, &params.NtpSources)
 
 	// Update ignition endpoint if needed
 	shouldUpdate, err := r.updateIgnitionInUpdateParams(ctx, log, clusterInstall, cluster, params)
@@ -1037,8 +1161,12 @@ func (r *ClusterDeploymentsReconciler) updateIfNeeded(ctx context.Context,
 		if cluster.DiskEncryption == nil { // true when current cluster configuration does not include disk encryption
 			cluster.DiskEncryption = &models.DiskEncryption{}
 		}
-		updateString(swag.StringValue(clusterInstall.Spec.DiskEncryption.EnableOn), swag.StringValue(cluster.DiskEncryption.EnableOn), &params.DiskEncryption.EnableOn)
-		updateString(swag.StringValue(clusterInstall.Spec.DiskEncryption.Mode), swag.StringValue(cluster.DiskEncryption.Mode), &params.DiskEncryption.Mode)
+		enableOn, mode := common.DiskEncryptionFieldDefaults(
+			clusterInstall.Spec.DiskEncryption.EnableOn,
+			clusterInstall.Spec.DiskEncryption.Mode,
+		)
+		updateString(enableOn, swag.StringValue(cluster.DiskEncryption.EnableOn), &params.DiskEncryption.EnableOn)
+		updateString(mode, swag.StringValue(cluster.DiskEncryption.Mode), &params.DiskEncryption.Mode)
 		if clusterInstall.Spec.DiskEncryption.TangServers != cluster.DiskEncryption.TangServers {
 			params.DiskEncryption.TangServers = clusterInstall.Spec.DiskEncryption.TangServers
 			update = true
@@ -1060,6 +1188,16 @@ func (r *ClusterDeploymentsReconciler) updateIfNeeded(ctx context.Context,
 		update = true
 	}
 
+	if clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents != int(cluster.ControlPlaneCount) {
+		params.ControlPlaneCount = swag.Int64(int64(clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents))
+		update = true
+	}
+
+	if label, exists := clusterInstall.GetLabels()[hiveext.ClusterConsumerLabel]; exists && label != cluster.Tags {
+		params.Tags = &label
+		update = true
+	}
+
 	if !update {
 		return cluster, nil
 	}
@@ -1069,7 +1207,7 @@ func (r *ClusterDeploymentsReconciler) updateIfNeeded(ctx context.Context,
 	clusterAfterUpdate, err = r.Installer.UpdateClusterNonInteractive(ctx, installer.V2UpdateClusterParams{
 		ClusterUpdateParams: params,
 		ClusterID:           *cluster.ID,
-	})
+	}, mirrorRegistryConfiguration)
 	if err != nil {
 		return cluster, err
 	}
@@ -1115,8 +1253,7 @@ func selectClusterNetworkType(params *models.V2ClusterUpdateParams, cluster *com
 	}
 }
 
-func (r *ClusterDeploymentsReconciler) updateInstallConfigOverrides(ctx context.Context, log logrus.FieldLogger, clusterInstall *hiveext.AgentClusterInstall,
-	cluster *common.Cluster) error {
+func (r *ClusterDeploymentsReconciler) updateInstallConfigOverrides(ctx context.Context, log logrus.FieldLogger, clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
 	// not relevant for day2 cluster - install config is not used
 	if common.IsDay2Cluster(cluster) {
 		return nil
@@ -1138,11 +1275,97 @@ func (r *ClusterDeploymentsReconciler) updateInstallConfigOverrides(ctx context.
 				apiErr := errors.Wrapf(err, "Failed to parse '%s' annotation", InstallConfigOverrides)
 				return common.NewApiError(http.StatusBadRequest, apiErr)
 			}
-			return err
+			return errors.Wrapf(err, "failed to update install-config overrides for cluster %s", *cluster.ID)
 		}
 		log.Infof("Updated InstallConfig overrides on clusterInstall %s/%s", clusterInstall.Namespace, clusterInstall.Name)
 		return nil
 	}
+	return nil
+}
+
+// applyClusterInstallAnnotations processes AgentClusterInstall annotations that affect the
+// cluster configuration, including install-config overrides and ignored validations.
+func (r *ClusterDeploymentsReconciler) applyClusterInstallAnnotations(ctx context.Context, log logrus.FieldLogger,
+	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
+	if err := r.updateInstallConfigOverrides(ctx, log, clusterInstall, cluster); err != nil {
+		return err
+	}
+	if err := r.updateIgnoredValidations(ctx, log, clusterInstall, cluster); err != nil {
+		return err
+	}
+	return nil
+}
+
+// commaSeparatedToJSONArray converts a comma-separated string (e.g. "a,b,c") into a JSON array
+// string (e.g. '["a","b","c"]'). Returns an empty string when the input has no items.
+func commaSeparatedToJSONArray(csv string) (string, error) {
+	items, err := common.ParseCommaSeparatedUniqueValues(csv, "ignored validation ID")
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse comma-separated validation IDs")
+	}
+	if len(items) == 0 {
+		return "", nil
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal ignored validation IDs to JSON")
+	}
+	return string(data), nil
+}
+
+// annotationToIgnoredJSON reads a comma-separated list of validation IDs from the
+// given annotation key and returns it as a JSON array string (e.g. '["id-1","id-2"]').
+// If the annotation is present but empty, it returns "[]".
+// If the annotation is not present, it returns an empty string.
+func annotationToIgnoredJSON(annotations map[string]string, key string) (string, error) {
+	value, exists := annotations[key]
+	if !exists {
+		return "", nil
+	}
+	jsonArray, err := commaSeparatedToJSONArray(value)
+	if err != nil {
+		return "", errors.Wrapf(err, "annotation %q", key)
+	}
+	if jsonArray == "" {
+		return "[]", nil
+	}
+	return jsonArray, nil
+}
+
+// updateIgnoredValidations reads the ignored-cluster-validations and ignored-host-validations
+// annotations from the AgentClusterInstall and applies them to the cluster via the installer API.
+// It is a no-op when the annotations have not changed since the last reconciliation.
+func (r *ClusterDeploymentsReconciler) updateIgnoredValidations(ctx context.Context, log logrus.FieldLogger,
+	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
+
+	annotations := clusterInstall.ObjectMeta.GetAnnotations()
+
+	newIgnoredCluster, err := annotationToIgnoredJSON(annotations, IgnoredClusterValidationsAnnotation)
+	if err != nil {
+		return common.NewApiError(http.StatusBadRequest, errors.Wrapf(err, "Failed to parse '%s' annotation", IgnoredClusterValidationsAnnotation))
+	}
+	newIgnoredHost, err := annotationToIgnoredJSON(annotations, IgnoredHostValidationsAnnotation)
+	if err != nil {
+		return common.NewApiError(http.StatusBadRequest, errors.Wrapf(err, "Failed to parse '%s' annotation", IgnoredHostValidationsAnnotation))
+	}
+
+	if newIgnoredCluster == cluster.IgnoredClusterValidations && newIgnoredHost == cluster.IgnoredHostValidations {
+		return nil
+	}
+
+	log.Infof("Updating ignored validations on cluster %s/%s (cluster: %q, host: %q)",
+		clusterInstall.Namespace, clusterInstall.Name, newIgnoredCluster, newIgnoredHost)
+
+	err = r.Installer.SetIgnoredValidationsInternal(ctx, *cluster.ID, newIgnoredCluster, newIgnoredHost)
+	if err != nil {
+		if IsUserError(err) {
+			return err
+		}
+		return errors.Wrapf(err, "failed to update ignored validations for cluster %s", cluster.ID)
+	}
+
+	cluster.IgnoredClusterValidations = newIgnoredCluster
+	cluster.IgnoredHostValidations = newIgnoredHost
 	return nil
 }
 
@@ -1236,6 +1459,42 @@ func (r *ClusterDeploymentsReconciler) getManifestConfigMap(ctx context.Context,
 	return configMap, nil
 }
 
+func (r *ClusterDeploymentsReconciler) ensureManifestConfigMapsLabelled(ctx context.Context, log logrus.FieldLogger,
+	clusterInstall *hiveext.AgentClusterInstall) {
+	for _, name := range getManifestConfigMapNames(clusterInstall) {
+		cm := &corev1.ConfigMap{}
+		key := types.NamespacedName{Namespace: clusterInstall.Namespace, Name: name}
+		if err := r.Get(ctx, key, cm); err != nil {
+			continue
+		}
+		if err := ensureConfigMapIsLabelled(ctx, r.Client, cm, key); err != nil {
+			log.WithError(err).Warnf("Failed to label manifest configmap %s", name)
+		}
+	}
+}
+
+func getManifestConfigMapNames(clusterInstall *hiveext.AgentClusterInstall) []string {
+	if clusterInstall.Spec.ManifestsConfigMapRefs != nil {
+		names := make([]string, 0, len(clusterInstall.Spec.ManifestsConfigMapRefs))
+		for _, ref := range clusterInstall.Spec.ManifestsConfigMapRefs {
+			names = append(names, ref.Name)
+		}
+		return names
+	}
+	if clusterInstall.Spec.ManifestsConfigMapRef != nil {
+		return []string{clusterInstall.Spec.ManifestsConfigMapRef.Name}
+	}
+	return nil
+}
+
+func indexManifestConfigMapNames(obj client.Object) []string {
+	aci, ok := obj.(*hiveext.AgentClusterInstall)
+	if !ok {
+		return nil
+	}
+	return getManifestConfigMapNames(aci)
+}
+
 func (r *ClusterDeploymentsReconciler) addCustomManifests(ctx context.Context, log logrus.FieldLogger,
 	clusterInstall *hiveext.AgentClusterInstall, cluster *common.Cluster) error {
 
@@ -1257,29 +1516,45 @@ func (r *ClusterDeploymentsReconciler) addCustomManifests(ctx context.Context, l
 		return nil
 	}
 
-	return r.syncManifests(ctx, log, cluster, clusterInstall, alreadyCreatedManifests)
+	err = r.syncManifests(ctx, log, cluster, clusterInstall, alreadyCreatedManifests)
+	if err != nil && len(alreadyCreatedManifests) > 0 {
+		// When sync fails (e.g. referenced ConfigMap was deleted), remove
+		// previously-synced manifests so the backend validation correctly
+		// detects their absence on the next reconcile cycle.
+		for _, manifest := range alreadyCreatedManifests {
+			log.Infof("Cleaning up manifest %s after sync failure", manifest.FileName)
+			_ = r.Manifests.DeleteClusterManifestInternal(ctx, operations.V2DeleteClusterManifestParams{
+				ClusterID: *cluster.ID,
+				FileName:  manifest.FileName,
+				Folder:    swag.String(models.ManifestFolderOpenshift),
+			})
+		}
+	}
+	return err
 }
 
 func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall,
-	pullSecret string, releaseImageVersion string, releaseImageCPUArch string,
-	ignitionEndpoint *models.IgnitionEndpoint) *models.ClusterCreateParams {
+	pullSecret string, releaseImage *models.ReleaseImage,
+	ignitionEndpoint *models.IgnitionEndpoint, olmOperators []*models.OperatorCreateParams) *models.ClusterCreateParams {
 	spec := clusterDeployment.Spec
 	platform, _ := getPlatform(clusterInstall.Spec)
 
 	clusterParams := &models.ClusterCreateParams{
 		BaseDNSDomain:         spec.BaseDomain,
 		Name:                  swag.String(spec.ClusterName),
-		OpenshiftVersion:      &releaseImageVersion,
-		OlmOperators:          nil, // TODO: handle operators
+		OpenshiftVersion:      releaseImage.Version,
 		PullSecret:            swag.String(pullSecret),
 		VipDhcpAllocation:     swag.Bool(false),
 		APIVips:               ApiVipsEntriesToArray(clusterInstall.Spec.APIVIPs),
 		IngressVips:           IngressVipsEntriesToArray(clusterInstall.Spec.IngressVIPs),
 		SSHPublicKey:          clusterInstall.Spec.SSHPublicKey,
-		CPUArchitecture:       releaseImageCPUArch,
+		CPUArchitecture:       *releaseImage.CPUArchitecture,
 		UserManagedNetworking: swag.Bool(isUserManagedNetwork(clusterInstall)),
 		Platform:              platform,
 		SchedulableMasters:    swag.Bool(clusterInstall.Spec.MastersSchedulable),
+		ControlPlaneCount:     swag.Int64(int64(clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents)),
+		OcpReleaseImage:       *releaseImage.URL,
+		OsStream:              clusterInstall.Spec.OSStream,
 	}
 
 	if len(clusterInstall.Spec.Networking.ClusterNetwork) > 0 {
@@ -1311,14 +1586,27 @@ func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterIns
 		clusterParams.HighAvailabilityMode = swag.String(HighAvailabilityModeNone)
 	}
 
+	if len(clusterInstall.Spec.NTPSources) > 0 {
+		clusterParams.NtpSources = swag.String(strings.Join(clusterInstall.Spec.NTPSources, ","))
+	}
+
 	if hyperthreadingInSpec(clusterInstall) {
 		clusterParams.Hyperthreading = getHyperthreading(clusterInstall)
 	}
 
-	if isDiskEncryptionEnabled(clusterInstall) {
+	if clusterInstall.Spec.DiskEncryption != nil &&
+		common.RequestsDiskEncryptionConfiguration(
+			clusterInstall.Spec.DiskEncryption.EnableOn,
+			clusterInstall.Spec.DiskEncryption.Mode,
+			clusterInstall.Spec.DiskEncryption.TangServers,
+		) {
+		enableOn, mode := common.DiskEncryptionFieldDefaults(
+			clusterInstall.Spec.DiskEncryption.EnableOn,
+			clusterInstall.Spec.DiskEncryption.Mode,
+		)
 		clusterParams.DiskEncryption = &models.DiskEncryption{
-			EnableOn:    clusterInstall.Spec.DiskEncryption.EnableOn,
-			Mode:        clusterInstall.Spec.DiskEncryption.Mode,
+			EnableOn:    swag.String(enableOn),
+			Mode:        swag.String(mode),
 			TangServers: clusterInstall.Spec.DiskEncryption.TangServers,
 		}
 	}
@@ -1339,6 +1627,20 @@ func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterIns
 		clusterParams.IgnitionEndpoint = ignitionEndpoint
 	}
 
+	if clusterInstall.Spec.LoadBalancer != nil {
+		if convertedType, ok := mapLoadBalancerTypes[clusterInstall.Spec.LoadBalancer.Type]; ok {
+			clusterParams.LoadBalancer = &models.LoadBalancer{Type: convertedType}
+		}
+	}
+
+	if len(olmOperators) != 0 {
+		clusterParams.OlmOperators = olmOperators
+	}
+
+	if label, exists := clusterInstall.GetLabels()[hiveext.ClusterConsumerLabel]; exists && label != "" {
+		clusterParams.Tags = &label
+	}
+
 	return clusterParams
 }
 
@@ -1346,27 +1648,19 @@ func (r *ClusterDeploymentsReconciler) createNewCluster(
 	ctx context.Context,
 	log logrus.FieldLogger,
 	key types.NamespacedName,
+	pullSecret string,
+	releaseImage *models.ReleaseImage,
 	clusterDeployment *hivev1.ClusterDeployment,
-	clusterInstall *hiveext.AgentClusterInstall) (ctrl.Result, error) {
+	clusterInstall *hiveext.AgentClusterInstall,
+	mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) (ctrl.Result, error) {
 
 	log.Infof("Creating a new cluster %s %s", clusterDeployment.Name, clusterDeployment.Namespace)
-	spec := clusterDeployment.Spec
-
-	pullSecret, err := r.PullSecretHandler.GetValidPullSecret(ctx, getPullSecretKey(key.Namespace, spec.PullSecretRef))
-	if err != nil {
-		log.WithError(err).Error("failed to get pull secret")
-		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
+	if releaseImage == nil { // releaseImage shoudn't be nil, but guard against it just in case
+		log.Errorf("release image cannot be nil for day 1 cluster %s %s", clusterDeployment.Name, clusterDeployment.Namespace)
+		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, fmt.Errorf("release image cannot be nil for day 1 cluster %s %s. Ensure AgentClusterInstall.Spec.ImageSetRef references a valid ClusterImageSet", clusterDeployment.Name, clusterDeployment.Namespace))
 	}
-
-	releaseImage, err := r.getReleaseImage(ctx, log, clusterInstall.Spec, pullSecret)
-	if err != nil {
-		log.WithError(err)
-		_, _ = r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
-		// The controller will requeue after one minute, giving the user a chance to fix releaseImage
-		return ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}, nil
-	}
-
 	var ignitionEndpoint *models.IgnitionEndpoint
+	var err error
 	if clusterInstall.Spec.IgnitionEndpoint != nil {
 		ignitionEndpoint, err = r.parseIgnitionEndpoint(ctx, clusterInstall.Spec.IgnitionEndpoint)
 		if err != nil {
@@ -1375,10 +1669,9 @@ func (r *ClusterDeploymentsReconciler) createNewCluster(
 		}
 	}
 
-	clusterParams := CreateClusterParams(clusterDeployment, clusterInstall, pullSecret, *releaseImage.Version,
-		*releaseImage.CPUArchitecture, ignitionEndpoint)
+	clusterParams := CreateClusterParams(clusterDeployment, clusterInstall, pullSecret, releaseImage, ignitionEndpoint, nil)
 
-	c, err := r.Installer.RegisterClusterInternal(ctx, &key, installer.V2RegisterClusterParams{
+	c, err := r.Installer.RegisterClusterInternal(ctx, &key, mirrorRegistryConfiguration, installer.V2RegisterClusterParams{
 		NewClusterParams: clusterParams,
 	})
 
@@ -1403,6 +1696,7 @@ func (r *ClusterDeploymentsReconciler) createNewDay2Cluster(
 	ctx context.Context,
 	log logrus.FieldLogger,
 	key types.NamespacedName,
+	releaseImage *models.ReleaseImage,
 	clusterDeployment *hivev1.ClusterDeployment,
 	clusterInstall *hiveext.AgentClusterInstall) (ctrl.Result, error) {
 
@@ -1414,6 +1708,9 @@ func (r *ClusterDeploymentsReconciler) createNewDay2Cluster(
 	clusterParams := &models.ImportClusterParams{
 		APIVipDnsname: swag.String(apiVipDnsname),
 		Name:          swag.String(spec.ClusterName),
+	}
+	if releaseImage != nil && releaseImage.OpenshiftVersion != nil {
+		clusterParams.OpenshiftVersion = *releaseImage.OpenshiftVersion
 	}
 
 	// add optional parameter
@@ -1431,26 +1728,52 @@ func (r *ClusterDeploymentsReconciler) createNewDay2Cluster(
 	return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, c, err)
 }
 
-func (r *ClusterDeploymentsReconciler) getReleaseImage(
-	ctx context.Context,
-	log logrus.FieldLogger,
-	spec hiveext.AgentClusterInstallSpec,
-	pullSecret string) (*models.ReleaseImage, error) {
+func (r *ClusterDeploymentsReconciler) ensureClusterImageSetRef(ctx context.Context, log logrus.FieldLogger, clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall) (*hivev1.ClusterImageSet, error) {
+	if isInstalled(clusterDeployment, clusterInstall) {
+		return nil, nil
+	}
+
+	// Make sure that the ImageSetRef is set before continuing
+	if clusterInstall.Spec.ImageSetRef == nil {
+		return nil, newInputError("ClusterImageSet must be specified in AgentClusterInstall.Spec.ImageSetRef for cluster that is not installed")
+	}
 
 	clusterImageSet := &hivev1.ClusterImageSet{}
 	key := types.NamespacedName{
 		Namespace: "",
-		Name:      spec.ImageSetRef.Name,
+		Name:      clusterInstall.Spec.ImageSetRef.Name,
 	}
 	if err := r.Client.Get(ctx, key, clusterImageSet); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, errors.Errorf("ClusterImageSet %s not found. Please ensure the ClusterImageSet exists", key.Name)
+		}
 		return nil, errors.Wrapf(err, "failed to get cluster image set %s", key.Name)
 	}
 
+	return clusterImageSet, nil
+}
+
+func (r *ClusterDeploymentsReconciler) getReleaseImage(
+	ctx context.Context,
+	clusterImageSet *hivev1.ClusterImageSet,
+	pullSecret string) (*models.ReleaseImage, error) {
+	if clusterImageSet == nil {
+		r.Log.Debugf("cluster image set is nil for cluster")
+		return nil, nil
+	}
 	releaseImage, err := r.VersionsHandler.GetReleaseImageByURL(ctx, clusterImageSet.Spec.ReleaseImage, pullSecret)
 	if err != nil {
-		log.Error(err)
-		errMsg := "failed to get release image '%s'. Please ensure the releaseImage field in ClusterImageSet '%s' is valid (error: %s)."
-		return nil, errors.New(fmt.Sprintf(errMsg, clusterImageSet.Spec.ReleaseImage, spec.ImageSetRef.Name, err.Error()))
+		errMsgSuffix := ""
+		if r.MirrorRegistriesConfigBuilder.IsMirrorRegistriesConfigured() {
+			// There is a special error case where we should check to see if the supplied image is tag based
+			// if so then we need to provide the user with a hint as to what might be happening.
+			ref, err2 := imageReference.Parse(clusterImageSet.Spec.ReleaseImage)
+			if err2 == nil && len(ref.Tag) > 0 {
+				errMsgSuffix = fmt.Sprintf("Release image %q uses a tag (%q), this is usually unsupported in combination with mirror registries, try providing a digest-based image instead", clusterImageSet.Spec.ReleaseImage, ref.Tag)
+			}
+		}
+		errMsg := "failed to get release image '%s'. Please ensure the releaseImage field in ClusterImageSet '%s' is valid, %s (error: %s)."
+		return nil, errors.New(fmt.Sprintf(errMsg, clusterImageSet.Spec.ReleaseImage, clusterImageSet.Name, errMsgSuffix, err.Error()))
 	}
 
 	return releaseImage, nil
@@ -1525,7 +1848,7 @@ func (r *ClusterDeploymentsReconciler) deleteClusterInstall(ctx context.Context,
 	return buildReply(err)
 }
 
-func (r *ClusterDeploymentsReconciler) shouldDeleteAgentOnUnbind(ctx context.Context, agent aiv1beta1.Agent, clusterDeployment types.NamespacedName) bool {
+func (r *ClusterDeploymentsReconciler) shouldDeleteAgentOnUnbind(ctx context.Context, agent aiv1beta1.Agent, clusterDeployment types.NamespacedName) (bool, error) {
 	log := logutil.FromContext(ctx, r.Log).WithFields(logrus.Fields{
 		"cluster_deployment":           clusterDeployment.Name,
 		"cluster_deployment_namespace": clusterDeployment.Namespace,
@@ -1533,23 +1856,36 @@ func (r *ClusterDeploymentsReconciler) shouldDeleteAgentOnUnbind(ctx context.Con
 	infraEnvName, ok := agent.Labels[aiv1beta1.InfraEnvNameLabel]
 	if !ok {
 		log.Errorf("Failed to find infraEnv name for agent %s in namespace %s", agent.Name, agent.Namespace)
-		return false
+		return false, nil
 	}
 
 	infraEnv := &aiv1beta1.InfraEnv{}
 	if err := r.Get(ctx, types.NamespacedName{Name: infraEnvName, Namespace: agent.Namespace}, infraEnv); err != nil {
 		log.Errorf("Failed to get infraEnv %s in namespace %s", infraEnvName, agent.Namespace)
-		return false
+		return false, nil
 	}
 
 	if infraEnv.Spec.ClusterRef != nil &&
 		infraEnv.Spec.ClusterRef.Name == clusterDeployment.Name &&
 		infraEnv.Spec.ClusterRef.Namespace == clusterDeployment.Namespace {
 
-		return true
+		return true, nil
 	}
 
-	return false
+	// If the agent came from a late binding pool (the infrastructure environment has no cluster
+	// reference) then we want to delete it only if the cluster deployment is marked to preserve
+	// on delete. This is necessary because otherwise the host will go back to the pool, and it
+	// will be provisioned again, effectively destroying the cluster.
+	if infraEnv.Spec.ClusterRef == nil {
+		clusterDeploymentObject := &hivev1.ClusterDeployment{}
+		err := r.Get(ctx, clusterDeployment, clusterDeploymentObject)
+		if err != nil {
+			return false, err
+		}
+		return clusterDeploymentObject.Spec.PreserveOnDelete, nil
+	}
+
+	return false, nil
 }
 
 func (r *ClusterDeploymentsReconciler) unbindAgents(ctx context.Context, log logrus.FieldLogger, clusterDeployment types.NamespacedName) error {
@@ -1562,7 +1898,11 @@ func (r *ClusterDeploymentsReconciler) unbindAgents(ctx context.Context, log log
 		if clusterAgent.Spec.ClusterDeploymentName != nil &&
 			clusterAgent.Spec.ClusterDeploymentName.Name == clusterDeployment.Name &&
 			clusterAgent.Spec.ClusterDeploymentName.Namespace == clusterDeployment.Namespace {
-			if r.shouldDeleteAgentOnUnbind(ctx, clusterAgent, clusterDeployment) {
+			shouldDeleteAgent, err := r.shouldDeleteAgentOnUnbind(ctx, clusterAgent, clusterDeployment)
+			if err != nil {
+				return err
+			}
+			if shouldDeleteAgent {
 				log.Infof("deleting agent %s in namespace %s", clusterAgent.Name, clusterAgent.Namespace)
 				if err := r.Delete(ctx, &agents.Items[i]); err != nil {
 					log.WithError(err).Errorf("failed to delete agent %s in namespace %s", clusterAgent.Name, clusterAgent.Namespace)
@@ -1582,6 +1922,10 @@ func (r *ClusterDeploymentsReconciler) unbindAgents(ctx context.Context, log log
 }
 
 func (r *ClusterDeploymentsReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &hiveext.AgentClusterInstall{}, ManifestConfigMapIndexField, indexManifestConfigMapNames); err != nil {
+		return err
+	}
+
 	mapSecretToClusterDeployment := func(ctx context.Context, a client.Object) []reconcile.Request {
 		clusterDeployments := &hivev1.ClusterDeploymentList{}
 
@@ -1693,8 +2037,41 @@ func (r *ClusterDeploymentsReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&aiv1beta1.Agent{},
 			handler.EnqueueRequestsFromMapFunc(mapAgentToClusterDeployment),
 			agentSpecStatusChangedPredicate).
-		WatchesRawSource(&source.Channel{Source: clusterDeploymentUpdates}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapConfigMapToClusterDeployment),
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+				return obj.GetLabels()[WatchResourceLabel] == WatchResourceValue
+			}))).
+		WatchesRawSource(source.Channel(clusterDeploymentUpdates, &handler.EnqueueRequestForObject{})).
 		Complete(r)
+}
+
+func (r *ClusterDeploymentsReconciler) mapConfigMapToClusterDeployment(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := logutil.FromContext(ctx, r.Log).WithFields(logrus.Fields{
+		"configmap":           obj.GetName(),
+		"configmap_namespace": obj.GetNamespace(),
+	})
+
+	aciList := &hiveext.AgentClusterInstallList{}
+	if err := r.List(ctx, aciList,
+		client.InNamespace(obj.GetNamespace()),
+		client.MatchingFields{ManifestConfigMapIndexField: obj.GetName()}); err != nil {
+		log.WithError(err).Error("failed to list AgentClusterInstalls for ConfigMap mapper")
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(aciList.Items))
+	for i := range aciList.Items {
+		aci := &aciList.Items[i]
+		log.Debugf("ConfigMap %s matches ACI %s, enqueueing ClusterDeployment %s",
+			obj.GetName(), aci.Name, aci.Spec.ClusterDeploymentRef.Name)
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: aci.Namespace,
+				Name:      aci.Spec.ClusterDeploymentRef.Name,
+			},
+		})
+	}
+	return requests
 }
 
 // updateStatus is updating all the AgentClusterInstall Conditions.
@@ -1703,6 +2080,10 @@ func (r *ClusterDeploymentsReconciler) SetupWithManager(mgr ctrl.Manager) error 
 func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log logrus.FieldLogger,
 	clusterInstall *hiveext.AgentClusterInstall, clusterDeployment *hivev1.ClusterDeployment,
 	c *common.Cluster, syncErr error) (ctrl.Result, error) {
+
+	var (
+		mastersCountPtr, arbiterCountPtr, workersCountPtr *int64
+	)
 
 	clusterSpecSynced(clusterInstall, syncErr)
 	if c != nil {
@@ -1724,8 +2105,8 @@ func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log log
 			clusterInstall.Status.UserManagedNetworking = c.UserManagedNetworking
 			clusterInstall.Status.PlatformType = getPlatformType(c.Platform)
 			status := *c.Status
-			var err error
-			err = r.populateEventsURL(log, clusterInstall, c)
+
+			err := r.populateEventsURL(log, clusterInstall, c)
 			if err != nil {
 				return ctrl.Result{Requeue: true}, nil
 			}
@@ -1733,22 +2114,39 @@ func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log log
 			if err != nil {
 				return ctrl.Result{Requeue: true}, nil
 			}
-			var registeredHosts, approvedHosts, unsyncedHosts int
+			var approvedHosts, unsyncedHosts int
 			if status == models.ClusterStatusReady {
-				registeredHosts, approvedHosts, err = r.getNumOfClusterAgents(c)
+				_, approvedHosts, err = r.getNumOfClusterAgents(c)
 				if err != nil {
 					log.WithError(err).Error("failed to fetch cluster's agents")
 					return ctrl.Result{Requeue: true}, nil
 				}
-				agents, err := findAgentsByAgentClusterInstall(r.Client, ctx, log, clusterInstall)
+				var agents []*aiv1beta1.Agent
+				agents, err = findAgentsByAgentClusterInstall(r.Client, ctx, log, clusterInstall)
 				if err != nil {
 					log.WithError(err).Error("failed to fetch ACI's agents")
 					return ctrl.Result{Requeue: true}, nil
 				}
+
+				mastersCountPtr, arbiterCountPtr, workersCountPtr, err = getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
+				if err != nil {
+					log.WithError(err).Error("failed to fetch host suggested role count")
+					// proceed to update the conditions (the counts will be 0)
+				}
+
 				unsyncedHosts = getNumOfUnsyncedAgents(agents)
 				log.Debugf("Updating ACI conditions, found %d unsynced agents out of total of %d agents", unsyncedHosts, len(agents))
 			}
-			clusterRequirementsMet(clusterInstall, status, registeredHosts, approvedHosts, unsyncedHosts)
+
+			clusterRequirementsMet(
+				clusterInstall,
+				status,
+				approvedHosts,
+				unsyncedHosts,
+				int(swag.Int64Value(mastersCountPtr)),
+				int(swag.Int64Value(arbiterCountPtr)),
+				int(swag.Int64Value(workersCountPtr)),
+			)
 			clusterValidated(clusterInstall, status, c)
 			clusterCompleted(clusterInstall, clusterDeployment, status, swag.StringValue(c.StatusInfo), c.MonitoredOperators)
 			clusterFailed(clusterInstall, status, swag.StringValue(c.StatusInfo))
@@ -1887,31 +2285,48 @@ func clusterSpecSynced(cluster *hiveext.AgentClusterInstall, syncErr error) {
 	})
 }
 
-func clusterRequirementsMet(clusterInstall *hiveext.AgentClusterInstall, status string, registeredHosts, approvedHosts, unsyncedHosts int) {
+func clusterRequirementsMet(
+	clusterInstall *hiveext.AgentClusterInstall,
+	status string,
+	approvedHosts,
+	unsyncedHosts int,
+	masterCount int,
+	arbiterCount int,
+	workerCount int,
+) {
 	var condStatus corev1.ConditionStatus
 	var reason string
 	var msg string
 
 	switch status {
 	case models.ClusterStatusReady:
-		expectedHosts := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents +
-			clusterInstall.Spec.ProvisionRequirements.WorkerAgents
-		if registeredHosts < expectedHosts {
+		expectedMasterCount := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents
+		expectedArbiterCount := clusterInstall.Spec.ProvisionRequirements.ArbiterAgents
+		expectedWorkerCount := clusterInstall.Spec.ProvisionRequirements.WorkerAgents
+		expectedHostCount := expectedMasterCount + expectedWorkerCount + expectedArbiterCount
+
+		if masterCount != expectedMasterCount ||
+			workerCount != expectedWorkerCount ||
+			arbiterCount != expectedArbiterCount {
 			condStatus = corev1.ConditionFalse
 			reason = hiveext.ClusterInsufficientAgentsReason
-			msg = fmt.Sprintf(hiveext.ClusterInsufficientAgentsMsg, expectedHosts, approvedHosts)
+			msg = fmt.Sprintf(
+				hiveext.ClusterInsufficientAgentsMsg,
+				expectedMasterCount,
+				expectedArbiterCount,
+				expectedWorkerCount,
+				masterCount,
+				arbiterCount,
+				workerCount,
+			)
 		} else if unsyncedHosts != 0 {
 			condStatus = corev1.ConditionFalse
 			reason = hiveext.ClusterUnsyncedAgentsReason
 			msg = fmt.Sprintf(hiveext.ClusterUnsyncedAgentsMsg, unsyncedHosts)
-		} else if approvedHosts < expectedHosts {
+		} else if approvedHosts < expectedHostCount {
 			condStatus = corev1.ConditionFalse
 			reason = hiveext.ClusterUnapprovedAgentsReason
-			msg = fmt.Sprintf(hiveext.ClusterUnapprovedAgentsMsg, expectedHosts-approvedHosts)
-		} else if registeredHosts > expectedHosts {
-			condStatus = corev1.ConditionFalse
-			reason = hiveext.ClusterAdditionalAgentsReason
-			msg = fmt.Sprintf(hiveext.ClusterAdditionalAgentsMsg, expectedHosts, registeredHosts)
+			msg = fmt.Sprintf(hiveext.ClusterUnapprovedAgentsMsg, expectedHostCount-approvedHosts)
 		} else {
 			condStatus = corev1.ConditionTrue
 			reason = hiveext.ClusterReadyReason
@@ -2206,7 +2621,7 @@ func isConditionEqual(existingCond hivev1.ClusterInstallCondition, newCondition 
 }
 
 // FindStatusCondition finds the conditionType in conditions.
-func FindStatusCondition(conditions []hivev1.ClusterInstallCondition, conditionType string) *hivev1.ClusterInstallCondition {
+func FindStatusCondition(conditions []hivev1.ClusterInstallCondition, conditionType hivev1.ClusterInstallConditionType) *hivev1.ClusterInstallCondition {
 	for i := range conditions {
 		if conditions[i].Type == conditionType {
 			return &conditions[i]
@@ -2218,6 +2633,11 @@ func FindStatusCondition(conditions []hivev1.ClusterInstallCondition, conditionT
 
 // ensureOwnerRef sets the owner reference of ClusterDeployment on AgentClusterInstall
 func (r *ClusterDeploymentsReconciler) ensureOwnerRef(ctx context.Context, log logrus.FieldLogger, cd *hivev1.ClusterDeployment, ci *hiveext.AgentClusterInstall) error {
+	for _, ref := range ci.GetOwnerReferences() {
+		if ref.UID == cd.UID {
+			return nil
+		}
+	}
 
 	if err := controllerutil.SetOwnerReference(cd, ci, r.Scheme); err != nil {
 		log.WithError(err).Error("error setting owner reference Agent Cluster Install")
@@ -2291,4 +2711,20 @@ func getClusterDeploymentAdminKubeConfigSecretName(cd *hivev1.ClusterDeployment)
 		return cd.Spec.ClusterMetadata.AdminKubeconfigSecretRef.Name
 	}
 	return fmt.Sprintf(adminKubeConfigStringTemplate, cd.Name)
+}
+
+// processMirrorRegistryConfig retrieves the mirror registry configuration from the referenced ConfigMap
+func (r *ClusterDeploymentsReconciler) processMirrorRegistryConfig(ctx context.Context, log logrus.FieldLogger, clusterInstall *hiveext.AgentClusterInstall) (*common.MirrorRegistryConfiguration, error) {
+	mirrorRegistryConfiguration, userTomlConfigMap, err := mirrorregistry.ProcessMirrorRegistryConfig(ctx, log, r.Client, clusterInstall.Spec.MirrorRegistryRef)
+	if err != nil {
+		return nil, err
+	}
+	if mirrorRegistryConfiguration != nil {
+		namespacedName := types.NamespacedName{Name: clusterInstall.Spec.MirrorRegistryRef.Name, Namespace: clusterInstall.Spec.MirrorRegistryRef.Namespace}
+		if err = ensureConfigMapIsLabelled(ctx, r.Client, userTomlConfigMap, namespacedName); err != nil {
+			return nil, errors.Wrapf(err, "Unable to mark mirror configmap for backup")
+		}
+	}
+
+	return mirrorRegistryConfiguration, nil
 }

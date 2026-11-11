@@ -41,6 +41,11 @@ func (v *validator) isInstallationDiskSpeedCheckSuccessful(c *validationContext)
 		return true
 	}
 
+	// Disk speed check is skipped when installing to the existing root
+	if c.inventory != nil && c.inventory.Boot != nil && c.inventory.Boot.DeviceType == models.BootDeviceTypePersistent {
+		return true
+	}
+
 	info, err := v.getBootDeviceInfo(c.host)
 	return err == nil && info != nil && info.DiskSpeed != nil && info.DiskSpeed.Tested && info.DiskSpeed.ExitCode == 0
 }
@@ -77,7 +82,7 @@ func (v *validator) isValidRoleForInstallation(c *validationContext) bool {
 	if c.infraEnv != nil {
 		return false
 	}
-	validRoles := []string{string(models.HostRoleMaster), string(models.HostRoleWorker)}
+	validRoles := []string{string(models.HostRoleMaster), string(models.HostRoleArbiter), string(models.HostRoleWorker)}
 	return funk.ContainsString(validRoles, string(c.host.Role))
 }
 
@@ -93,7 +98,15 @@ func (v *validator) isSuccessfulContainerImageAvailability(c *validationContext)
 		return false
 	}
 	imagesStatuses, err := common.UnmarshalImageStatuses(c.host.ImagesStatus)
-	return err == nil && len(imagesStatuses) > 0 && allImagesValid(imagesStatuses)
+	if err != nil || len(imagesStatuses) == 0 {
+		return false
+	}
+	if allImagesValid(imagesStatuses) {
+		return true
+	}
+
+	criticalFailures, _, err := v.classifyFailedImages(c, imagesStatuses)
+	return err == nil && len(criticalFailures) == 0
 }
 
 func (v *validator) isHostStageTimedOut(c *validationContext) bool {

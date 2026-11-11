@@ -1,11 +1,20 @@
 package network
 
 import (
+	"fmt"
+	"net"
+
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
 )
+
+var mNetworks = []*net.IPNet{
+	{IP: net.IP{192, 168, 10, 0}, Mask: net.IPv4Mask(255, 255, 255, 0)},
+	{IP: net.IP{192, 168, 11, 0}, Mask: net.IPv4Mask(255, 255, 255, 0)},
+}
 
 var _ = Describe("host IP address families", func() {
 	It("host doesn't have interfaces", func() {
@@ -461,6 +470,16 @@ var _ = Describe("AreMachineNetworksIdentical", func() {
 			},
 			expectedResult: false,
 		},
+		{
+			name: "IPv6 non-canonical vs canonical",
+			n1: []*models.MachineNetwork{
+				{Cidr: "fcff:0069:0001:0000::/64"},
+			},
+			n2: []*models.MachineNetwork{
+				{Cidr: "fcff:69:1::/64"},
+			},
+			expectedResult: true,
+		},
 	}
 	for i := range tests {
 		t := tests[i]
@@ -557,6 +576,16 @@ var _ = Describe("ArServiceNetworksIdentical", func() {
 				},
 			},
 			expectedResult: false,
+		},
+		{
+			name: "IPv6 non-canonical vs canonical",
+			n1: []*models.ServiceNetwork{
+				{Cidr: "fd02:0000:0000:0000::/112"},
+			},
+			n2: []*models.ServiceNetwork{
+				{Cidr: "fd02::/112"},
+			},
+			expectedResult: true,
 		},
 	}
 	for i := range tests {
@@ -683,6 +712,16 @@ var _ = Describe("ArClusterNetworksIdentical", func() {
 			},
 			expectedResult: false,
 		},
+		{
+			name: "IPv6 non-canonical vs canonical",
+			n1: []*models.ClusterNetwork{
+				{Cidr: "fd01:0000:0000:0000::/48", HostPrefix: 64},
+			},
+			n2: []*models.ClusterNetwork{
+				{Cidr: "fd01::/48", HostPrefix: 64},
+			},
+			expectedResult: true,
+		},
 	}
 	for i := range tests {
 		t := tests[i]
@@ -800,6 +839,46 @@ var _ = Describe("AreApiVipsIdentical", func() {
 				{
 					IP: "2.2.3.0",
 				},
+			},
+			expectedResult: false,
+		},
+		{
+			name: "IPv6 expanded vs canonical",
+			n1: []*models.APIVip{
+				{IP: "2620:0052:0009:164d:0000:0000:0000:0046"},
+			},
+			n2: []*models.APIVip{
+				{IP: "2620:52:9:164d::46"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 leading zeros stripped",
+			n1: []*models.APIVip{
+				{IP: "2001:0db8:0000:0000:0000:0000:0000:0001"},
+			},
+			n2: []*models.APIVip{
+				{IP: "2001:db8::1"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 mixed case",
+			n1: []*models.APIVip{
+				{IP: "2001:0DB8::ABCD"},
+			},
+			n2: []*models.APIVip{
+				{IP: "2001:db8::abcd"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 actually different",
+			n1: []*models.APIVip{
+				{IP: "2001:db8::1"},
+			},
+			n2: []*models.APIVip{
+				{IP: "2001:db8::2"},
 			},
 			expectedResult: false,
 		},
@@ -923,6 +1002,46 @@ var _ = Describe("AreIngressVipsIdentical", func() {
 			},
 			expectedResult: false,
 		},
+		{
+			name: "IPv6 expanded vs canonical",
+			n1: []*models.IngressVip{
+				{IP: "2620:0052:0009:164d:0000:0000:0000:0046"},
+			},
+			n2: []*models.IngressVip{
+				{IP: "2620:52:9:164d::46"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 leading zeros stripped",
+			n1: []*models.IngressVip{
+				{IP: "2001:0db8:0000:0000:0000:0000:0000:0001"},
+			},
+			n2: []*models.IngressVip{
+				{IP: "2001:db8::1"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 mixed case",
+			n1: []*models.IngressVip{
+				{IP: "2001:0DB8::ABCD"},
+			},
+			n2: []*models.IngressVip{
+				{IP: "2001:db8::abcd"},
+			},
+			expectedResult: true,
+		},
+		{
+			name: "IPv6 actually different",
+			n1: []*models.IngressVip{
+				{IP: "2001:db8::1"},
+			},
+			n2: []*models.IngressVip{
+				{IP: "2001:db8::2"},
+			},
+			expectedResult: false,
+		},
 	}
 	for i := range tests {
 		t := tests[i]
@@ -1009,6 +1128,437 @@ var _ = Describe("GetVips", func() {
 			Expect(IngressVips[1]).To(Equal("1001:db8:0:200::79"))
 			Expect(PrimaryApiVip).To(Equal("192.168.10.10"))
 			Expect(PrimaryIngressVip).To(Equal("192.168.10.11"))
+		})
+	})
+})
+var _ = Describe("FindInterfaceByIP", func() {
+	var allInterfaces []*models.Interface
+	var searchedInterface models.Interface
+
+	BeforeEach(func() {
+		searchedInterface = models.Interface{
+			IPV4Addresses: []string{"192.168.1.3/24"},
+			IPV6Addresses: []string{"1001:db8:0:200::78/48", "1001:db8:0:200::79/48"},
+		}
+		allInterfaces = []*models.Interface{
+			{
+				IPV4Addresses: []string{"192.168.1.1/24"},
+			},
+			{
+				IPV6Addresses: []string{"1001:db8:0:200::80/48"},
+			},
+			&searchedInterface,
+		}
+
+	})
+	DescribeTable("FindInterfaceByIP", func(allInterfaces *[]*models.Interface, lookForIp string, expectedInterface *models.Interface, expectedError string) {
+		int, err := FindInterfaceByIPString(lookForIp, *allInterfaces)
+		if expectedError == "" {
+			Expect(err).To(BeNil())
+			Expect(int).To(Equal(expectedInterface))
+		} else {
+			Expect(err).ToNot(BeNil())
+			Expect(err.Error()).To(Equal(expectedError))
+		}
+	},
+		Entry("Look for IPv4", &allInterfaces, "192.168.1.3", &searchedInterface, ""),
+		Entry("Look for IPv6", &allInterfaces, "1001:db8:0:200::79", &searchedInterface, ""),
+		Entry("Invalid searched IP", &allInterfaces, "invalid", nil, "ParseAddr(\"invalid\"): unable to parse IP"),
+		Entry("Empty list all interfaces", &[]*models.Interface{}, "192.168.1.3", nil, "Cannot find the network interface on which the IP 192.168.1.3 is set"),
+		Entry("Searched IP does not match any of the interfaces", &allInterfaces, "99.99.99.99", nil, "Cannot find the network interface on which the IP 99.99.99.99 is set"),
+	)
+})
+
+var _ = Describe("IsNicBelongsAnyMachineNetwork", func() {
+	DescribeTable("", func(outgoingNicName string, mNetworks []*net.IPNet, interfaces []*models.Interface, isIPV6 bool, expectedResult bool) {
+		isNicBelongs, err := IsNicBelongsAnyMachineNetwork(outgoingNicName, mNetworks, interfaces, isIPV6)
+		Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("Debugging info: %v", err))
+		Expect(isNicBelongs).To(Equal(expectedResult), fmt.Sprintf("Debugging info: actualResult: %t, expectedResult: %t", isNicBelongs, expectedResult))
+	},
+		Entry("nic belongs to a machine network", "eth0", mNetworks, []*models.Interface{{IPV4Addresses: []string{"192.168.10.2/24"}, Name: "eth0"}}, false, true),
+		Entry("nic doesn't belongs to any machine network", "eth0", mNetworks, []*models.Interface{{IPV4Addresses: []string{"192.168.12.2/24"}, Name: "eth0"}}, false, false),
+	)
+})
+
+var _ = Describe("IsIPBelongsToAnyMachineNetwork", func() {
+	DescribeTable("", func(ip net.IP, mNetworks []*net.IPNet, expectedResult bool) {
+		isIPBelongs := IsIPBelongsToAnyMachineNetwork(ip, mNetworks)
+		Expect(isIPBelongs).To(Equal(expectedResult))
+	},
+		Entry("IP belongs to a machine network", net.IP{192, 168, 10, 0}, mNetworks, true),
+		Entry("IP doesn't belongs to any machine network", net.IP{192, 168, 12, 0}, mNetworks, false),
+	)
+})
+
+var _ = Describe("ComputeParsedMachineNetworks", func() {
+	mNets := []*models.MachineNetwork{
+		{Cidr: "192.168.10.0/24"},
+	}
+	expectedResult := []*net.IPNet{
+		{
+			IP:   net.IP{192, 168, 10, 0},        // Network Address
+			Mask: net.IPv4Mask(255, 255, 255, 0), // Subnet Mask
+		},
+	}
+	parsedMachineNetworks, err := ComputeParsedMachineNetworks(mNets)
+	Expect(err).ShouldNot(HaveOccurred(), fmt.Sprintf("Debugging info: %v", err))
+	Expect(parsedMachineNetworks).To(Equal(expectedResult))
+
+})
+
+var _ = Describe("Network Comparison Functions with Dual-Stack Support", func() {
+
+	Describe("AreMachineNetworksIdentical", func() {
+		Context("Single-stack networks", func() {
+			It("should return true for identical IPv4 networks in any order", func() {
+				n1 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "192.168.1.0/24"},
+				}
+				n2 := []*models.MachineNetwork{
+					{Cidr: "192.168.1.0/24"},
+					{Cidr: "10.0.0.0/16"},
+				}
+				Expect(AreMachineNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for different single-stack networks", func() {
+				n1 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+				}
+				n2 := []*models.MachineNetwork{
+					{Cidr: "192.168.1.0/24"},
+				}
+				Expect(AreMachineNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+		})
+
+		Context("Dual-stack networks", func() {
+			It("should return true for identical dual-stack networks in same order", func() {
+				n1 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "2001:db8::/64"},
+				}
+				n2 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "2001:db8::/64"},
+				}
+				Expect(AreMachineNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for identical dual-stack networks in different order", func() {
+				n1 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "2001:db8::/64"},
+				}
+				n2 := []*models.MachineNetwork{
+					{Cidr: "2001:db8::/64"},
+					{Cidr: "10.0.0.0/16"},
+				}
+				Expect(AreMachineNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+
+			It("should return false for different dual-stack networks", func() {
+				n1 := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "2001:db8::/64"},
+				}
+				n2 := []*models.MachineNetwork{
+					{Cidr: "192.168.1.0/24"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				Expect(AreMachineNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+		})
+	})
+
+	Describe("AreServiceNetworksIdentical", func() {
+		Context("Single-stack networks", func() {
+			It("should return true for identical IPv4 networks in any order", func() {
+				n1 := []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "172.31.0.0/16"},
+				}
+				n2 := []*models.ServiceNetwork{
+					{Cidr: "172.31.0.0/16"},
+					{Cidr: "172.30.0.0/16"},
+				}
+				Expect(AreServiceNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+
+		Context("Dual-stack networks", func() {
+			It("should return true for identical dual-stack networks in same order", func() {
+				n1 := []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				n2 := []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				Expect(AreServiceNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for identical dual-stack networks in different order", func() {
+				n1 := []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				n2 := []*models.ServiceNetwork{
+					{Cidr: "2001:db8:1::/64"},
+					{Cidr: "172.30.0.0/16"},
+				}
+				Expect(AreServiceNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+		})
+	})
+
+	Describe("AreClusterNetworksIdentical", func() {
+		Context("Single-stack networks", func() {
+			It("should return true for identical IPv4 networks in any order", func() {
+				n1 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "10.132.0.0/14", HostPrefix: 24},
+				}
+				n2 := []*models.ClusterNetwork{
+					{Cidr: "10.132.0.0/14", HostPrefix: 24},
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				Expect(AreClusterNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+
+		Context("Dual-stack networks", func() {
+			It("should return true for identical dual-stack networks in same order", func() {
+				n1 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+				}
+				n2 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+				}
+				Expect(AreClusterNetworksIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for identical dual-stack networks in different order", func() {
+				n1 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+				}
+				n2 := []*models.ClusterNetwork{
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				Expect(AreClusterNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+
+			It("should return false for networks with different host prefixes", func() {
+				n1 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+				}
+				n2 := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 24},
+					{Cidr: "2001:db8:2::/64", HostPrefix: 64},
+				}
+				Expect(AreClusterNetworksIdentical(n1, n2)).To(BeFalse())
+			})
+		})
+	})
+
+	Describe("AreApiVipsIdentical", func() {
+		Context("Single-stack VIPs", func() {
+			It("should return true for identical IPv4 VIPs in any order", func() {
+				n1 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "10.0.1.2"},
+				}
+				n2 := []*models.APIVip{
+					{IP: "10.0.1.2"},
+					{IP: "10.0.1.1"},
+				}
+				Expect(AreApiVipsIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+
+		Context("Dual-stack VIPs", func() {
+			It("should return true for identical dual-stack VIPs in same order", func() {
+				n1 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2001:db8::1"},
+				}
+				n2 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2001:db8::1"},
+				}
+				Expect(AreApiVipsIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for identical dual-stack VIPs in different order", func() {
+				n1 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2001:db8::1"},
+				}
+				n2 := []*models.APIVip{
+					{IP: "2001:db8::1"},
+					{IP: "10.0.1.1"},
+				}
+				Expect(AreApiVipsIdentical(n1, n2)).To(BeFalse())
+			})
+
+			It("should return true for dual-stack VIPs with non-canonical IPv6", func() {
+				n1 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2620:0052:0009:164d:0000:0000:0000:0046"},
+				}
+				n2 := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2620:52:9:164d::46"},
+				}
+				Expect(AreApiVipsIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+	})
+
+	Describe("AreIngressVipsIdentical", func() {
+		Context("Single-stack VIPs", func() {
+			It("should return true for identical IPv4 VIPs in any order", func() {
+				n1 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "10.0.1.4"},
+				}
+				n2 := []*models.IngressVip{
+					{IP: "10.0.1.4"},
+					{IP: "10.0.1.3"},
+				}
+				Expect(AreIngressVipsIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+
+		Context("Dual-stack VIPs", func() {
+			It("should return true for identical dual-stack VIPs in same order", func() {
+				n1 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "2001:db8::2"},
+				}
+				n2 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "2001:db8::2"},
+				}
+				Expect(AreIngressVipsIdentical(n1, n2)).To(BeTrue())
+			})
+
+			It("should return false for identical dual-stack VIPs in different order", func() {
+				n1 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "2001:db8::2"},
+				}
+				n2 := []*models.IngressVip{
+					{IP: "2001:db8::2"},
+					{IP: "10.0.1.3"},
+				}
+				Expect(AreIngressVipsIdentical(n1, n2)).To(BeFalse())
+			})
+
+			It("should return true for dual-stack VIPs with non-canonical IPv6", func() {
+				n1 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "2620:0052:0009:164d:0000:0000:0000:0047"},
+				}
+				n2 := []*models.IngressVip{
+					{IP: "10.0.1.3"},
+					{IP: "2620:52:9:164d::47"},
+				}
+				Expect(AreIngressVipsIdentical(n1, n2)).To(BeTrue())
+			})
+		})
+	})
+
+	Describe("isDualStackItems helper function", func() {
+		Context("Machine Networks", func() {
+			It("should return true for dual-stack machine networks", func() {
+				networks := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "2001:db8::/64"},
+				}
+				Expect(isDualStackItems(networks)).To(BeTrue())
+			})
+
+			It("should return false for single-stack IPv4 machine networks", func() {
+				networks := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+					{Cidr: "192.168.1.0/24"},
+				}
+				Expect(isDualStackItems(networks)).To(BeFalse())
+			})
+
+			It("should return false for single-stack IPv6 machine networks", func() {
+				networks := []*models.MachineNetwork{
+					{Cidr: "2001:db8::/64"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				Expect(isDualStackItems(networks)).To(BeFalse())
+			})
+		})
+
+		Context("Service Networks", func() {
+			It("should return true for dual-stack service networks", func() {
+				networks := []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "2001:db8:1::/64"},
+				}
+				Expect(isDualStackItems(networks)).To(BeTrue())
+			})
+		})
+
+		Context("Cluster Networks", func() {
+			It("should return true for dual-stack cluster networks", func() {
+				networks := []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14"},
+					{Cidr: "2001:db8:2::/64"},
+				}
+				Expect(isDualStackItems(networks)).To(BeTrue())
+			})
+		})
+
+		Context("API VIPs", func() {
+			It("should return true for dual-stack API VIPs", func() {
+				vips := []*models.APIVip{
+					{IP: "10.0.1.1"},
+					{IP: "2001:db8::1"},
+				}
+				Expect(isDualStackItems(vips)).To(BeTrue())
+			})
+		})
+
+		Context("Ingress VIPs", func() {
+			It("should return true for dual-stack Ingress VIPs", func() {
+				vips := []*models.IngressVip{
+					{IP: "10.0.1.2"},
+					{IP: "2001:db8::2"},
+				}
+				Expect(isDualStackItems(vips)).To(BeTrue())
+			})
+		})
+
+		Context("Edge cases", func() {
+			It("should return false for unknown types", func() {
+				Expect(isDualStackItems("unknown")).To(BeFalse())
+			})
+
+			It("should return false for empty slices", func() {
+				var networks []*models.MachineNetwork
+				Expect(isDualStackItems(networks)).To(BeFalse())
+			})
+
+			It("should return false for single item slices", func() {
+				networks := []*models.MachineNetwork{
+					{Cidr: "10.0.0.0/16"},
+				}
+				Expect(isDualStackItems(networks)).To(BeFalse())
+			})
 		})
 	})
 })

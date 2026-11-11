@@ -1,12 +1,75 @@
 #!/usr/bin/env bash
 
 __dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source ${__dir}/common.sh
-source ${__dir}/utils.sh
+source "${__dir}/common.sh"
+source "${__dir}/utils.sh"
+source "${__dir}/mirror_utils.sh"
 
 set -o xtrace
 
 HIVE_IMAGE="${HIVE_IMAGE:-registry.ci.openshift.org/openshift/hive-v4.0:hive}"
+HIVE_CATALOG_IMAGE="${HIVE_CATALOG_IMAGE:-quay.io/operatorhubio/catalog:latest}"
+
+function configure_hive_catalog_source() {
+    if [[ -z "${HIVE_CATALOG_SOURCE:-}" ]]; then
+        local oc_major
+        oc_major=$(oc version -o json | jq --raw-output '.openshiftVersion' | cut -d'.' -f1)
+        if [[ "${oc_major}" -ge 5 ]]; then
+            # hive-operator was removed from community-operators starting with OCP 5.0.
+            HIVE_CATALOG_SOURCE="upstream-community-operators"
+        else
+            HIVE_CATALOG_SOURCE="community-operators"
+        fi
+        echo "Selected hive-operator catalog source ${HIVE_CATALOG_SOURCE} for OpenShift ${oc_major}.x"
+    fi
+
+    if [[ "${HIVE_CATALOG_SOURCE}" == "upstream-community-operators" ]]; then
+        ensure_upstream_community_operators_catalog
+    fi
+
+    export HIVE_CATALOG_SOURCE
+}
+
+function ensure_upstream_community_operators_catalog() {
+    local catalog_namespace="openshift-marketplace"
+
+    if ! oc get catalogsource "${HIVE_CATALOG_SOURCE}" -n "${catalog_namespace}" &>/dev/null; then
+        cat <<EOCR | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: ${HIVE_CATALOG_SOURCE}
+  namespace: ${catalog_namespace}
+spec:
+  displayName: Upstream Community Operators
+  image: ${HIVE_CATALOG_IMAGE}
+  publisher: OperatorHub.io
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 10m0s
+EOCR
+    fi
+
+    wait_for_catalogsource "${HIVE_CATALOG_SOURCE}" "${catalog_namespace}"
+}
+
+function wait_for_catalogsource() {
+    local catalog_source="$1"
+    local namespace="$2"
+    local counter=1
+    local retry=120
+
+    echo "Waiting for catalogsource ${catalog_source} in namespace ${namespace} to become ready..."
+    until [[ "$(oc get catalogsource "${catalog_source}" -n "${namespace}" -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null)" == "READY" ]]; do
+        if [[ "${counter}" -eq "${retry}" ]]; then
+            echo "$(date --rfc-3339=seconds) ERROR: catalogsource ${catalog_source} is not ready"
+            oc get catalogsource "${catalog_source}" -n "${namespace}" -o yaml
+            exit 1
+        fi
+        ((counter++)) && sleep 5
+    done
+}
 
 function print_help() {
     ALL_FUNCS="with_olm|from_upstream|enable_agent_install_strategy|print_help"
@@ -22,6 +85,8 @@ function with_olm() {
         echo "Not yet implemented"
         return 1
     fi
+
+    configure_hive_catalog_source
 
     cat <<EOCR | oc apply -f -
 apiVersion: v1
@@ -48,7 +113,7 @@ metadata:
 spec:
   installPlanApproval: Automatic
   name: hive-operator
-  source: community-operators
+  source: ${HIVE_CATALOG_SOURCE}
   sourceNamespace: openshift-marketplace
   channel: alpha
 EOCR
@@ -75,7 +140,7 @@ function from_upstream() {
 
     if [ "${DISCONNECTED}" = "true" ]; then
         export IMG="${LOCAL_REGISTRY}/localimages/hive:latest"
-        oc image mirror \
+        run_mirror_command_with_retry oc image mirror \
             -a ${AUTHFILE} \
             ${HIVE_IMAGE} \
             ${IMG}
@@ -112,7 +177,7 @@ spec:
     featureSet: Custom
 EOF
 
-    wait_for_condition "hiveconfig.hive.openshift.io/hive" "Ready" "10m"
+    wait_for_condition "hiveconfig.hive.openshift.io/hive" "condition=Ready" "10m"
 }
 
 if [ -z "$@" ] || ! declare -F "$@"; then

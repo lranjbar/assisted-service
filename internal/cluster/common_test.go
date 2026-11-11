@@ -6,13 +6,13 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	commontesting "github.com/openshift/assisted-service/internal/common/testing"
 	"github.com/openshift/assisted-service/models"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -82,6 +82,7 @@ var _ = Describe("update_cluster_state", func() {
 	})
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
 	})
 
 })

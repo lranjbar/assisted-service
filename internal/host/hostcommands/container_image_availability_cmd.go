@@ -35,7 +35,12 @@ func NewImageAvailabilityCmd(log logrus.FieldLogger, db *gorm.DB, ocRelease oc.R
 
 func (cmd *imageAvailabilityCmd) getImages(ctx context.Context, cluster *common.Cluster) ([]string, error) {
 	images := make([]string, 0)
-	releaseImage, err := cmd.versionsHandler.GetReleaseImage(ctx, cluster.OpenshiftVersion, cluster.CPUArchitecture, cluster.PullSecret)
+	// Prefer the cluster's OcpReleaseImage field which contains the actual release image URL
+	// (could be from a mirrored registry in disconnected environments via ClusterImageSet)
+	// instead of looking up by version which may return the wrong registry (e.g., upstream quay.io
+	// instead of the configured mirror). This ensures container-image-availability checks use the
+	// correct registry in disconnected environments. See ACM-27906.
+	releaseImage, err := cmd.versionsHandler.GetReleaseImageForCluster(ctx, cluster, cluster.CPUArchitecture)
 	if err != nil {
 		return images, err
 	}
@@ -49,12 +54,13 @@ func (cmd *imageAvailabilityCmd) getImages(ctx context.Context, cluster *common.
 
 	mustGatherImages, err := cmd.versionsHandler.GetMustGatherImages(cluster.OpenshiftVersion, cluster.CPUArchitecture, cluster.PullSecret)
 	if err != nil {
-		return images, err
-	}
-	for key, img := range mustGatherImages {
-		//At the moment, verify only the ocp image
-		if "ocp" == key {
-			images = append(images, img)
+		cmd.log.Warn("Could not determine must-gather image. Installation will proceed without pre-verifying the must-gather image availability.")
+	} else {
+		for key, img := range mustGatherImages {
+			//At the moment, verify only the ocp image
+			if "ocp" == key {
+				images = append(images, img)
+			}
 		}
 	}
 

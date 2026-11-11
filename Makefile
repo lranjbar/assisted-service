@@ -17,7 +17,7 @@ ifeq ($(CONTAINER_COMMAND), docker)
 	CONTAINER_COMMAND = $(shell docker -v 2>/dev/null | cut -f1 -d' ' | tr '[:upper:]' '[:lower:]')
 endif
 
-TARGET := $(or ${TARGET},minikube)
+TARGET := $(or ${TARGET},kind)
 KUBECTL=kubectl -n $(NAMESPACE)
 
 define get_service_host_port
@@ -39,7 +39,7 @@ DEBUG_SERVICE_PORT := $(or ${DEBUG_SERVICE_PORT},40000)
 SERVICE := $(or ${SERVICE},${ASSISTED_ORG}/assisted-service:${ASSISTED_TAG})
 IMAGE_SERVICE := $(or ${IMAGE_SERVICE},${ASSISTED_ORG}/assisted-image-service:${ASSISTED_TAG})
 ASSISTED_UI := $(or ${ASSISTED_UI},${ASSISTED_ORG}/assisted-installer-ui:${ASSISTED_TAG})
-PSQL_IMAGE := $(or ${PSQL_IMAGE},quay.io/centos7/postgresql-12-centos7:latest)
+PSQL_IMAGE := $(or ${PSQL_IMAGE},quay.io/sclorg/postgresql-16-c9s:latest)
 BUNDLE_IMAGE := $(or ${BUNDLE_IMAGE},${ASSISTED_ORG}/assisted-service-operator-bundle:${ASSISTED_TAG})
 INDEX_IMAGE := $(or ${INDEX_IMAGE},${ASSISTED_ORG}/assisted-service-index:${ASSISTED_TAG})
 
@@ -49,22 +49,12 @@ else
 	EVENT_STREAMING_OPTIONS=
 endif
 
-ifdef DEBUG_SERVICE
+ifeq ("${DEBUG_SERVICE}", "true")
 	DEBUG_ARGS=-gcflags "all=-N -l"
 	DEBUG_PORT_OPTIONS= --port ${DEBUG_SERVICE_PORT} debug-port
 	UPDATE_IMAGE=update-debug-minimal
 else
 	UPDATE_IMAGE=update-minimal
-endif
-
-ifdef SUBSYSTEM_LOCAL_REGISTRY
-	UPDATE_LOCAL_SERVICE=_update-private-registry-image
-	LOCAL_SERVICE_IMAGE=${SUBSYSTEM_LOCAL_REGISTRY}/assisted-service:${ASSISTED_TAG}
-	IMAGE_PULL_POLICY=--image-pull-policy Always
-else
-	IMAGE_PULL_POLICY=--image-pull-policy IfNotPresent
-	UPDATE_LOCAL_SERVICE=_update-local-k8s-image
-	LOCAL_SERVICE_IMAGE=${SERVICE}
 endif
 
 CONTAINER_BUILD_PARAMS = --network=host --label git_revision=${GIT_REVISION} ${CONTAINER_BUILD_EXTRA_PARAMS}
@@ -77,6 +67,7 @@ APPLY_NAMESPACE := $(or ${APPLY_NAMESPACE},True)
 ROUTE53_SECRET := ${ROUTE53_SECRET}
 OCM_CLIENT_ID := ${OCM_CLIENT_ID}
 OCM_CLIENT_SECRET := ${OCM_CLIENT_SECRET}
+JWKS_URL := $(or ${JWKS_URL},https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/certs)
 AUTH_TYPE := $(or ${AUTH_TYPE},none)
 CHECK_CLUSTER_VERSION := $(or ${CHECK_CLUSTER_VERSION},False)
 ENABLE_SINGLE_NODE_DNSMASQ := $(or ${ENABLE_SINGLE_NODE_DNSMASQ},True)
@@ -101,6 +92,15 @@ DISABLE_TLS := $(or ${DISABLE_TLS},false)
 ENABLE_ORG_TENANCY := $(or ${ENABLE_ORG_TENANCY},False)
 ALLOW_CONVERGED_FLOW := $(or ${ALLOW_CONVERGED_FLOW}, false)
 ENABLE_ORG_BASED_FEATURE_GATES := $(or ${ENABLE_ORG_BASED_FEATURE_GATES},False)
+KIND_EXPERIMENTAL_PROVIDER=podman
+USE_LOCAL_SERVICE := $(or ${USE_LOCAL_SERVICE}, false)
+LOCAL_ASSISTED_SERVICE_IMAGE=localhost/assisted-service:latest
+LOCAL_IMAGE_ARCHIVE=build/assisted_service_image.tar
+HUB_CLUSTER_NAME := $(or ${HUB_CLUSTER_NAME}, assisted-hub-cluster)
+NVIDIA_REQUIRE_GPU := $(or ${NVIDIA_REQUIRE_GPU}, true)
+AMD_REQUIRE_GPU := $(or ${AMD_REQUIRE_GPU}, true)
+TNA_CLUSTERS_SUPPORT := $(or ${TNA_CLUSTERS_SUPPORT}, true)
+
 
 ifeq ($(DISABLE_TLS),true)
 	DISABLE_TLS_CMD := --disable-tls
@@ -124,7 +124,7 @@ endif
 
 
 # Operator Vars - these must be kept up to date
-BUNDLE_CHANNELS ?= alpha,ocm-2.10
+BUNDLE_CHANNELS ?= alpha,backplane-5.1
 BUNDLE_OUTPUT_DIR ?= deploy/olm-catalog
 BUNDLE_METADATA_OPTS ?= --channels=$(BUNDLE_CHANNELS) --default-channel=alpha
 
@@ -143,6 +143,7 @@ REPORTS ?= $(ROOT_DIR)/reports
 GO_TEST_FORMAT = pkgname
 DEFAULT_RELEASE_IMAGES = $(shell (tr -d '\n\t ' < ${ROOT_DIR}/data/default_release_images.json))
 DEFAULT_OS_IMAGES = $(shell (tr -d '\n\t ' < ${ROOT_DIR}/data/default_os_images.json))
+DEFAULT_RELEASE_SOURCES = $(shell (tr -d '\n\t ' < ${ROOT_DIR}/data/default_release_sources.json))
 
 # Support all Release/OS images for CI
 ifeq ($(CI), true)
@@ -230,23 +231,23 @@ update-minimal:
 	$(CONTAINER_COMMAND) build $(CONTAINER_BUILD_PARAMS) -f Dockerfile.assisted-service . -t $(SERVICE)
 
 update-debug-minimal:
-	export DEBUG_SERVICE=True && $(MAKE) build-minimal
-	mkdir -p build/debug-image && cp Dockerfile.assisted-service-debug $(BUILD_FOLDER)/assisted-service $(BUILD_FOLDER)/assisted-service-operator build/debug-image
-	$(CONTAINER_COMMAND) build $(CONTAINER_BUILD_PARAMS) --build-arg SERVICE=$(SERVICE) --build-arg DEBUG_SERVICE_PORT=$(DEBUG_SERVICE_PORT) -f build/debug-image/Dockerfile.assisted-service-debug build/debug-image -t $(SERVICE)
-	rm -r build/debug-image
+	$(CONTAINER_COMMAND) build $(CONTAINER_BUILD_PARAMS) --build-arg DEBUG_SERVICE_PORT=$(DEBUG_SERVICE_PORT) -f Dockerfile.assisted-service-debug -t $(SERVICE)
 
 update-image: $(UPDATE_IMAGE)
 
-_update-private-registry-image: update-image
-	$(CONTAINER_COMMAND) tag $(SERVICE) $(LOCAL_SERVICE_IMAGE)
-	$(CONTAINER_COMMAND) push $(PUSH_FLAGS) $(LOCAL_SERVICE_IMAGE)
-
-_update-local-k8s-image:
-	# Temporary hack that updates the local k8s(e.g minikube) with the latest image.
-	# Should be replaced after installing a local registry
-	./hack/update_local_image.sh
-
-update-local-image: $(UPDATE_LOCAL_SERVICE)
+load-image:
+	rm -f $(LOCAL_IMAGE_ARCHIVE) || true
+	mkdir -p build
+	if [ -z ${SERVICE_IMAGE} ]; then \
+		echo "Building and using local assisted-service image..."; \
+		skipper $(MAKE) update-image SERVICE=$(LOCAL_ASSISTED_SERVICE_IMAGE); \
+	else \
+		echo "Using image from ${SERVICE_IMAGE}..."; \
+		$(CONTAINER_COMMAND) pull ${SERVICE_IMAGE}; \
+		$(CONTAINER_COMMAND) tag ${SERVICE_IMAGE} $(LOCAL_ASSISTED_SERVICE_IMAGE); \
+	fi
+	$(CONTAINER_COMMAND) save -o $(LOCAL_IMAGE_ARCHIVE) $(LOCAL_ASSISTED_SERVICE_IMAGE)
+	./hack/hub_cluster.sh load_image $(LOCAL_IMAGE_ARCHIVE) $(HUB_CLUSTER_NAME)
 
 build-image: update-minimal
 
@@ -257,9 +258,30 @@ update: build-all
 	$(CONTAINER_COMMAND) push $(SERVICE)
 
 publish-client: generate-python-client
-	python3 -m twine upload --skip-existing "$(BUILD_FOLDER)/assisted-service-client/dist/*.whl"
+	python3 -m twine upload --skip-existing "$(BUILD_FOLDER)/assisted-service-client/dist/*"
 
 build-openshift-ci-test-bin: init
+
+remove_assisted_service_deployment_liveness_probe:
+	$(KUBECTL) patch deployment assisted-service --type json -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/livenessProbe"}]' || true
+
+set_assisted_service_deployment_replicas_to_one:
+	$(KUBECTL) patch deployment assisted-service --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 1}]'
+
+restart_service_pods:
+	$(KUBECTL) rollout restart deployment assisted-service
+	$(KUBECTL) rollout status  deployment assisted-service
+
+prepare_assisted_service_for_debug: remove_assisted_service_deployment_liveness_probe set_assisted_service_deployment_replicas_to_one restart_service_pods
+
+patch-service: load-image
+	$(KUBECTL) patch deployment assisted-service \
+		--type json \
+		-p='[{"op": "replace", "path": "/spec/template/spec/containers/0/image", "value": "$(LOCAL_ASSISTED_SERVICE_IMAGE)"},{"op": "replace", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value": "Never"}]'
+	if [ "${DEBUG_SERVICE}" == "true" ]; then \
+		$(MAKE) remove_assisted_service_deployment_liveness_probe set_assisted_service_deployment_replicas_to_one; \
+	fi
+	$(MAKE) restart_service_pods
 
 ##########
 # Deploy #
@@ -271,11 +293,6 @@ else ifdef DEPLOY_MANIFEST_PATH
 else ifdef DEPLOY_MANIFEST_TAG
   DEPLOY_TAG_OPTION = --deploy-manifest-tag "$(DEPLOY_MANIFEST_TAG)"
 endif
-
-define restart_service_pods
-$(KUBECTL) rollout restart deployment assisted-service
-$(KUBECTL) rollout status  deployment assisted-service
-endef
 
 _verify_cluster:
 	python3 ./tools/wait_for_cluster_info.py --namespace "$(NAMESPACE)"
@@ -343,7 +360,7 @@ deploy-converged-flow-requirements:
 deploy-service: deploy-service-requirements
 	python3 ./tools/deploy_assisted_installer.py $(DEPLOY_TAG_OPTION) --namespace "$(NAMESPACE)" \
 		$(TEST_FLAGS) --target "$(TARGET)" --replicas-count $(REPLICAS_COUNT) \
-		--apply-manifest $(APPLY_MANIFEST) $(EVENT_STREAMING_OPTIONS) $(DEBUG_PORT_OPTIONS) $(IMAGE_PULL_POLICY)
+		--apply-manifest $(APPLY_MANIFEST) $(EVENT_STREAMING_OPTIONS) $(DEBUG_PORT_OPTIONS)
 	$(MAKE) wait-for-service
 
 wait-for-service:
@@ -379,28 +396,30 @@ create-ocp-manifests:
 	export HW_REQUIREMENTS="$(subst ",\", $(shell cat $(ROOT_DIR)/data/default_hw_requirements.json | tr -d "\n\t "))" && \
 	$(MAKE) deploy-postgres deploy-ocm-secret deploy-s3-secret deploy-service deploy-ui
 
-ci-deploy-for-subsystem: _verify_cluster generate-keys
-	export TEST_FLAGS=--subsystem-test && export AUTH_TYPE="rhsso" && export DUMMY_IGNITION=${DUMMY_IGNITION} && \
-	export IPV6_SUPPORT="True" && export ENABLE_ORG_TENANCY="True" && export ENABLE_ORG_BASED_FEATURE_GATES="True" && \
-	$(MAKE) deploy-wiremock deploy-all
+ci-deploy-for-subsystem:
+	OS_IMAGES="$$( "$(ROOT_DIR)/hack/ci/prepare_subsystem_os_images.sh" "$(ROOT_DIR)" )" && \
+	export OS_IMAGES && \
+	$(MAKE) deploy-test
 
-patch-service: _verify_cluster update-local-image
-ifdef DEBUG_SERVICE
-	$(KUBECTL) patch deployment assisted-service --type json -p='[{"op": "add", "path": "/spec/template/spec/containers/0/ports/-", "value": {"containerPort": 40000}}]'
-	$(KUBECTL) patch service assisted-service --type json -p='[{"op": "add", "path": "/spec/ports/-", value: {"name": "assisted-service-debug", "port": 40000, "protocol": "TCP", "targetPort": 40000}}]'
-	$(KUBECTL) patch deployment assisted-service --type json -p='[{"op": "remove", "path": "/spec/template/spec/containers/0/livenessProbe"}]'
-endif
-	$(call restart_service_pods)
-
-deploy-test: _verify_cluster generate-keys update-local-image
+deploy-test: _verify_cluster generate-keys
 	-$(KUBECTL) delete deployments.apps assisted-service &> /dev/null
-	export SERVICE=${LOCAL_SERVICE_IMAGE} && export TEST_FLAGS=--subsystem-test && \
+	export TEST_FLAGS=--subsystem-test && \
 	export AUTH_TYPE="rhsso" && export DUMMY_IGNITION="True" && \
 	export IPV6_SUPPORT="True" && ENABLE_ORG_TENANCY="True" && ENABLE_ORG_BASED_FEATURE_GATES="True" && \
+	export RELEASE_SOURCES='$(or ${RELEASE_SOURCES},${DEFAULT_RELEASE_SOURCES})' && \
 	$(MAKE) deploy-wiremock deploy-all
 
-# An alias for the deploy-test target
-deploy-service-for-subsystem-test: deploy-test
+# execute on the host, without skipper
+deploy-service-for-subsystem-test: create-hub-cluster load-image
+	skipper $(MAKE) deploy-test SERVICE=$(LOCAL_ASSISTED_SERVICE_IMAGE) IP=$(shell ip route get 1 | sed 's/^.*src \([^ ]*\).*$$/\1/;q')
+	if [ "$(ENABLE_KUBE_API)" == "true" ]; then \
+		echo "Deploying assisted-service for subsystem tests in kube-api mode..."; \
+		skipper make enable-kube-api-for-subsystem; \
+	fi
+	if [ "${DEBUG_SERVICE}" == "true" ]; then \
+		$(MAKE) prepare_assisted_service_for_debug; \
+	fi
+	echo "assited service deployment for subsystem tests is ready"
 
 # $SERVICE is built with docker. If we want the latest version of $SERVICE
 # we need to pull it from the docker daemon before deploy-onprem.
@@ -410,50 +429,79 @@ podman-pull-service-from-docker-daemon:
 deploy-onprem:
 	podman play kube --configmap ${PODMAN_CONFIGMAP} deploy/podman/pod.yml
 	./hack/retry.sh 90 2 "curl -f http://127.0.0.1:8090/ready"
-	./hack/retry.sh 60 10 "curl -f http://127.0.0.1:8888/health"
+	./hack/retry.sh 180 10 "curl -f http://127.0.0.1:8888/health"
 
 deploy-on-openshift-ci:
 	export PERSISTENT_STORAGE="False" && export TARGET='oc' && export GENERATE_CRD='false' && unset GOFLAGS && \
-	$(MAKE) ci-deploy-for-subsystem
+	$(MAKE) deploy-test
 	oc get pods
+
+deploy-on-k8s: create-hub-cluster
+	skipper $(MAKE) deploy-all IP=$(shell ip route get 1 | sed 's/^.*src \([^ ]*\).*$$/\1/;q')
+	if [ "$(USE_LOCAL_SERVICE)" == "true" ] || [ "${DEBUG_SERVICE}" == "true" ]; then \
+		$(MAKE) patch-service; \
+	fi
+	skipper $(MAKE) deploy-ui
+
+deploy-sylva: create-hub-cluster
+	./hack/kind/dev-env-sylva.sh
+
+deploy-dev-infra: create-hub-cluster
+	./hack/kind/dev-env-infra.sh
 
 ########
 # Test #
 ########
 
-subsystem-run: test subsystem-clean
-
-subsystem-run-kube-api: enable-kube-api-for-subsystem test-kube-api subsystem-clean
-
 test:
-	$(MAKE) _run_subsystem_test AUTH_TYPE=rhsso ENABLE_ORG_TENANCY=true ENABLE_ORG_BASED_FEATURE_GATES=true
+	$(MAKE) _run_subsystem_test AUTH_TYPE=rhsso ENABLE_ORG_TENANCY=true ENABLE_ORG_BASED_FEATURE_GATES=true TEST="$(or $(TEST),'github.com/openshift/assisted-service/subsystem')"
 
 test-kube-api:
-	$(MAKE) _run_subsystem_test AUTH_TYPE=local ENABLE_KUBE_API=true FOCUS="$(or ${FOCUS},kube-api)"
+	$(MAKE) _run_subsystem_test AUTH_TYPE=local TEST="$(or $(TEST),'github.com/openshift/assisted-service/subsystem/kubeapi')"
 
-# An alias for the test target
+# Alias for test
 subsystem-test: test
 
-# An alias for the test-kube-api target
-subsystem-test-kube-api: test-kube-api
+subsystem-test-kube-api:
+	$(MAKE) test-kube-api ENABLE_KUBE_API=true
 
 _run_subsystem_test:
-	INVENTORY=$(shell $(call get_service_host_port,assisted-service) | sed 's/http:\/\///g') \
-	DB_HOST=$(shell $(call get_service_host_port,postgres) | sed 's/http:\/\///g' | cut -d ":" -f 1) \
-	DB_PORT=$(shell $(call get_service_host_port,postgres) | sed 's/http:\/\///g' | cut -d ":" -f 2) \
-	OCM_HOST=$(shell $(call get_service_host_port,wiremock) | sed 's/http:\/\///g') \
+	@if [ $(TARGET) == "kind" ]; then \
+		assisted_service_url="localhost:8090"; \
+		db_host="localhost"; \
+		db_port="5432"; \
+		ocm_host="localhost:8070"; \
+	else \
+		assisted_service_url="$(shell $(call get_service_host_port,assisted-service) | sed 's/http:\/\///g')"; \
+		db_host="$(shell $(call get_service_host_port,postgres) | sed 's/http:\/\///g' | cut -d ":" -f 1)"; \
+		db_port="$(shell $(call get_service_host_port,postgres) | sed 's/http:\/\///g' | cut -d ":" -f 2)"; \
+		ocm_host="$(shell $(call get_service_host_port,wiremock) | sed 's/http:\/\///g')"; \
+	fi; \
+	echo "INVENTORY=$$assisted_service_url\n"; \
+	echo "DB_HOST=$$db_host\n"; \
+	echo "DB_PORT=$$db_port\n"; \
+	echo "OCM_HOST=$$ocm_host\n"; \
+	echo "TEST_TOKEN=$(shell cat $(BUILD_FOLDER)/auth-tokenString)"; \
+	echo "TEST_TOKEN_2=$(shell cat $(BUILD_FOLDER)/auth-tokenString2)"; \
+	echo "TEST_TOKEN_ADMIN=$(shell cat $(BUILD_FOLDER)/auth-tokenAdminString)"; \
+	echo "TEST_TOKEN_UNALLOWED=$(shell cat $(BUILD_FOLDER)/auth-tokenUnallowedString)"; \
+	echo "TEST_TOKEN_EDITOR=$(shell cat $(BUILD_FOLDER)/auth-tokenClusterEditor)"; \
+	INVENTORY=$$assisted_service_url \
+	DB_HOST=$$db_host \
+	DB_PORT=$$db_port \
+	OCM_HOST=$$ocm_host \
 	TEST_TOKEN="$(shell cat $(BUILD_FOLDER)/auth-tokenString)" \
 	TEST_TOKEN_2="$(shell cat $(BUILD_FOLDER)/auth-tokenString2)" \
 	TEST_TOKEN_ADMIN="$(shell cat $(BUILD_FOLDER)/auth-tokenAdminString)" \
 	TEST_TOKEN_UNALLOWED="$(shell cat $(BUILD_FOLDER)/auth-tokenUnallowedString)" \
 	TEST_TOKEN_EDITOR="$(shell cat $(BUILD_FOLDER)/auth-tokenClusterEditor)" \
-	$(MAKE) _test TEST_SCENARIO=subsystem TIMEOUT=120m TEST="$(or $(TEST),./subsystem/...)"
+	RELEASE_SOURCES='$(or ${RELEASE_SOURCES},${DEFAULT_RELEASE_SOURCES})' \
+	$(MAKE) _test TEST_SCENARIO=subsystem TIMEOUT=120m
 
 enable-kube-api-for-subsystem: $(BUILD_FOLDER)
 	$(MAKE) deploy-service-requirements AUTH_TYPE=local ENABLE_KUBE_API=true ALLOW_CONVERGED_FLOW=true ISO_IMAGE_TYPE=minimal-iso
 	$(MAKE) deploy-converged-flow-requirements  ENABLE_KUBE_API=true  ALLOW_CONVERGED_FLOW=true
-	$(call restart_service_pods)
-	$(MAKE) wait-for-service
+	$(MAKE) restart_service_pods wait-for-service
 
 deploy-wiremock: deploy-namespace
 	python3 ./tools/deploy_wiremock.py --target $(TARGET) --namespace "$(NAMESPACE)"
@@ -505,16 +553,20 @@ display-coverage:
 
 run-db-container:
 	$(CONTAINER_COMMAND) ps -q --filter "name=postgres" | xargs -r $(CONTAINER_COMMAND) kill && sleep 3
-	$(CONTAINER_COMMAND) run -d  --rm --tmpfs /var/lib/pgsql/data --name postgres -e POSTGRESQL_ADMIN_PASSWORD=admin -e POSTGRESQL_MAX_CONNECTIONS=10000 -p 127.0.0.1:5432:5432 \
+	$(CONTAINER_COMMAND) run -d  --rm --tmpfs /var/lib/pgsql/data --name postgres -e POSTGRESQL_ADMIN_PASSWORD=admin -e POSTGRESQL_MAX_CONNECTIONS=10000 -p 127.0.0.1:5433:5432 \
 		$(PSQL_IMAGE)
 	timeout 5m ./hack/wait_for_postgres.sh
 
 run-unit-test:
 	SKIP_UT_DB=1 $(MAKE) _unit_test TIMEOUT=30m TEST="$(or $(TEST),$(shell go list ./... | grep -v subsystem))"
 
+run-unit-test-api:
+	cd api/ && go test ./...
+
 ci-unit-test:
 	./hack/start_db.sh
 	$(MAKE) run-unit-test
+	$(MAKE) run-unit-test-api
 
 kill-db-container:
 	$(CONTAINER_COMMAND) kill postgres
@@ -528,6 +580,15 @@ test-on-openshift-ci:
 	export TARGET='oc' && unset GOFLAGS && \
 	$(MAKE) test FOCUS="[minimal-set]"
 
+install-kind-if-needed:
+	./hack/kind/kind.sh install
+
+create-hub-cluster:
+	./hack/hub_cluster.sh create
+
+destroy-hub-cluster:
+	./hack/hub_cluster.sh delete
+
 #########
 # Clean #
 #########
@@ -538,9 +599,6 @@ clean:
 	-rm -rf $(BUILD_FOLDER) $(REPORTS)
 	-rm -rf bundle*
 
-subsystem-clean:
-	-$(KUBECTL) get pod -o name | grep createimage | xargs -r $(KUBECTL) delete --force --grace-period=0 1> /dev/null || true
-
 clear-deployment:
 	-python3 ./tools/clear_deployment.py --delete-namespace $(APPLY_NAMESPACE) --delete-pvc $(DELETE_PVC) --namespace "$(NAMESPACE)" --target "$(TARGET)" || true
 
@@ -550,6 +608,9 @@ clear-images:
 
 clean-onprem:
 	podman pod rm --force --ignore assisted-installer
+
+subsystem-clean:
+	-$(KUBECTL) get pod -o name | grep createimage | xargs -r $(KUBECTL) delete --force --grace-period=0 1> /dev/null || true
 
 ############
 # Operator #

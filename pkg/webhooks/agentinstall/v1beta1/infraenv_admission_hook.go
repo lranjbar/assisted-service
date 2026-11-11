@@ -1,14 +1,21 @@
 package v1beta1
 
 import (
+	"context"
+	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/openshift/assisted-service/api/v1beta1"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	log "github.com/sirupsen/logrus"
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -19,15 +26,20 @@ const (
 
 	infraEnvAdmissionGroup   = "admission.agentinstall.openshift.io"
 	infraEnvAdmissionVersion = "v1"
+
+	// defaultCPUArchitecture matches the kubebuilder default in
+	// api/v1beta1/infraenv_types.go and the CRD schema
+	defaultCPUArchitecture = "x86_64"
 )
 
 // InfraEnvValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
 type InfraEnvValidatingAdmissionHook struct {
-	decoder *admission.Decoder
+	decoder admission.Decoder
+	client  ctrlclient.Client
 }
 
 // NewInfraEnvValidatingAdmissionHook constructs a new NewInfraEnvValidatingAdmissionHook
-func NewInfraEnvValidatingAdmissionHook(decoder *admission.Decoder) *InfraEnvValidatingAdmissionHook {
+func NewInfraEnvValidatingAdmissionHook(decoder admission.Decoder) *InfraEnvValidatingAdmissionHook {
 	return &InfraEnvValidatingAdmissionHook{decoder: decoder}
 }
 
@@ -60,7 +72,20 @@ func (a *InfraEnvValidatingAdmissionHook) Initialize(kubeClientConfig *rest.Conf
 		"version":  infraEnvAdmissionVersion,
 		"resource": "infraenvvalidator",
 	}).Info("Initializing validation REST resource")
-	return nil // No initialization needed right now.
+
+	scheme := runtime.NewScheme()
+	if err := hivev1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add hive scheme: %w", err)
+	}
+
+	client, err := ctrlclient.New(kubeClientConfig, ctrlclient.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create k8s client: %w", err)
+	}
+
+	a.client = client
+
+	return nil
 }
 
 // Validate is called by generic-admission-server when the registered REST resource above is called with an admission request.
@@ -141,6 +166,16 @@ func areClusterRefsEqual(clusterRef1 *v1beta1.ClusterReference, clusterRef2 *v1b
 	}
 }
 
+func areCpuArchsEqual(oldArch, newArch string) bool {
+	if oldArch == "" {
+		oldArch = defaultCPUArchitecture
+	}
+	if newArch == "" {
+		newArch = defaultCPUArchitecture
+	}
+	return oldArch == newArch
+}
+
 // validateUpdate specifically validates create operations for InfraEnv objects.
 func (a *InfraEnvValidatingAdmissionHook) validateCreate(admissionSpec *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
 	contextLogger := log.WithFields(log.Fields{
@@ -163,9 +198,9 @@ func (a *InfraEnvValidatingAdmissionHook) validateCreate(admissionSpec *admissio
 		}
 	}
 
-	// Ensure that ClusterRef and OSImageVersion are not both specified
-	if newObject.Spec.ClusterRef != nil && newObject.Spec.OSImageVersion != "" {
-		message := "Either Spec.ClusterRef or Spec.OSImageVersion should be specified (not both)."
+	// Ensure that ClusterRef cannot be combined with OSImageVersion or OSStream
+	if newObject.Spec.ClusterRef != nil && (newObject.Spec.OSImageVersion != "" || newObject.Spec.OSStream != "") {
+		message := "Spec.ClusterRef is mutually exclusive with either Spec.OSImageVersion or Spec.OSStream."
 		contextLogger.Infof("Failed validation: %v", message)
 		contextLogger.Error(message)
 		return &admissionv1.AdmissionResponse{
@@ -233,9 +268,87 @@ func (a *InfraEnvValidatingAdmissionHook) validateUpdate(admissionSpec *admissio
 		}
 	}
 
+	if !areCpuArchsEqual(oldObject.Spec.CpuArchitecture, newObject.Spec.CpuArchitecture) {
+		message := "Attempted to change Spec.CpuArchitecture which is immutable after InfraEnv creation."
+		contextLogger.Infof("Failed validation: %v", message)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: message,
+			},
+		}
+	}
+
+	if !a.osImageVersionValid(contextLogger, oldObject, newObject) {
+		message := "spec.OSImageVersion is not valid. It can't be added alongside with a clusterRef when the cluster is not installed yet."
+		contextLogger.Infof("Failed validation: %v", message)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: message,
+			},
+		}
+	}
+
+	if !a.osStreamValid(contextLogger, oldObject, newObject) {
+		message := "spec.OSStream is not valid. It can't be added alongside with a clusterRef when the cluster is not installed yet."
+		contextLogger.Infof("Failed validation: %v", message)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: message,
+			},
+		}
+	}
+
 	// If we get here, then all checks passed, so the object is valid.
 	contextLogger.Info("Successful validation")
 	return &admissionv1.AdmissionResponse{
 		Allowed: true,
 	}
+}
+
+// osImageVersionValid checks if the OSImageVersion is valid: if it has been added, then the cluster must be installed.
+func (a *InfraEnvValidatingAdmissionHook) osImageVersionValid(logger *log.Entry, oldObject *v1beta1.InfraEnv, newObject *v1beta1.InfraEnv) bool {
+	return a.isFieldAddedOnlyWhenClusterIsInstalled(logger, oldObject, newObject,
+		oldObject.Spec.OSImageVersion == "" && newObject.Spec.OSImageVersion != "")
+}
+
+// osStreamValid checks if the OSStream is valid: if it has been added, then the cluster must be installed.
+func (a *InfraEnvValidatingAdmissionHook) osStreamValid(logger *log.Entry, oldObject *v1beta1.InfraEnv, newObject *v1beta1.InfraEnv) bool {
+	return a.isFieldAddedOnlyWhenClusterIsInstalled(logger, oldObject, newObject,
+		oldObject.Spec.OSStream == "" && newObject.Spec.OSStream != "")
+}
+
+func (a *InfraEnvValidatingAdmissionHook) isFieldAddedOnlyWhenClusterIsInstalled(logger *log.Entry, oldObject *v1beta1.InfraEnv, newObject *v1beta1.InfraEnv, fieldAdded bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// If cluster ref is not set, then there is nothing to check
+	if oldObject.Spec.ClusterRef == nil || newObject.Spec.ClusterRef == nil {
+		return true
+	}
+
+	// If the field was not added, then there is nothing to check
+	if !fieldAdded {
+		return true
+	}
+
+	namespace := newObject.Spec.ClusterRef.Namespace
+	clusterDeployment := hivev1.ClusterDeployment{}
+
+	err := a.client.Get(ctx, types.NamespacedName{Name: newObject.Spec.ClusterRef.Name, Namespace: namespace}, &clusterDeployment)
+	if err != nil {
+		logger.WithError(err).Error("Failed to get cluster deployment")
+
+		return false
+	}
+
+	return clusterDeployment.Spec.Installed
 }

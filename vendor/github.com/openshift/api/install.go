@@ -14,8 +14,6 @@ import (
 	kauthorizationv1beta1 "k8s.io/api/authorization/v1beta1"
 	kautoscalingv1 "k8s.io/api/autoscaling/v1"
 	kautoscalingv2 "k8s.io/api/autoscaling/v2"
-	kautoscalingv2beta1 "k8s.io/api/autoscaling/v2beta1"
-	kautoscalingv2beta2 "k8s.io/api/autoscaling/v2beta2"
 	kbatchv1 "k8s.io/api/batch/v1"
 	kbatchv1beta1 "k8s.io/api/batch/v1beta1"
 	kcertificatesv1 "k8s.io/api/certificates/v1"
@@ -26,7 +24,6 @@ import (
 	keventsv1 "k8s.io/api/events/v1"
 	keventsv1beta1 "k8s.io/api/events/v1beta1"
 	kextensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	kflowcontrolv1alpha1 "k8s.io/api/flowcontrol/v1alpha1"
 	kflowcontrolv1beta1 "k8s.io/api/flowcontrol/v1beta1"
 	kflowcontrolv1beta2 "k8s.io/api/flowcontrol/v1beta2"
 	kimagepolicyv1alpha1 "k8s.io/api/imagepolicy/v1alpha1"
@@ -41,13 +38,13 @@ import (
 	krbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
 	krbacv1beta1 "k8s.io/api/rbac/v1beta1"
 	kschedulingv1 "k8s.io/api/scheduling/v1"
-	kschedulingv1alpha1 "k8s.io/api/scheduling/v1alpha1"
 	kschedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	kstoragev1 "k8s.io/api/storage/v1"
 	kstoragev1alpha1 "k8s.io/api/storage/v1alpha1"
 	kstoragev1beta1 "k8s.io/api/storage/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"github.com/openshift/api/apiextensions"
 	"github.com/openshift/api/apiserver"
 	"github.com/openshift/api/apps"
 	"github.com/openshift/api/authorization"
@@ -55,6 +52,7 @@ import (
 	"github.com/openshift/api/cloudnetwork"
 	"github.com/openshift/api/config"
 	"github.com/openshift/api/console"
+	"github.com/openshift/api/etcd"
 	"github.com/openshift/api/helm"
 	"github.com/openshift/api/image"
 	"github.com/openshift/api/imageregistry"
@@ -84,12 +82,14 @@ import (
 
 var (
 	schemeBuilder = runtime.NewSchemeBuilder(
+		apiextensions.Install,
 		apiserver.Install,
 		apps.Install,
 		authorization.Install,
 		build.Install,
 		config.Install,
 		console.Install,
+		etcd.Install,
 		helm.Install,
 		image.Install,
 		imageregistry.Install,
@@ -131,8 +131,6 @@ var (
 		kauthorizationv1beta1.AddToScheme,
 		kautoscalingv1.AddToScheme,
 		kautoscalingv2.AddToScheme,
-		kautoscalingv2beta1.AddToScheme,
-		kautoscalingv2beta2.AddToScheme,
 		kbatchv1.AddToScheme,
 		kbatchv1beta1.AddToScheme,
 		kcertificatesv1.AddToScheme,
@@ -143,7 +141,6 @@ var (
 		keventsv1.AddToScheme,
 		keventsv1beta1.AddToScheme,
 		kextensionsv1beta1.AddToScheme,
-		kflowcontrolv1alpha1.AddToScheme,
 		kflowcontrolv1beta1.AddToScheme,
 		kflowcontrolv1beta2.AddToScheme,
 		kimagepolicyv1alpha1.AddToScheme,
@@ -158,7 +155,6 @@ var (
 		krbacv1beta1.AddToScheme,
 		krbacv1alpha1.AddToScheme,
 		kschedulingv1.AddToScheme,
-		kschedulingv1alpha1.AddToScheme,
 		kschedulingv1beta1.AddToScheme,
 		kstoragev1.AddToScheme,
 		kstoragev1beta1.AddToScheme,

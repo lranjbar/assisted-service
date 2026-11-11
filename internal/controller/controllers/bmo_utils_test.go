@@ -3,13 +3,14 @@ package controllers
 import (
 	"context"
 
-	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	v1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/common"
 	metal3iov1alpha1 "github.com/openshift/cluster-baremetal-operator/api/v1alpha1"
+	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -116,11 +117,107 @@ var _ = Describe("bmoUtils", func() {
 			Expect(c.Create(context.Background(), provisioningInfo)).To(BeNil())
 			serviceIPs, inspectorIPs, err := bmoUtils.GetIronicIPs()
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("unable to determine inspector IP, check if metal3 pod is running"))
+			Expect(err.Error()).To(ContainSubstring("unable to determine Ironic's IP"))
 			Expect(serviceIPs).Should(BeNil())
 			Expect(inspectorIPs).Should(BeNil())
 		})
 
+	})
+	Context("getICCConfig", func() {
+		It("success", func() {
+			bmoUtils := &bmoUtils{
+				c:              c,
+				log:            log,
+				kubeAPIEnabled: true,
+			}
+			ironicURLs := getUrlFromIP("10.10.10.11")
+			inspectorURLs := getUrlFromIP("10.10.10.10")
+			agentImage := "quay.io/some/agent:image"
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      iccSecretName,
+					Namespace: iccNamespace,
+				},
+				Data: map[string][]byte{
+					ironicBaseURLKey:          []byte(ironicURLs),
+					ironicInspectorBaseURLKey: []byte(inspectorURLs),
+					ironicAgentImageKey:       []byte(agentImage),
+				},
+			}
+			Expect(c.Create(context.Background(), secret)).To(BeNil())
+			iccConfig, err := bmoUtils.getICCConfig(context.Background())
+			Expect(err).Should(BeNil())
+			Expect(iccConfig.IronicBaseURL).Should(Equal(ironicURLs))
+			Expect(iccConfig.IronicInspectorBaseUrl).Should(Equal(inspectorURLs))
+			Expect(iccConfig.IronicAgentImage).Should(Equal(agentImage))
+		})
+
+		It("succeeds when only the inspector url is missing", func() {
+			bmoUtils := &bmoUtils{
+				c:              c,
+				log:            log,
+				kubeAPIEnabled: true,
+			}
+			ironicURLs := getUrlFromIP("10.10.10.11")
+			agentImage := "quay.io/some/agent:image"
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      iccSecretName,
+					Namespace: iccNamespace,
+				},
+				Data: map[string][]byte{
+					ironicBaseURLKey:    []byte(ironicURLs),
+					ironicAgentImageKey: []byte(agentImage),
+				},
+			}
+			Expect(c.Create(context.Background(), secret)).To(BeNil())
+			iccConfig, err := bmoUtils.getICCConfig(context.Background())
+			Expect(err).Should(BeNil())
+			Expect(iccConfig.IronicBaseURL).Should(Equal(ironicURLs))
+			Expect(iccConfig.IronicAgentImage).Should(Equal(agentImage))
+		})
+
+		It("throws an error when secret is missing", func() {
+			bmoUtils := &bmoUtils{
+				c:              c,
+				log:            log,
+				kubeAPIEnabled: true,
+			}
+			_, err := bmoUtils.getICCConfig(context.Background())
+			Expect(err).Should(Not(BeNil()))
+		})
+
+		DescribeTable("throws an error when config is incomplete",
+			func(ironicURLs []byte, inspectorURLs []byte, agentImage []byte) {
+				bmoUtils := &bmoUtils{
+					c:              c,
+					log:            log,
+					kubeAPIEnabled: true,
+				}
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      iccSecretName,
+						Namespace: iccNamespace,
+					},
+					Data: map[string][]byte{},
+				}
+				if ironicURLs != nil {
+					secret.Data[ironicBaseURLKey] = ironicURLs
+				}
+				if inspectorURLs != nil {
+					secret.Data[ironicInspectorBaseURLKey] = inspectorURLs
+				}
+				if agentImage != nil {
+					secret.Data[ironicAgentImageKey] = agentImage
+				}
+
+				Expect(c.Create(context.Background(), secret)).To(BeNil())
+				_, err := bmoUtils.getICCConfig(context.Background())
+				Expect(err).Should(Not(BeNil()))
+			},
+			Entry("ironicURLs is missing", nil, []byte("some"), []byte("some")),
+			Entry("ironicAgentImage is missing", []byte("some"), []byte("some"), nil),
+		)
 	})
 })
 

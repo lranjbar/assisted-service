@@ -5,7 +5,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -22,6 +21,7 @@ import (
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -69,7 +69,7 @@ var _ = Describe("Suggested-Role on Refresh", func() {
 		clusterId = strfmt.UUID(uuid.New().String())
 		infraEnvId = strfmt.UUID(uuid.New().String())
 		mockEvents = eventsapi.NewMockHandler(ctrl)
-		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		initHwValidator()
 		mockProviderRegistry = registry.NewMockProviderRegistry(ctrl)
 		mockProviderRegistry.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeBaremetal), gomock.Any()).Return(true, nil).AnyTimes()

@@ -25,10 +25,13 @@ import (
 type ValidationStatus string
 
 const (
-	ValidationSuccess ValidationStatus = "success"
-	ValidationFailure ValidationStatus = "failure"
-	ValidationPending ValidationStatus = "pending"
-	ValidationError   ValidationStatus = "error"
+	ValidationSuccess     ValidationStatus = "success"
+	ValidationFailure     ValidationStatus = "failure"
+	ValidationPending     ValidationStatus = "pending"
+	ValidationError       ValidationStatus = "error"
+	ValidationDisabled    ValidationStatus = "disabled"
+	DefaultIPV4HostPrefix                  = 25
+	DefaultIPV6HostPrefix                  = 64
 )
 
 func (v ValidationStatus) String() string {
@@ -119,6 +122,9 @@ func (v *clusterValidator) isMachineCidrEqualsToCalculatedCidr(c *clusterPreproc
 	if swag.BoolValue(c.cluster.UserManagedNetworking) {
 		return ValidationSuccess, "The Cluster Machine CIDR is not required: User Managed Networking"
 	}
+	if network.IsLoadBalancerUserManaged(c.cluster) {
+		return ValidationSuccess, "Calculating machine network CIDR is not enabled: User Managed Load Balancer"
+	}
 	if len(c.cluster.APIVips) == 0 && len(c.cluster.IngressVips) == 0 {
 		return ValidationPending, "The Machine Network CIDR, API virtual IPs, or Ingress virtual IPs are undefined."
 	}
@@ -135,8 +141,14 @@ func (v *clusterValidator) isMachineCidrEqualsToCalculatedCidr(c *clusterPreproc
 		c.calculateCidr = cidr
 		machineCidrAvailable := network.IsMachineCidrAvailable(c.cluster)
 		if machineCidrAvailable {
-			if cidr != network.GetMachineCidrById(c.cluster, i) {
-				multiErr = multierror.Append(multiErr, errors.Errorf("The Cluster Machine CIDR %s is different than the calculated CIDR %s.", network.GetMachineCidrById(c.cluster, i), c.calculateCidr))
+			userMachineCidr := network.GetMachineCidrById(c.cluster, i)
+			normalizedUserMachineCidr, err := models.Subnet(userMachineCidr).Normalize()
+			if err != nil {
+				multiErr = multierror.Append(multiErr, errors.Wrapf(err, "failed to normalize user machine CIDR %s", userMachineCidr))
+				continue
+			}
+			if cidr != string(normalizedUserMachineCidr) {
+				multiErr = multierror.Append(multiErr, errors.Errorf("The Cluster Machine CIDR %s is different than the calculated CIDR %s.", userMachineCidr, c.calculateCidr))
 			}
 		}
 	}
@@ -186,7 +198,7 @@ func (v *clusterValidator) areVipsDefined(c *clusterPreprocessContext, vipsWrapp
 	if swag.BoolValue(c.cluster.UserManagedNetworking) {
 		return ValidationSuccess, fmt.Sprintf("%s virtual IPs are not required: User Managed Networking", vipsWrapper.Name())
 	}
-	if swag.StringValue(c.cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+	if c.cluster.ControlPlaneCount == 1 {
 		return ValidationSuccess, fmt.Sprintf("%s virtual IPs are not required: SNO", vipsWrapper.Name())
 	}
 	if vipsWrapper.Len() > 0 {
@@ -212,16 +224,10 @@ func (v *clusterValidator) areApiVipsDefined(c *clusterPreprocessContext) (Valid
 }
 
 func (v *clusterValidator) areVipsValid(c *clusterPreprocessContext, vipsWrapper VipsWrapper) (ValidationStatus, string) {
-	var (
-		multiErr *multierror.Error
-		msg      string
-	)
-
-	name := strings.ToLower(vipsWrapper.Name()) + " vips"
 	if swag.BoolValue(c.cluster.UserManagedNetworking) {
 		return ValidationSuccess, fmt.Sprintf("%s virtual IPs are not required: User Managed Networking", vipsWrapper.Name())
 	}
-	if swag.StringValue(c.cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+	if c.cluster.ControlPlaneCount == 1 {
 		return ValidationSuccess, fmt.Sprintf("%s virtual IPs are not required: SNO", vipsWrapper.Name())
 	}
 
@@ -234,10 +240,35 @@ func (v *clusterValidator) areVipsValid(c *clusterPreprocessContext, vipsWrapper
 		return ValidationPending, "Hosts have not been discovered yet"
 	}
 
+	if !network.IsLoadBalancerUserManaged(c.cluster) {
+		return validateVipsClusterManagedLoadBalancer(c, vipsWrapper, v.log)
+	}
+
+	return validateVipsUserManagedLoadBalancer(c, vipsWrapper, v.log)
+}
+
+func validateVipsClusterManagedLoadBalancer(
+	c *clusterPreprocessContext, vipsWrapper VipsWrapper, log logrus.FieldLogger,
+) (ValidationStatus, string) {
+	var (
+		multiErr *multierror.Error
+		msg      string
+	)
+
+	name := strings.ToLower(vipsWrapper.Name()) + " vips"
+
 	failed := false
 	for i := 0; i != vipsWrapper.Len(); i++ {
-		verification, err := network.VerifyVip(c.cluster.Hosts, network.GetMachineCidrById(c.cluster, i), vipsWrapper.IP(i), name,
-			vipsWrapper.Verification(i), v.log)
+		verification, err := network.VerifyVipWithSingleMachineNetwork(
+			c.cluster.Hosts,
+			network.GetMachineCidrById(c.cluster, i),
+			vipsWrapper.IP(i),
+			name,
+			vipsWrapper.Verification(i),
+			true,
+			log,
+		)
+
 		failed = failed || verification != models.VipVerificationSucceeded
 		if err != nil {
 			multiErr = multierror.Append(multiErr, err)
@@ -254,25 +285,121 @@ func (v *clusterValidator) areVipsValid(c *clusterPreprocessContext, vipsWrapper
 	return ValidationSuccess, fmt.Sprintf("%s %s belongs to the Machine CIDR and is not in use.", name, strings.Join(vipsWrapper.GetVips(), `, `))
 }
 
+func validateVipsUserManagedLoadBalancer(
+	c *clusterPreprocessContext, vipsWrapper VipsWrapper, log logrus.FieldLogger,
+) (ValidationStatus, string) {
+	if vipsWrapper.Len() == 0 {
+		return ValidationPending, fmt.Sprintf("%s virtual IPs are undefined.", vipsWrapper.Name())
+	}
+
+	name := strings.ToLower(vipsWrapper.Name()) + " vip"
+	verification, err := network.VerifyVipWithMachineNetworkList(
+		c.cluster.Hosts,
+		c.cluster.MachineNetworks,
+		vipsWrapper.IP(0),
+		name,
+		vipsWrapper.Verification(0),
+		false,
+		log,
+	)
+
+	if verification != models.VipVerificationSucceeded {
+		if err != nil {
+			return ValidationFailure, err.Error()
+		}
+		return ValidationFailure, fmt.Sprintf("%s %s is invalid", name, vipsWrapper.IP(0))
+	}
+
+	return ValidationSuccess, fmt.Sprintf("%s %s is valid", name, vipsWrapper.IP(0))
+}
+
 func (v *clusterValidator) areApiVipsValid(c *clusterPreprocessContext) (ValidationStatus, string) {
 	return v.areVipsValid(c, &ApiVipsWrapper{c: c})
 }
 
 func (v *clusterValidator) isNetworkTypeValid(c *clusterPreprocessContext) (ValidationStatus, string) {
-	validNetworkTypes := []string{models.ClusterNetworkTypeOVNKubernetes, models.ClusterNetworkTypeOpenShiftSDN}
+	validNetworkTypes := []string{
+		models.ClusterNetworkTypeOVNKubernetes,
+		models.ClusterNetworkTypeOpenShiftSDN,
+		models.ClusterNetworkTypeCilium,
+		models.ClusterNetworkTypeCalico,
+		models.ClusterNetworkTypeCiscoACI,
+		models.ClusterNetworkTypeNone,
+	}
 	if !funk.ContainsString(validNetworkTypes, swag.StringValue(c.cluster.NetworkType)) && c.cluster.NetworkType != nil {
-		return ValidationFailure, "The network type is not valid; the valid network types are OpenShiftSDN or OVNKubernetes"
+		return ValidationFailure, "The network type is not valid; the valid network types are OpenShiftSDN, OVNKubernetes, Cilium, Calico, CiscoACI, or None"
 	}
 	if hasClusterNetworksUnsupportedByNetworkType(c.cluster) {
 		return ValidationFailure, "The cluster is configured with IPv6 which is not supported by OpenShiftSDN; use OVNKubernetes instead"
 	}
-	if isHighAvailabilityModeUnsupportedByNetworkType(c.cluster) {
-		return ValidationFailure, "High-availability mode 'None' (SNO) is not supported by OpenShiftSDN; use another network type instead"
+	if isControlPlaneCountUnsupportedByNetworkType(c.cluster) {
+		return ValidationFailure, "Control Plane Count '1' (SNO) is not supported by OpenShiftSDN; use another network type instead"
 	}
 	if isVipDhcpAllocationAndOVN(c.cluster) {
 		return ValidationFailure, "VIP DHCP allocation is not supported when the cluster is configured to use OVNKubernetes."
 	}
 	return ValidationSuccess, "The cluster has a valid network type"
+}
+
+func (v *clusterValidator) isCustomManifestsRequirementsSatisfied(c *clusterPreprocessContext) (ValidationStatus, string) {
+	requirements := v.getCustomManifestRequirements(c.cluster)
+	if len(requirements) == 0 {
+		return ValidationSuccess, "No custom manifests are required"
+	}
+
+	usages, err := usage.Unmarshal(c.cluster.Cluster.FeatureUsage)
+	if err != nil {
+		v.log.Errorf("Custom manifest validation failure, failed to parse feature usages: %s", err.Error())
+		return ValidationFailure, "Failed to parse feature usages"
+	}
+
+	hasManifests := false
+	for _, usg := range usages {
+		if usg.Name == usage.CustomManifest {
+			hasManifests = true
+			break
+		}
+	}
+
+	if hasManifests {
+		return ValidationSuccess, "Custom manifests are uploaded"
+	}
+
+	return ValidationFailure, fmt.Sprintf("Custom manifests are required for: %s. Please upload manifests via the custom manifests API.", strings.Join(requirements, ", "))
+}
+
+// getEffectiveNetworkType resolves the network type from InstallConfigOverrides if set,
+// otherwise returns the cluster's NetworkType field.
+func (v *clusterValidator) getEffectiveNetworkType(cluster *common.Cluster) string {
+	networkType := swag.StringValue(cluster.NetworkType)
+	if cluster.InstallConfigOverrides != "" {
+		overrideDecoder := json.NewDecoder(strings.NewReader(cluster.InstallConfigOverrides))
+
+		cfg := &installcfg.InstallerConfigBaremetal{}
+		if overrideDecoder.Decode(cfg) == nil && cfg.Networking.NetworkType != "" {
+			networkType = cfg.Networking.NetworkType
+		}
+	}
+	return networkType
+}
+
+// getCustomManifestRequirements returns features requiring custom manifests.
+// Currently, third-party CNIs require custom manifests to be uploaded.
+func (v *clusterValidator) getCustomManifestRequirements(cluster *common.Cluster) []string {
+	var requirements []string
+
+	networkType := v.getEffectiveNetworkType(cluster)
+	thirdPartyCNIs := []string{
+		models.ClusterNetworkTypeCilium,
+		models.ClusterNetworkTypeCalico,
+		models.ClusterNetworkTypeCiscoACI,
+		models.ClusterNetworkTypeNone,
+	}
+	if funk.ContainsString(thirdPartyCNIs, networkType) {
+		requirements = append(requirements, fmt.Sprintf("%s network type", networkType))
+	}
+
+	return requirements
 }
 
 func hasClusterNetworksUnsupportedByNetworkType(cluster *common.Cluster) bool {
@@ -281,11 +408,11 @@ func hasClusterNetworksUnsupportedByNetworkType(cluster *common.Cluster) bool {
 			return false
 		}
 		return network.IsIPv6CIDR(*ip)
-	})) && cluster.NetworkType != nil && swag.StringValue(cluster.NetworkType) != models.ClusterNetworkTypeOVNKubernetes
+	})) && cluster.NetworkType != nil && swag.StringValue(cluster.NetworkType) == models.ClusterNetworkTypeOpenShiftSDN
 }
 
-func isHighAvailabilityModeUnsupportedByNetworkType(cluster *common.Cluster) bool {
-	return swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone &&
+func isControlPlaneCountUnsupportedByNetworkType(cluster *common.Cluster) bool {
+	return cluster.ControlPlaneCount == 1 &&
 		cluster.NetworkType != nil && swag.StringValue(cluster.NetworkType) == models.ClusterNetworkTypeOpenShiftSDN
 }
 
@@ -303,50 +430,33 @@ func (v *clusterValidator) areIngressVipsValid(c *clusterPreprocessContext) (Val
 	return v.areVipsValid(c, &IngressVipsWrapper{c: c})
 }
 
-// conditions to have a valid number of masters
-// 1. have exactly three masters
-// 2. have less then 3 masters but enough to auto-assign hosts that can become masters
-// 3. have at least 2 workers or auto-assign hosts that can become workers, if workers configured
-// 4. having more then 3 known masters is illegal
-func (v *clusterValidator) sufficientMastersCount(c *clusterPreprocessContext) (ValidationStatus, string) {
+// SufficientMastersCount validates that there is a sufficient amount of hosts to satisfy requirements of both masters and workers.
+// The requirements are -
+//   - For none-high-availablity cluster (SNO), exactly 1 master and 0 workers are required.
+//   - For high-availablity cluster, the master count should match the expected master count (ControlPlaneCount).
+func (v *clusterValidator) SufficientMastersCount(c *clusterPreprocessContext) (ValidationStatus, string) {
 	status := ValidationSuccess
-	var message string
+	var (
+		message string
+		suffix  string
+	)
 
-	minMastersNeededForInstallation := common.MinMasterHostsNeededForInstallation
-	nonHAMode := swag.StringValue(c.cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone
-	if nonHAMode {
-		minMastersNeededForInstallation = common.AllowedNumberOfMasterHostsInNoneHaMode
-	}
-
-	hosts := make([]*models.Host, 0)
-	for _, h := range MapHostsByStatus(c.cluster) {
-		hosts = append(hosts, h...)
-	}
-	masters := make([]*models.Host, 0)
-	workers := make([]*models.Host, 0)
-	candidates := make([]*models.Host, 0)
-
-	for _, host := range hosts {
-		switch role := common.GetEffectiveRole(host); role {
-		case models.HostRoleMaster:
-			//add pre-assigned/suggested master hosts to the masters list
-			masters = append(masters, host)
-		case models.HostRoleWorker:
-			//add pre-assigned/suggested worker hosts to the worker list
-			workers = append(workers, host)
-		default:
-			//auto-assign hosts and other types go to the candidate list
-			candidates = append(candidates, host)
-		}
-	}
-
-	for _, h := range candidates {
+	masters, arbiters, workers, autoAssignHosts := common.GetHostsByEachRole(&c.cluster.Cluster, true)
+	for _, h := range autoAssignHosts {
 		//if allocated masters count is less than the desired count, find eligible hosts
-		//from the candidate pool to match the master count criteria, up to 3
-		if len(masters) < minMastersNeededForInstallation {
-			candidate := *h
-			if isValid, err := v.hostAPI.IsValidMasterCandidate(&candidate, c.cluster, c.db, v.log); isValid && err == nil {
+		//from the candidate pool to match the master count criteria
+		if len(masters) < int(c.cluster.ControlPlaneCount) {
+			if isValid, err := v.hostAPI.IsValidCandidate(h, c.cluster, models.HostRoleMaster, c.db, v.log, false); isValid && err == nil {
 				masters = append(masters, h)
+				continue
+			}
+		}
+		//otherwise, if the cluster's ControlPlaneCount is 2 then we should try to have at least 1 arbiter
+		if c.cluster.ControlPlaneCount < common.MinMasterHostsNeededForInstallationInHaMode &&
+			c.cluster.ControlPlaneCount >= common.MinMasterHostsNeededForInstallationInHaArbiterMode &&
+			len(arbiters) == 0 {
+			if isValid, err := v.hostAPI.IsValidCandidate(h, c.cluster, models.HostRoleArbiter, c.db, v.log, false); isValid && err == nil {
+				arbiters = append(arbiters, h)
 				continue
 			}
 		}
@@ -355,8 +465,23 @@ func (v *clusterValidator) sufficientMastersCount(c *clusterPreprocessContext) (
 	}
 
 	numWorkers := len(workers)
-	if len(masters) != minMastersNeededForInstallation ||
-		nonHAMode && numWorkers != common.AllowedNumberOfWorkersInNoneHaMode {
+	numArbiters := len(arbiters)
+	numMasters := len(masters)
+
+	// validate masters
+	if numMasters != int(c.cluster.ControlPlaneCount) {
+		status = ValidationFailure
+	}
+
+	if c.cluster.ControlPlaneCount < common.MinMasterHostsNeededForInstallationInHaMode &&
+		c.cluster.ControlPlaneCount >= common.MinMasterHostsNeededForInstallationInHaArbiterMode &&
+		numArbiters == 0 && !common.IsClusterTopologyTwoNodesWithFencing(c.cluster) {
+		status = ValidationFailure
+		suffix = " and at least 1 arbiter node or the control plane nodes must have fencing credentials"
+	}
+
+	// validate workers (for SNO)
+	if c.cluster.ControlPlaneCount == 1 && numWorkers != common.AllowedNumberOfWorkersInNoneHaMode {
 		status = ValidationFailure
 	}
 
@@ -364,8 +489,11 @@ func (v *clusterValidator) sufficientMastersCount(c *clusterPreprocessContext) (
 	case ValidationSuccess:
 		message = "The cluster has the exact amount of dedicated control plane nodes."
 	case ValidationFailure:
-		message = fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.", common.MinMasterHostsNeededForInstallation)
-		if nonHAMode {
+		message = fmt.Sprintf(
+			"The cluster must have exactly %d dedicated control plane nodes%s. Add or remove hosts, or change their roles configurations to meet the requirement.",
+			c.cluster.ControlPlaneCount, suffix,
+		)
+		if c.cluster.ControlPlaneCount == 1 {
 			message = "Single-node clusters must have a single control plane node and no workers."
 		}
 	default:
@@ -531,17 +659,12 @@ func (v *clusterValidator) networkPrefixValid(c *clusterPreprocessContext) (Vali
 		return ValidationPending, "The Cluster Network CIDR is undefined."
 	}
 
-	skipHostPrefix := v.skipNetworkHostPrefixCheck(c)
+	skipHostPrefixCheck := v.skipNetworkHostPrefixCheck(c)
 
 	validClusterNetworks := funk.Filter(c.cluster.ClusterNetworks, func(clusterNetwork *models.ClusterNetwork) bool {
-		var hostPrefixForCidrValidation int
-		if !skipHostPrefix {
-			hostPrefixForCidrValidation = int(clusterNetwork.HostPrefix)
-		} else {
-			hostPrefixForCidrValidation = 25 // default to 128 addresses
-		}
+		hostPrefixForCidrValidation := getHostPrefixForCidrValidation(skipHostPrefixCheck, clusterNetwork)
 		return clusterNetwork != nil &&
-			(skipHostPrefix || network.VerifyNetworkHostPrefix(clusterNetwork.HostPrefix) == nil) &&
+			(skipHostPrefixCheck || network.VerifyNetworkHostPrefix(clusterNetwork.HostPrefix) == nil) &&
 			network.VerifyClusterCidrSize(hostPrefixForCidrValidation, string(clusterNetwork.Cidr), len(c.cluster.Hosts)) == nil
 	}).([]*models.ClusterNetwork)
 
@@ -551,10 +674,14 @@ func (v *clusterValidator) networkPrefixValid(c *clusterPreprocessContext) (Vali
 
 	var err error
 	for _, clusterNetwork := range c.cluster.ClusterNetworks {
-		if err = network.VerifyNetworkHostPrefix(clusterNetwork.HostPrefix); err != nil {
-			return ValidationFailure, fmt.Sprintf("Invalid Cluster Network prefix: %s.", err.Error())
+		if !skipHostPrefixCheck {
+			if err = network.VerifyNetworkHostPrefix(clusterNetwork.HostPrefix); err != nil {
+				return ValidationFailure, fmt.Sprintf("Invalid Cluster Network prefix: %s.", err.Error())
+			}
 		}
-		if err = network.VerifyClusterCidrSize(int(clusterNetwork.HostPrefix), string(clusterNetwork.Cidr), len(c.cluster.Hosts)); err != nil {
+
+		hostPrefixForCidrValidation := getHostPrefixForCidrValidation(skipHostPrefixCheck, clusterNetwork)
+		if err = network.VerifyClusterCidrSize(hostPrefixForCidrValidation, string(clusterNetwork.Cidr), len(c.cluster.Hosts)); err != nil {
 			return ValidationFailure, err.Error()
 		}
 	}
@@ -573,30 +700,28 @@ func (v *clusterValidator) isNtpServerConfigured(c *clusterPreprocessContext) (V
 		"please configure an NTP server via DHCP or set clocks manually.", common.MaximumAllowedTimeDiffMinutes)
 }
 
-// Ignore hostPrefix for non-OVN/SDN plugins.
+// skipNetworkHostPrefixCheck returns true if the hostPrefix should be ignored for non-OVN/SDN plugins.
 func (v *clusterValidator) skipNetworkHostPrefixCheck(c *clusterPreprocessContext) bool {
 	// list of known plugins that require hostPrefix to be set
 	var pluginsUsingHostPrefix = []string{models.ClusterNetworkTypeOVNKubernetes, models.ClusterNetworkTypeOpenShiftSDN}
 
-	networkType := swag.StringValue(c.cluster.NetworkType)
-	if c.cluster.InstallConfigOverrides != "" {
-		// use networkType from install-config overrides if set
-		overrideDecoder := json.NewDecoder(strings.NewReader(c.cluster.InstallConfigOverrides))
-		overrideDecoder.DisallowUnknownFields()
-
-		cfg := &installcfg.InstallerConfigBaremetal{}
-		if overrideDecoder.Decode(cfg) != nil {
-			v.log.Infof("could not decode install-config overrides %s", c.cluster.InstallConfigOverrides)
-			return false
-		}
-
-		if cfg.Networking.NetworkType != "" {
-			networkType = cfg.Networking.NetworkType
-		}
-	}
+	networkType := v.getEffectiveNetworkType(c.cluster)
 	if !funk.ContainsString(pluginsUsingHostPrefix, networkType) {
 		v.log.Infof("skipping network prefix check for %s", networkType)
 		return true
 	}
 	return false
+}
+
+// getHostPrefixForCidrValidation returns the prefix to use when validating CIDR.
+func getHostPrefixForCidrValidation(skipHostPrefix bool, clusterNetwork *models.ClusterNetwork) int {
+	hostPrefix := int(clusterNetwork.HostPrefix)
+	if skipHostPrefix {
+		if network.IsIPv6CIDR(string(clusterNetwork.Cidr)) {
+			hostPrefix = DefaultIPV6HostPrefix
+		} else {
+			hostPrefix = DefaultIPV4HostPrefix
+		}
+	}
+	return hostPrefix
 }

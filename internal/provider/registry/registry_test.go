@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -16,7 +15,7 @@ import (
 	"github.com/openshift/assisted-service/internal/provider/vsphere"
 	"github.com/openshift/assisted-service/internal/usage"
 	"github.com/openshift/assisted-service/models"
-	"gopkg.in/yaml.v2"
+	"go.uber.org/mock/gomock"
 )
 
 var (
@@ -25,47 +24,6 @@ var (
 )
 
 const invalidInventory = "{\"system_vendor\": \"invalid\"}"
-
-const expectedNutanixInstallConfig411 = `apiVIPs:
-- 192.168.10.10
-apiVIP: 192.168.10.10
-ingressVIPs:
-- 192.168.10.11
-ingressVIP: 192.168.10.11
-prismCentral:
-  endpoint:
-    address: prism.central.placeholder.address
-    port: 9440
-  username: username_placeholder
-  password: password_placeholder
-prismElements:
-- endpoint:
-    address: prism.element.placeholder.address
-    port: 9440
-  uuid: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  name: prism_endpoint_name_placeholder
-subnetUUIDs:
-- yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
-`
-const expectedNutanixInstallConfig412 = `apiVIPs:
-- 192.168.10.10
-ingressVIPs:
-- 192.168.10.11
-prismCentral:
-  endpoint:
-    address: prism.central.placeholder.address
-    port: 9440
-  username: username_placeholder
-  password: password_placeholder
-prismElements:
-- endpoint:
-    address: prism.element.placeholder.address
-    port: 9440
-  uuid: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-  name: prism_endpoint_name_placeholder
-subnetUUIDs:
-- yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
-`
 
 var _ = Describe("Test GetSupportedProvidersByHosts", func() {
 	bmInventory := getBaremetalInventoryStr("hostname0", "bootMode", true, false)
@@ -143,6 +101,10 @@ var _ = Describe("Test GetSupportedProvidersByHosts", func() {
 		Expect(err).ToNot(BeNil())
 		Expect(len(platforms)).Should(Equal(0))
 	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
 })
 
 var _ = Describe("IsHostSupported", func() {
@@ -170,7 +132,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 					},
 				},
 			}
-			err := providerRegistry.AddPlatformToInstallConfig(nil, cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(nil, cluster, nil)
 			Expect(err).ToNot(BeNil())
 		})
 	})
@@ -186,7 +148,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.Cluster.OpenshiftVersion = "4.12"
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.Baremetal).ToNot(BeNil())
 			Expect(cfg.Platform.Baremetal.DeprecatedAPIVIP).To(Equal(""))
@@ -215,7 +177,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.Cluster.OpenshiftVersion = "4.8"
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.Baremetal).ToNot(BeNil())
 			Expect(cfg.Platform.Baremetal.APIVIPs[0]).To(Equal(string(cluster.Cluster.APIVips[0].IP)))
@@ -240,7 +202,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.Cluster.OpenshiftVersion = "4.6"
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.Baremetal).ToNot(BeNil())
 			Expect(cfg.Platform.Baremetal.APIVIPs[0]).To(Equal(string(cluster.Cluster.APIVips[0].IP)))
@@ -261,9 +223,9 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.168.1.0/24"}}
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).ToNot(BeNil())
-			Expect(err.Error()).Should(ContainSubstring("Failed to find a network interface matching machine network"))
+			Expect(err.Error()).Should(ContainSubstring("Failed to find a network interface matching any machine network"))
 		})
 		It("fails for cluster without machine networks", func() {
 			cfg := getInstallerConfigBaremetal()
@@ -272,7 +234,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.MachineNetworks = nil
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).ToNot(BeNil())
 			Expect(err.Error()).Should(ContainSubstring("Failed to find machine networks for baremetal cluster"))
 		})
@@ -283,7 +245,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.MachineNetworks = []*models.MachineNetwork{}
 			cluster.Platform = createBaremetalPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).ToNot(BeNil())
 			Expect(err.Error()).Should(ContainSubstring("Failed to find machine networks for baremetal cluster"))
 		})
@@ -299,7 +261,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 				cluster := createClusterFromHosts(hosts)
 				cluster.Cluster.OpenshiftVersion = "4.12"
 				cluster.Platform = createVspherePlatformParams()
-				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 				Expect(err).To(BeNil())
 				Expect(cfg.Platform.Vsphere).ToNot(BeNil())
 				Expect(cfg.Platform.Vsphere.DeprecatedAPIVIP).To(Equal(""))
@@ -323,7 +285,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 				cluster := createClusterFromHosts(hosts)
 				cluster.Cluster.OpenshiftVersion = "4.11"
 				cluster.Platform = createVspherePlatformParams()
-				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 				Expect(err).To(BeNil())
 				Expect(cfg.Platform.Vsphere).ToNot(BeNil())
 				Expect(cfg.Platform.Vsphere.APIVIPs[0]).To(Equal(string(cluster.Cluster.APIVips[0].IP)))
@@ -336,7 +298,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 				cluster := createClusterFromHosts([]*models.Host{})
 				cluster.Cluster.OpenshiftVersion = "4.11"
 				cluster.Platform = createVspherePlatformParams()
-				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 				Expect(err).To(BeNil())
 				Expect(cfg.Platform.Vsphere).ToNot(BeNil())
 				Expect(cfg.Platform.Vsphere.APIVIPs[0]).To(Equal(string(cluster.Cluster.APIVips[0].IP)))
@@ -356,7 +318,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 				cluster := createClusterFromHosts([]*models.Host{})
 				cluster.Cluster.OpenshiftVersion = "4.13"
 				cluster.Platform = createVspherePlatformParams()
-				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+				err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 				Expect(err).To(BeNil())
 				Expect(cfg.Platform.Vsphere).ToNot(BeNil())
 				Expect(cfg.Platform.Vsphere.APIVIPs).To(Not(BeNil()))
@@ -397,13 +359,21 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.Cluster.OpenshiftVersion = "4.12"
 			cluster.Platform = createNutanixPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.Nutanix).ToNot(BeNil())
-			installConfigByte, err := yaml.Marshal(cfg.Platform.Nutanix)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(installConfigByte)).To(Equal(expectedNutanixInstallConfig412))
+			Expect(cfg.Platform.Nutanix.APIVIPs[0]).Should(Equal("192.168.10.10"))
+			Expect(cfg.Platform.Nutanix.IngressVIPs[0]).Should(Equal("192.168.10.11"))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Endpoint.Address).Should(Equal("prism.central.placeholder.address"))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Endpoint.Port).Should(Equal(int32(9440)))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Username).Should(Equal("username_placeholder"))
+			Expect(string(cfg.Platform.Nutanix.PrismCentral.Password)).Should(Equal("password_placeholder"))
+			Expect(string(cfg.Platform.Nutanix.PrismElements[0].UUID)).Should(Equal("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"))
+			Expect(cfg.Platform.Nutanix.PrismElements[0].Endpoint.Address).Should(Equal("prism.element.placeholder.address"))
+			Expect(cfg.Platform.Nutanix.PrismElements[0].Endpoint.Port).Should(Equal(int32(9440)))
+			Expect(string(cfg.Platform.Nutanix.SubnetUUIDs[0])).Should(Equal("yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"))
 		})
+
 		It("without cluster params openshift version 4.11", func() {
 			cfg := getInstallerConfigBaremetal()
 			hosts := make([]*models.Host, 0)
@@ -415,12 +385,21 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			cluster := createClusterFromHosts(hosts)
 			cluster.Cluster.OpenshiftVersion = "4.11"
 			cluster.Platform = createNutanixPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.Nutanix).ToNot(BeNil())
-			installConfigByte, err := yaml.Marshal(cfg.Platform.Nutanix)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(installConfigByte)).To(Equal(expectedNutanixInstallConfig411))
+			Expect(cfg.Platform.Nutanix.APIVIPs[0]).Should(Equal("192.168.10.10"))
+			Expect(cfg.Platform.Nutanix.DeprecatedAPIVIP).Should(Equal("192.168.10.10"))
+			Expect(cfg.Platform.Nutanix.IngressVIPs[0]).Should(Equal("192.168.10.11"))
+			Expect(cfg.Platform.Nutanix.DeprecatedIngressVIP).Should(Equal("192.168.10.11"))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Endpoint.Address).Should(Equal("prism.central.placeholder.address"))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Endpoint.Port).Should(Equal(int32(9440)))
+			Expect(cfg.Platform.Nutanix.PrismCentral.Username).Should(Equal("username_placeholder"))
+			Expect(string(cfg.Platform.Nutanix.PrismCentral.Password)).Should(Equal("password_placeholder"))
+			Expect(string(cfg.Platform.Nutanix.PrismElements[0].UUID)).Should(Equal("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"))
+			Expect(cfg.Platform.Nutanix.PrismElements[0].Endpoint.Address).Should(Equal("prism.element.placeholder.address"))
+			Expect(cfg.Platform.Nutanix.PrismElements[0].Endpoint.Port).Should(Equal(int32(9440)))
+			Expect(string(cfg.Platform.Nutanix.SubnetUUIDs[0])).Should(Equal("yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"))
 		})
 	})
 
@@ -435,7 +414,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 			hosts = append(hosts, createHost(false, models.HostStatusKnown, getBaremetalInventoryStr("hostname4", "bootMode", true, false)))
 			cluster := createClusterFromHosts(hosts)
 			cluster.Platform = createExternalOciPlatformParams()
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.External).ToNot(BeNil())
 			Expect(cfg.Platform.External.PlatformName).To(Equal(common.ExternalPlatformNameOci))
@@ -463,7 +442,7 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 					CloudControllerManager: &cloudControllerManager,
 				},
 			}
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.External).ToNot(BeNil())
 			Expect(cfg.Platform.External.PlatformName).To(Equal(platformName))
@@ -489,12 +468,16 @@ var _ = Describe("Test AddPlatformToInstallConfig", func() {
 					CloudControllerManager: &cloudControllerManager,
 				},
 			}
-			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster)
+			err := providerRegistry.AddPlatformToInstallConfig(&cfg, &cluster, nil)
 			Expect(err).To(BeNil())
 			Expect(cfg.Platform.External).ToNot(BeNil())
 			Expect(cfg.Platform.External.PlatformName).To(Equal(platformName))
 			Expect(string(cfg.Platform.External.CloudControllerManager)).To(Equal(cloudControllerManager))
 		})
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
 	})
 })
 
@@ -544,6 +527,10 @@ var _ = Describe("Test SetPlatformUsages", func() {
 			err := providerRegistry.SetPlatformUsages(createExternalPlatformParams(), nil, usageApi)
 			Expect(err).To(BeNil())
 		})
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
 	})
 })
 
@@ -690,10 +677,11 @@ func getInstallerConfigBaremetal() installcfg.InstallerConfigBaremetal {
 		APIVersion: "v1",
 		BaseDomain: "test.base.domain",
 		Networking: struct {
-			NetworkType    string                      `json:"networkType"`
-			ClusterNetwork []installcfg.ClusterNetwork `json:"clusterNetwork"`
-			MachineNetwork []installcfg.MachineNetwork `json:"machineNetwork,omitempty"`
-			ServiceNetwork []string                    `json:"serviceNetwork"`
+			NetworkType         string                      `json:"networkType"`
+			ClusterNetwork      []installcfg.ClusterNetwork `json:"clusterNetwork"`
+			MachineNetwork      []installcfg.MachineNetwork `json:"machineNetwork,omitempty"`
+			ServiceNetwork      []string                    `json:"serviceNetwork"`
+			OVNKubernetesConfig *installcfg.OVNKConfig      `json:"ovnKubernetesConfig,omitempty"`
 		}{
 			NetworkType:    "OpenShiftSDN",
 			ClusterNetwork: []installcfg.ClusterNetwork{{Cidr: "10.128.0.0/14", HostPrefix: 23}},
@@ -712,9 +700,10 @@ func getInstallerConfigBaremetal() installcfg.InstallerConfigBaremetal {
 			Replicas: 2,
 		}},
 		ControlPlane: struct {
-			Hyperthreading string `json:"hyperthreading,omitempty"`
-			Name           string `json:"name"`
-			Replicas       int    `json:"replicas"`
+			Hyperthreading string              `json:"hyperthreading,omitempty"`
+			Name           string              `json:"name"`
+			Replicas       int                 `json:"replicas"`
+			Fencing        *installcfg.Fencing `json:"fencing,omitempty"`
 		}{
 			Name:     "master-test",
 			Replicas: 3,

@@ -20,10 +20,6 @@ import (
 )
 
 const (
-	MinMastersNeededForInstallation = 3
-)
-
-const (
 	StatusInfoReady                           = "Cluster ready to be installed"
 	StatusInfoInsufficient                    = "Cluster is not ready for install"
 	statusInfoInstalling                      = "Installation in progress"
@@ -39,7 +35,9 @@ const (
 	statusInfoPendingForInput                 = "User input required"
 	statusInfoError                           = "cluster has hosts in error"
 	statusInfoTimeout                         = "cluster installation timed out while pending user action (a manual booting from installation disk)"
+	statusInfoInstallationTimeout             = "cluster installation timeout (%d minutes) has expired"
 	statusInfoAddingHosts                     = "cluster is adding hosts to existing OCP cluster"
+	statusInfoDisconnected                    = "Cluster created for offline installation"
 	statusInfoInstallingPendingUserAction     = "Cluster has hosts pending user action"
 	statusInfoUnpreparingHostExists           = "At least one host has stopped preparing for installation"
 	statusInfoClusterFailedToPrepare          = "Cluster failed to prepare for installation"
@@ -189,57 +187,6 @@ func getKnownMastersNodesIds(c *common.Cluster, db *gorm.DB) ([]*strfmt.UUID, er
 		}
 	}
 	return masterNodesIds, nil
-}
-
-func NumberOfWorkers(c *common.Cluster) int {
-	num := 0
-	for _, host := range c.Hosts {
-		if common.GetEffectiveRole(host) != models.HostRoleWorker {
-			continue
-		}
-		num += 1
-	}
-	return num
-}
-
-func HostsInStatus(c *common.Cluster, statuses []string) (int, int) {
-	mappedMastersByRole := MapMasterHostsByStatus(c)
-	mappedWorkersByRole := MapWorkersHostsByStatus(c)
-	mastersInSomeInstallingStatus := 0
-	workersInSomeInstallingStatus := 0
-
-	for _, status := range statuses {
-		mastersInSomeInstallingStatus += len(mappedMastersByRole[status])
-		workersInSomeInstallingStatus += len(mappedWorkersByRole[status])
-	}
-	return mastersInSomeInstallingStatus, workersInSomeInstallingStatus
-}
-
-func MapMasterHostsByStatus(c *common.Cluster) map[string][]*models.Host {
-	return mapHostsByStatus(c, models.HostRoleMaster)
-}
-
-func MapWorkersHostsByStatus(c *common.Cluster) map[string][]*models.Host {
-	return mapHostsByStatus(c, models.HostRoleWorker)
-}
-
-func mapHostsByStatus(c *common.Cluster, role models.HostRole) map[string][]*models.Host {
-	hostMap := make(map[string][]*models.Host)
-	for _, host := range c.Hosts {
-		if role != "" && common.GetEffectiveRole(host) != role {
-			continue
-		}
-		if _, ok := hostMap[swag.StringValue(host.Status)]; ok {
-			hostMap[swag.StringValue(host.Status)] = append(hostMap[swag.StringValue(host.Status)], host)
-		} else {
-			hostMap[swag.StringValue(host.Status)] = []*models.Host{host}
-		}
-	}
-	return hostMap
-}
-
-func MapHostsByStatus(c *common.Cluster) map[string][]*models.Host {
-	return mapHostsByStatus(c, "")
 }
 
 func UpdateMachineNetwork(db *gorm.DB, cluster *common.Cluster, machineNetwork []string) error {

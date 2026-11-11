@@ -11,15 +11,13 @@ import (
 )
 
 var _ = Describe("CNV manifest generation", func() {
-	fullHaMode := models.ClusterHighAvailabilityModeFull
-	noneHaMode := models.ClusterHighAvailabilityModeNone
-	operator := NewCNVOperator(common.GetTestLog(), Config{Mode: true, SNOInstallHPP: true}, nil)
+	operator := NewCNVOperator(common.GetTestLog(), Config{Mode: true, SNOInstallHPP: true})
 
 	Context("CNV Manifest", func() {
 		table.DescribeTable("Should create manifestes", func(cluster common.Cluster, isSno bool, cfg Config) {
-			cnvOperator := NewCNVOperator(common.GetTestLog(), cfg, nil)
+			cnvOperator := NewCNVOperator(common.GetTestLog(), cfg)
 			openshiftManifests, manifest, err := cnvOperator.GenerateManifests(&cluster)
-			numManifests := 3
+			numManifests := 5
 			if isSno && cfg.SNOInstallHPP {
 				var versionerr error
 				var ocpVersion, minimalVersionForHppSno *version.Version
@@ -40,6 +38,8 @@ var _ = Describe("CNV manifest generation", func() {
 			Expect(openshiftManifests["50_openshift-cnv_ns.yaml"]).NotTo(HaveLen(0))
 			Expect(openshiftManifests["50_openshift-cnv_operator_group.yaml"]).NotTo(HaveLen(0))
 			Expect(openshiftManifests["50_openshift-cnv_subscription.yaml"]).NotTo(HaveLen(0))
+			Expect(openshiftManifests["50_openshift-cnv_workers_schedstats.yaml"]).NotTo(HaveLen(0))
+			Expect(openshiftManifests["50_openshift-cnv_masters_schedstats.yaml"]).NotTo(HaveLen(0))
 
 			_, err = yaml.YAMLToJSON(manifest)
 			Expect(err).ShouldNot(HaveOccurred())
@@ -50,20 +50,20 @@ var _ = Describe("CNV manifest generation", func() {
 			}
 		},
 			table.Entry("for non-SNO cluster", common.Cluster{Cluster: models.Cluster{
-				OpenshiftVersion:     "4.10",
-				HighAvailabilityMode: &fullHaMode,
+				OpenshiftVersion:  "4.10",
+				ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
 			}}, false, Config{Mode: true, SNOInstallHPP: true}),
 			table.Entry("for SNO cluster", common.Cluster{Cluster: models.Cluster{
-				OpenshiftVersion:     "4.10",
-				HighAvailabilityMode: &noneHaMode,
+				OpenshiftVersion:  "4.10",
+				ControlPlaneCount: 1,
 			}}, true, Config{Mode: true, SNOInstallHPP: true}),
 			table.Entry("for SNO cluster with openshift version (and thus CNV) lower than 4.10", common.Cluster{Cluster: models.Cluster{
-				OpenshiftVersion:     "4.9",
-				HighAvailabilityMode: &noneHaMode,
+				OpenshiftVersion:  "4.9",
+				ControlPlaneCount: 1,
 			}}, true, Config{Mode: true, SNOInstallHPP: true}),
 			table.Entry("for SNO cluster and opt out of HPP via env var", common.Cluster{Cluster: models.Cluster{
-				OpenshiftVersion:     "4.10",
-				HighAvailabilityMode: &noneHaMode,
+				OpenshiftVersion:  "4.10",
+				ControlPlaneCount: 1,
 			}}, true, Config{Mode: true, SNOInstallHPP: false}),
 		)
 

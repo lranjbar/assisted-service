@@ -2,10 +2,7 @@ package validations
 
 import (
 	"bytes"
-	"context"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -14,7 +11,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/containers/image/v5/docker/reference"
+	"github.com/distribution/reference"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/hashicorp/go-multierror"
@@ -23,8 +20,6 @@ import (
 	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/models"
-	"github.com/openshift/assisted-service/pkg/auth"
-	"github.com/openshift/assisted-service/pkg/ocm"
 	"github.com/openshift/assisted-service/pkg/tang"
 	"github.com/openshift/assisted-service/pkg/validations"
 	"github.com/pkg/errors"
@@ -40,12 +35,10 @@ const (
 	clusterNameRegex                = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
 	clusterNameRegexForNonePlatform = "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)*$"
 	CloudOpenShiftCom               = "cloud.openshift.com"
-	sshPublicKeyRegex               = "^(ssh-rsa AAAAB3NzaC1yc2|ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNT|ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzOD|ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1Mj|ssh-ed25519 AAAAC3NzaC1lZDI1NTE5|ssh-dss AAAAB3NzaC1kc3)[0-9A-Za-z+/]+[=]{0,3}( .*)?$"
-	dockerHubRegistry               = "docker.io"
-	dockerHubLegacyAuth             = "https://index.docker.io/v1/"
-	stageRegistry                   = "registry.stage.redhat.io"
-	ignoreListSeparator             = ","
-
+	// sshPublicKeyRegex matches a supported public-key line (OCPBUGSM-13814).
+	// Known authorized_keys options are stripped before matching so prefixes
+	// such as from= are accepted (MGMT-25133) while junk prefixes are not.
+	sshPublicKeyRegex = "^(ssh-rsa AAAAB3NzaC1yc2|ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNT|ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzOD|ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1Mj|ssh-ed25519 AAAAC3NzaC1lZDI1NTE5|ssh-dss AAAAB3NzaC1kc3)[0-9A-Za-z+/]+[=]{0,3}( .*)?$"
 	// Size of the file used to embed an ignition config archive within an RHCOS ISO: 256 KiB
 	// See: https://github.com/coreos/coreos-assembler/blob/d2c968a1f3c75713a4e1449e3da657c5d5a5d7e7/src/cmd-buildextend-live#L113-L114
 	IgnitionImageSizePadding = 256 * 1024
@@ -57,177 +50,31 @@ func init() {
 	regexpSshPublicKey, _ = regexp.Compile(sshPublicKeyRegex)
 }
 
-// PullSecretValidator is used run validations on a provided pull secret
-// it verifies the format of the pull secrete and access to required image registries
-//
-//go:generate mockgen -source=validations.go -package=validations -destination=mock_validations.go
-type PullSecretValidator interface {
-	ValidatePullSecret(secret string, username string) error
-}
-
-type registryPullSecretValidator struct {
-	registriesWithAuth *map[string]bool
-	authHandler        auth.Authenticator
-}
-
-type imagePullSecret struct {
-	Auths map[string]map[string]interface{} `json:"auths"`
-}
-
-type PullSecretCreds struct {
-	Username string
-	Password string
-	Registry string
-	AuthRaw  string
-	Email    string
-}
-
-// PullSecretError distinguishes secret validation errors produced by this package from other types of errors
-type PullSecretError struct {
-	Msg   string
-	Cause error
-}
-
-func (e *PullSecretError) Error() string {
-	return e.Msg
-}
-
-func (e *PullSecretError) Unwrap() error {
-	return e.Cause
-}
-
-// ParsePullSecret validates the format of a pull secret and converts the secret string into individual credentail entries
-func ParsePullSecret(secret string) (map[string]PullSecretCreds, error) {
-	result := make(map[string]PullSecretCreds)
-	var s imagePullSecret
-
-	err := json.Unmarshal([]byte(strings.TrimSpace(secret)), &s)
-	if err != nil {
-		return nil, &PullSecretError{Msg: "pull secret must be a well-formed JSON", Cause: err}
-	}
-
-	if len(s.Auths) == 0 {
-		return nil, &PullSecretError{Msg: "pull secret must contain 'auths' JSON-object field"}
-	}
-
-	for d, a := range s.Auths {
-
-		_, authPresent := a["auth"]
-		_, credsStorePresent := a["credsStore"]
-		if !authPresent && !credsStorePresent {
-			return nil, &PullSecretError{Msg: fmt.Sprintf("invalid pull secret: %q JSON-object requires either 'auth' or 'credsStore' field", d)}
-		}
-
-		var authRaw string
-		if auth, ok := a["auth"].(string); authPresent && !ok {
-			return nil, &PullSecretError{Msg: fmt.Sprintf("invalid pull secret: 'auth' field of %q is %v but should be a string", d, a["auth"])}
-		} else {
-			authRaw = auth
-		}
-		data, err := base64.StdEncoding.DecodeString(authRaw)
-		if err != nil {
-			return nil, &PullSecretError{Msg: fmt.Sprintf("invalid pull secret: 'auth' field of %q is not base64-encoded", d)}
-		}
-
-		res := bytes.Split(data, []byte(":"))
-		if len(res) != 2 {
-			return nil, &PullSecretError{Msg: fmt.Sprintf("invalid pull secret: 'auth' for %s is not in 'user:password' format", d)}
-		}
-
-		var email string
-		if emailString, ok := a["email"].(string); ok {
-			email = emailString
-		}
-
-		result[d] = PullSecretCreds{
-			Password: string(res[1]),
-			Username: string(res[0]),
-			AuthRaw:  authRaw,
-			Registry: d,
-			Email:    email,
-		}
-
-	}
-	return result, nil
-}
-
-func AddRHRegPullSecret(secret, rhCred string) (string, error) {
-	if rhCred == "" {
-		return "", errors.Errorf("invalid pull secret")
-	}
-	var s imagePullSecret
-	err := json.Unmarshal([]byte(strings.TrimSpace(secret)), &s)
-	if err != nil {
-		return secret, errors.Errorf("invalid pull secret: %v", err)
-	}
-	s.Auths[stageRegistry] = make(map[string]interface{})
-	s.Auths[stageRegistry]["auth"] = base64.StdEncoding.EncodeToString([]byte(rhCred))
-	ps, err := json.Marshal(s)
-	if err != nil {
-		return secret, err
-	}
-	return string(ps), nil
-}
-
-// NewPullSecretValidator receives all images whose registries must have an entry in a user pull secret (auth)
-func NewPullSecretValidator(config Config, authHandler auth.Authenticator, images ...string) (PullSecretValidator, error) {
-
-	authRegList, err := getRegistriesWithAuth(config.PublicRegistries, ignoreListSeparator, images...)
-	if err != nil {
-		return nil, err
-	}
-
-	return &registryPullSecretValidator{
-		registriesWithAuth: authRegList,
-		authHandler:        authHandler,
-	}, nil
-}
-
-// ValidatePullSecret validates that a pull secret is well formed and contains all required data
-func (v *registryPullSecretValidator) ValidatePullSecret(secret string, username string) error {
-	creds, err := ParsePullSecret(secret)
-	if err != nil {
-		return err
-	}
-
-	// only check for cloud creds if we're authenticating against Red Hat SSO
-	if v.authHandler.AuthType() == auth.TypeRHSSO {
-
-		r, ok := creds["cloud.openshift.com"]
-		if !ok {
-			return &PullSecretError{Msg: "pull secret must contain auth for \"cloud.openshift.com\""}
-		}
-
-		user, err := v.authHandler.AuthAgentAuth(r.AuthRaw)
-		if err != nil {
-			return &PullSecretError{Msg: "failed to authenticate the pull secret token"}
-		}
-
-		if (user.(*ocm.AuthPayload)).Username != username {
-			return &PullSecretError{Msg: "pull secret token does not match current user"}
-		}
-	}
-
-	for registry := range *v.registriesWithAuth {
-
-		// Both "docker.io" and "https://index.docker.io/v1/" are acceptable for DockerHub login
-		if registry == dockerHubRegistry {
-			if _, ok := creds[dockerHubLegacyAuth]; ok {
-				continue
-			}
-		}
-
-		// We add auth for stage registry automatically
-		if registry == stageRegistry {
-			continue
-		}
-
-		if _, ok := creds[registry]; !ok {
-			return &PullSecretError{Msg: fmt.Sprintf("pull secret must contain auth for %q", registry)}
-		}
-	}
-
-	return nil
+// allowedSSHAuthorizedKeyOptions maps sshd(8) authorized_keys option keywords
+// (lowercase) to whether the option requires a value.
+var allowedSSHAuthorizedKeyOptions = map[string]bool{
+	"agent-forwarding":    false,
+	"cert-authority":      false,
+	"command":             true,
+	"environment":         true,
+	"expiry-time":         true,
+	"from":                true,
+	"no-agent-forwarding": false,
+	"no-port-forwarding":  false,
+	"no-pty":              false,
+	"no-touch-required":   false,
+	"no-user-rc":          false,
+	"no-x11-forwarding":   false,
+	"permitlisten":        true,
+	"permitopen":          true,
+	"port-forwarding":     false,
+	"principals":          true,
+	"pty":                 false,
+	"restrict":            false,
+	"tunnel":              true,
+	"user-rc":             false,
+	"verify-required":     false,
+	"x11-forwarding":      false,
 }
 
 // ValidateClusterNameFormat validates specified cluster name format
@@ -269,23 +116,50 @@ func ValidateNoProxyFormat(noProxy string, ocpVersion string) error {
 
 func ValidateSSHPublicKey(sshPublicKeys string) error {
 	if regexpSshPublicKey == nil {
-		return fmt.Errorf("Can't parse SSH keys.")
+		return errors.New("Can't parse SSH keys.")
 	}
 
 	for _, sshPublicKey := range strings.Split(sshPublicKeys, "\n") {
 		sshPublicKey = strings.TrimSpace(sshPublicKey)
-		keyBytes := []byte(sshPublicKey)
-		isMatched := regexpSshPublicKey.Match(keyBytes)
-		if !isMatched {
+		if sshPublicKey == "" {
+			continue
+		}
+
+		pub, _, options, _, err := ssh.ParseAuthorizedKey([]byte(sshPublicKey))
+		if err != nil {
+			return errors.Wrapf(err, "Malformed SSH key: %s", sshPublicKey)
+		}
+
+		keyForRegex := sshKeyLineForTypeRegex(sshPublicKey, pub, options)
+		if !regexpSshPublicKey.Match([]byte(keyForRegex)) {
 			return errors.Errorf(
 				"SSH key: %s does not match any supported type: ssh-rsa, ssh-ed25519, ecdsa-[VARIANT]",
 				sshPublicKey)
-		} else if _, _, _, _, err := ssh.ParseAuthorizedKey(keyBytes); err != nil {
-			return errors.Wrapf(err, fmt.Sprintf("Malformed SSH key: %s", sshPublicKey))
 		}
 	}
 
 	return nil
+}
+
+func sshAuthorizedKeyOptionsAllowed(options []string) bool {
+	for _, opt := range options {
+		name, _, hasValue := strings.Cut(opt, "=")
+		requiresValue, ok := allowedSSHAuthorizedKeyOptions[strings.ToLower(name)]
+		if !ok {
+			return false
+		}
+		if requiresValue != hasValue {
+			return false
+		}
+	}
+	return true
+}
+
+func sshKeyLineForTypeRegex(sshPublicKey string, pub ssh.PublicKey, options []string) string {
+	if len(options) == 0 || !sshAuthorizedKeyOptionsAllowed(options) {
+		return sshPublicKey
+	}
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub)))
 }
 
 func ValidatePEMCertificateBundle(bundle string) error {
@@ -318,40 +192,20 @@ func ParseRegistry(image string) (string, error) {
 	return reference.Domain(parsed), nil
 }
 
-// getRegistriesWithAuth returns container registries that may require authentication based
-// on a list of used images and an ignore list. The ingore list comes as a string and a separator
-// to make it easier to read from a configuration variable
-func getRegistriesWithAuth(ignoreList string, ignoreSeparator string, images ...string) (*map[string]bool, error) {
-
-	ignored := make(map[string]bool)
-	for _, i := range strings.Split(ignoreList, ignoreSeparator) {
-		ignored[i] = true
+// ParseFullRegistry extracts the registry (base domain) + path from a full image name, or returns
+// the default (docker.io) with the path appended if the name does not start with a registry.
+func ParseFullRegistry(image string) (string, error) {
+	parsed, err := reference.ParseNormalizedNamed(strings.TrimSpace(image))
+	if err != nil {
+		return "", err
 	}
+	return reference.TrimNamed(parsed).Name(), nil
+}
 
-	_, docLegacyIgnored := ignored[dockerHubLegacyAuth]
-
-	registries := make(map[string]bool)
-	for _, img := range images {
-		if img == "" {
-			continue
-		}
-		r, err := ParseRegistry(img)
-		if err != nil {
-			return &registries, err
-		}
-
-		if r == dockerHubRegistry && docLegacyIgnored {
-			continue
-		}
-
-		if _, ok := ignored[r]; ok {
-			continue
-		}
-
-		registries[r] = true
-	}
-
-	return &registries, nil
+// ParseBaseRegistry extracts the base domain for a registry.
+func ParseBaseRegistry(registry string) string {
+	registryParts := strings.Split(strings.TrimSpace(registry), "/")
+	return registryParts[0]
 }
 
 // ValidateVipDHCPAllocationWithIPv6 returns an error in case of VIP DHCP allocation
@@ -376,7 +230,7 @@ func HandleApiVipBackwardsCompatibility(clusterId *strfmt.UUID, apiVip string, a
 		return vips, nil
 	}
 	// Both APIVip and APIVips were provided.
-	if apiVip != "" && len(apiVips) > 0 && apiVip != string(apiVips[0].IP) {
+	if apiVip != "" && len(apiVips) > 0 && !models.IP(apiVip).Equal(apiVips[0].IP) {
 		return nil, errors.New("apiVIP must be the same as the first element of apiVIPs")
 	}
 	return apiVips, nil
@@ -392,13 +246,13 @@ func HandleIngressVipBackwardsCompatibility(clusterId *strfmt.UUID, ingressVip s
 		return vips, nil
 	}
 	// Both IngressVip and IngressVips were provided.
-	if ingressVip != "" && len(ingressVips) > 0 && ingressVip != string(ingressVips[0].IP) {
+	if ingressVip != "" && len(ingressVips) > 0 && !models.IP(ingressVip).Equal(ingressVips[0].IP) {
 		return nil, errors.New("ingressVIP must be the same as the first element of ingressVIPs")
 	}
 	return ingressVips, nil
 }
 
-func ValidateClusterCreateIPAddresses(ipV6Supported bool, clusterId strfmt.UUID, params *models.ClusterCreateParams) error {
+func ValidateClusterCreateIPAddresses(ipV6Supported bool, clusterId strfmt.UUID, params *models.ClusterCreateParams, primaryIPStack *common.PrimaryIPStack) error {
 	targetConfiguration := common.Cluster{}
 
 	if (len(params.APIVips) > 1 || len(params.IngressVips) > 1) &&
@@ -415,17 +269,22 @@ func ValidateClusterCreateIPAddresses(ipV6Supported bool, clusterId strfmt.UUID,
 	if params.VipDhcpAllocation != nil {
 		targetConfiguration.VipDhcpAllocation = params.VipDhcpAllocation
 	}
+	haMode, controlPlaneCount := common.GetDefaultHighAvailabilityAndMasterCountParams(params.HighAvailabilityMode, params.ControlPlaneCount)
 	targetConfiguration.ID = &clusterId
 	targetConfiguration.APIVips = params.APIVips
 	targetConfiguration.IngressVips = params.IngressVips
 	targetConfiguration.UserManagedNetworking = params.UserManagedNetworking
+	targetConfiguration.ControlPlaneCount = swag.Int64Value(controlPlaneCount)
 	targetConfiguration.VipDhcpAllocation = params.VipDhcpAllocation
-	targetConfiguration.HighAvailabilityMode = params.HighAvailabilityMode
+	targetConfiguration.HighAvailabilityMode = haMode
 	targetConfiguration.ClusterNetworks = params.ClusterNetworks
 	targetConfiguration.ServiceNetworks = params.ServiceNetworks
 	targetConfiguration.MachineNetworks = params.MachineNetworks
-
-	return validateVIPAddresses(ipV6Supported, targetConfiguration)
+	targetConfiguration.LoadBalancer = params.LoadBalancer
+	targetConfiguration.OpenshiftVersion = swag.StringValue(params.OpenshiftVersion)
+	targetConfiguration.PrimaryIPStack = primaryIPStack
+	targetLBType := network.TargetLoadBalancerType(&targetConfiguration, nil)
+	return validateVIPAddresses(ipV6Supported, targetConfiguration, targetLBType)
 }
 
 func validateVIPsWithUMA(cluster *common.Cluster, params *models.V2ClusterUpdateParams, vipDhcpAllocation bool) error {
@@ -455,16 +314,33 @@ func validateVIPsWithUMA(cluster *common.Cluster, params *models.V2ClusterUpdate
 	)
 }
 
-func ValidateClusterUpdateVIPAddresses(ipV6Supported bool, cluster *common.Cluster, params *models.V2ClusterUpdateParams) error {
+func ValidateClusterUpdateVIPAddresses(ipV6Supported bool, cluster *common.Cluster, params *models.V2ClusterUpdateParams, primaryIPStack *common.PrimaryIPStack) error {
 	var (
-		err                 error
-		targetConfiguration common.Cluster
-		apiVips             []*models.APIVip
-		ingressVips         []*models.IngressVip
+		err error
 	)
 
-	apiVips = params.APIVips
-	ingressVips = params.IngressVips
+	apiVips := cluster.APIVips
+	if params.APIVips != nil {
+		apiVips = params.APIVips
+	}
+	ingressVips := cluster.IngressVips
+	if params.IngressVips != nil {
+		ingressVips = params.IngressVips
+	}
+	// Clear VIPs when DHCP allocation mode changes (to or from DHCP) and the user
+	// didn't explicitly provide VIPs in the update params. This matches the behavior
+	// in inventory.go:updateNetworkParams which clears VIPs when VipDhcpAllocation
+	// changes to prevent:
+	// 1. Non-DHCP mode using VIPs previously obtained via DHCP
+	// 2. DHCP mode being fed with manually provided VIPs
+	// If the user explicitly provides VIPs while changing DHCP mode, validation will
+	// fail appropriately (e.g., "Setting API VIPs is forbidden when cluster is in
+	// vip-dhcp-allocation mode").
+	dhcpModeChanging := params.VipDhcpAllocation != nil && swag.BoolValue(params.VipDhcpAllocation) != swag.BoolValue(cluster.VipDhcpAllocation)
+	if dhcpModeChanging && params.APIVips == nil && params.IngressVips == nil {
+		apiVips = []*models.APIVip{}
+		ingressVips = []*models.IngressVip{}
+	}
 
 	if (len(params.APIVips) > 1 || len(params.IngressVips) > 1) &&
 		!featuresupport.IsFeatureAvailable(models.FeatureSupportLevelIDDUALSTACKVIPS, cluster.OpenshiftVersion, swag.String(cluster.CPUArchitecture)) {
@@ -488,46 +364,110 @@ func ValidateClusterUpdateVIPAddresses(ipV6Supported bool, cluster *common.Clust
 			err = errors.Errorf("%s cannot be set with %s", errParts[1], errParts[0])
 			return common.NewApiError(http.StatusBadRequest, err)
 		}
-
-		if cluster.VipDhcpAllocation != nil && swag.BoolValue(cluster.VipDhcpAllocation) { // override VIPs that were allocated via DHCP
-			params.APIVips = []*models.APIVip{}
-			apiVips = []*models.APIVip{}
-			params.IngressVips = []*models.IngressVip{}
-			ingressVips = []*models.IngressVip{}
-		} else {
-			if params.APIVips == nil {
-				apiVips = cluster.APIVips
-			}
-			if params.IngressVips == nil {
-				ingressVips = cluster.IngressVips
-			}
-		}
 	}
 
+	targetConfiguration := common.Cluster{}
 	targetConfiguration.ID = cluster.ID
 	targetConfiguration.VipDhcpAllocation = params.VipDhcpAllocation
 	targetConfiguration.APIVips = apiVips
 	targetConfiguration.IngressVips = ingressVips
 	targetConfiguration.UserManagedNetworking = params.UserManagedNetworking
-	targetConfiguration.HighAvailabilityMode = cluster.HighAvailabilityMode
 	targetConfiguration.ClusterNetworks = params.ClusterNetworks
 	targetConfiguration.ServiceNetworks = params.ServiceNetworks
 	targetConfiguration.MachineNetworks = params.MachineNetworks
+	if params.ClusterNetworks == nil {
+		targetConfiguration.ClusterNetworks = cluster.ClusterNetworks
+	}
+	if params.ServiceNetworks == nil {
+		targetConfiguration.ServiceNetworks = cluster.ServiceNetworks
+	}
+	if params.MachineNetworks == nil {
+		targetConfiguration.MachineNetworks = cluster.MachineNetworks
+	}
+	targetConfiguration.LoadBalancer = cluster.LoadBalancer
 
-	return validateVIPAddresses(ipV6Supported, targetConfiguration)
+	// Copy fields that should be preserved from the existing cluster
+	targetConfiguration.OpenshiftVersion = cluster.OpenshiftVersion
+	targetConfiguration.CPUArchitecture = cluster.CPUArchitecture
+
+	if params.ControlPlaneCount != nil {
+		targetConfiguration.ControlPlaneCount = *params.ControlPlaneCount
+	}
+
+	if params.LoadBalancer != nil {
+		targetConfiguration.LoadBalancer = params.LoadBalancer
+	}
+
+	targetConfiguration.PrimaryIPStack = primaryIPStack
+	targetLBType := network.TargetLoadBalancerType(cluster, params)
+	return validateVIPAddresses(ipV6Supported, targetConfiguration, targetLBType)
+}
+
+func validateVIPIP(ip, vipType string, index int) error {
+	if ip == "" {
+		return errors.Errorf("%s VIP IP at index %d cannot be empty", vipType, index)
+	}
+	if net.ParseIP(ip) == nil {
+		return errors.Errorf("Could not parse VIP ip %s", ip)
+	}
+	return nil
 }
 
 func VerifyParsableVIPs(apiVips []*models.APIVip, ingressVips []*models.IngressVip) error {
 	var multiErr error
 
 	for i := range apiVips {
-		if string(apiVips[i].IP) != "" && net.ParseIP(string(apiVips[i].IP)) == nil {
-			multiErr = multierror.Append(multiErr, errors.Errorf("Could not parse VIP ip %s", string(apiVips[i].IP)))
+		if err := validateVIPIP(string(apiVips[i].IP), "API", i); err != nil {
+			multiErr = multierror.Append(multiErr, err)
 		}
 	}
 	for i := range ingressVips {
-		if string(ingressVips[i].IP) != "" && net.ParseIP(string(ingressVips[i].IP)) == nil {
-			multiErr = multierror.Append(multiErr, errors.Errorf("Could not parse VIP ip %s", string(ingressVips[i].IP)))
+		if err := validateVIPIP(string(ingressVips[i].IP), "Ingress", i); err != nil {
+			multiErr = multierror.Append(multiErr, err)
+		}
+	}
+	if multiErr != nil && !strings.Contains(multiErr.Error(), "0 errors occurred") {
+		return multiErr
+	}
+
+	return nil
+}
+
+// ValidateNetworkCIDRs validates that the CIDRs for all networksare parsable and not empty
+func ValidateNetworkCIDRs(machineNetworks []*models.MachineNetwork, serviceNetworks []*models.ServiceNetwork, clusterNetworks []*models.ClusterNetwork) error {
+	var multiErr error
+
+	for i, mn := range machineNetworks {
+		if mn != nil {
+			if string(mn.Cidr) == "" {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Machine Network CIDR cannot be empty (index %d)", i))
+				continue
+			}
+			if _, _, err := net.ParseCIDR(string(mn.Cidr)); err != nil {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Could not parse Machine Network CIDR %s (index %d): %v", string(mn.Cidr), i, err))
+			}
+		}
+	}
+	for i, sn := range serviceNetworks {
+		if sn != nil {
+			if string(sn.Cidr) == "" {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Service Network CIDR cannot be empty (index %d)", i))
+				continue
+			}
+			if _, _, err := net.ParseCIDR(string(sn.Cidr)); err != nil {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Could not parse Service Network CIDR %s (index %d): %v", string(sn.Cidr), i, err))
+			}
+		}
+	}
+	for i, cn := range clusterNetworks {
+		if cn != nil {
+			if string(cn.Cidr) == "" {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Cluster Network CIDR cannot be empty (index %d)", i))
+				continue
+			}
+			if _, _, err := net.ParseCIDR(string(cn.Cidr)); err != nil {
+				multiErr = multierror.Append(multiErr, errors.Errorf("Could not parse Cluster Network CIDR %s (index %d): %v", string(cn.Cidr), i, err))
+			}
 		}
 	}
 	if multiErr != nil && !strings.Contains(multiErr.Error(), "0 errors occurred") {
@@ -595,19 +535,19 @@ func validateNetworksIPAddressFamily(ipV6Supported bool, targetConfiguration com
 	for i := range machineNetworks {
 		networks = append(networks, swag.String(string(machineNetworks[i].Cidr)))
 	}
-	if err = ValidateIPAddressFamily(ipV6Supported, networks...); err != nil {
+	if err = ValidateIPAddressFamily(ipV6Supported, "machine networks", targetConfiguration.PrimaryIPStack, networks...); err != nil {
 		multiErr = multierror.Append(multiErr, err)
 	}
 	for i := range serviceNetworks {
 		networks = append(networks, swag.String(string(serviceNetworks[i].Cidr)))
 	}
-	if err = ValidateIPAddressFamily(ipV6Supported, networks...); err != nil {
+	if err = ValidateIPAddressFamily(ipV6Supported, "service networks", targetConfiguration.PrimaryIPStack, networks...); err != nil {
 		multiErr = multierror.Append(multiErr, err)
 	}
 	for i := range clusterNetworks {
 		networks = append(networks, swag.String(string(clusterNetworks[i].Cidr)))
 	}
-	if err = ValidateIPAddressFamily(ipV6Supported, networks...); err != nil {
+	if err = ValidateIPAddressFamily(ipV6Supported, "cluster networks", targetConfiguration.PrimaryIPStack, networks...); err != nil {
 		multiErr = multierror.Append(multiErr, err)
 	}
 
@@ -622,48 +562,56 @@ func validateVIPAddressFamily(ipV6Supported bool, targetConfiguration common.Clu
 	var err error
 
 	if len(targetConfiguration.APIVips) == 1 {
-		if network.IsIPv6Addr(network.GetApiVipById(&targetConfiguration, 0)) && !ipV6Supported {
-			err = errors.New("IPv6 is not supported in this setup")
+		if network.IsIPv6Addr(network.GetApiVipById(&targetConfiguration, 0)) && !ipV6Supported && targetConfiguration.PrimaryIPStack == nil {
+			err = errors.New("Single stack IPv6 is not supported in this setup. Please verify your API Vips configuration")
 			return nil, err
 		}
 		allAddresses = append(allAddresses, swag.String(network.GetApiVipById(&targetConfiguration, 0)))
 	} else if len(targetConfiguration.APIVips) == 2 {
-		if !network.IsIPv4Addr(network.GetApiVipById(&targetConfiguration, 0)) {
-			err = errors.Errorf("the first element of apiVIPs must be an IPv4 address. got: %s", network.GetApiVipById(&targetConfiguration, 0))
-			return nil, err
+		// Extract VIP addresses
+		vipAddresses := []string{
+			network.GetApiVipById(&targetConfiguration, 0),
+			network.GetApiVipById(&targetConfiguration, 1),
 		}
-		allAddresses = append(allAddresses, swag.String(network.GetApiVipById(&targetConfiguration, 0)))
 
-		if !network.IsIPv6Addr(network.GetApiVipById(&targetConfiguration, 1)) {
-			err = errors.Errorf("the second element of apiVIPs must be an IPv6 address. got: %s", network.GetApiVipById(&targetConfiguration, 1))
+		// Validate dual-stack VIP ordering
+		if err = network.ValidateDualStackOrder(vipAddresses, "apiVIPs", "address", targetConfiguration.OpenshiftVersion, network.IsIPv4Addr, network.IsIPv6Addr); err != nil {
 			return nil, err
 		}
-		allAddresses = append(allAddresses, swag.String(network.GetApiVipById(&targetConfiguration, 1)))
+
+		// Add to allAddresses for further processing
+		for _, addr := range vipAddresses {
+			allAddresses = append(allAddresses, swag.String(addr))
+		}
 	}
 
 	if len(targetConfiguration.IngressVips) == 1 {
-		if network.IsIPv6Addr(network.GetIngressVipById(&targetConfiguration, 0)) && !ipV6Supported {
-			err = errors.New("IPv6 is not supported in this setup")
+		if network.IsIPv6Addr(network.GetIngressVipById(&targetConfiguration, 0)) && !ipV6Supported && targetConfiguration.PrimaryIPStack == nil {
+			err = errors.New("Single stack IPv6 is not supported in this setup. Please verify your Ingress Vips configuration")
 			return nil, err
 		}
 		allAddresses = append(allAddresses, swag.String(network.GetIngressVipById(&targetConfiguration, 0)))
 	} else if len(targetConfiguration.IngressVips) == 2 {
-		if !network.IsIPv4Addr(network.GetIngressVipById(&targetConfiguration, 0)) {
-			err = errors.Errorf("the first element of ingressVips must be an IPv4 address. got: %s", network.GetIngressVipById(&targetConfiguration, 0))
-			return nil, err
+		// Extract VIP addresses
+		vipAddresses := []string{
+			network.GetIngressVipById(&targetConfiguration, 0),
+			network.GetIngressVipById(&targetConfiguration, 1),
 		}
-		allAddresses = append(allAddresses, swag.String(network.GetIngressVipById(&targetConfiguration, 0)))
 
-		if !network.IsIPv6Addr(network.GetIngressVipById(&targetConfiguration, 1)) {
-			err = errors.Errorf("the second element of ingressVips must be an IPv6 address. got: %s", network.GetIngressVipById(&targetConfiguration, 1))
+		// Validate dual-stack VIP ordering
+		if err := network.ValidateDualStackOrder(vipAddresses, "ingressVips", "address", targetConfiguration.OpenshiftVersion, network.IsIPv4Addr, network.IsIPv6Addr); err != nil {
 			return nil, err
 		}
-		allAddresses = append(allAddresses, swag.String(network.GetIngressVipById(&targetConfiguration, 1)))
+
+		// Add to allAddresses for further processing
+		for _, addr := range vipAddresses {
+			allAddresses = append(allAddresses, swag.String(addr))
+		}
 	}
 	return allAddresses, nil
 }
 
-func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster) error {
+func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster, targetLBType string) error {
 	var allAddresses []*string
 	var multiErr error
 	var err error
@@ -674,7 +622,7 @@ func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster
 	}
 
 	// In-depth input validations
-	if err = network.ValidateNoVIPAddressesDuplicates(targetConfiguration.APIVips, targetConfiguration.IngressVips); err != nil {
+	if err = network.ValidateNoVIPAddressesDuplicates(targetConfiguration.APIVips, targetConfiguration.IngressVips, network.IsLoadBalancerUserManaged(&targetConfiguration)); err != nil {
 		return common.NewApiError(http.StatusBadRequest, err)
 	}
 
@@ -687,11 +635,12 @@ func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster
 	}
 
 	allAddresses = append(allAddresses, common.GetNetworksCidrs(targetConfiguration)...)
-	err = ValidateIPAddressFamily(ipV6Supported, allAddresses...)
+	err = ValidateIPAddressFamily(ipV6Supported, "VIPs and networks", targetConfiguration.PrimaryIPStack, allAddresses...)
 	if err != nil {
 		return err
 	}
-	err = ValidateDualStackNetworks(targetConfiguration, false)
+
+	err = ValidateDualStackNetworks(targetConfiguration, false, targetLBType, targetConfiguration.OpenshiftVersion)
 	if err != nil {
 		return err
 	}
@@ -714,11 +663,16 @@ func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster
 			targetConfiguration.APIVips, targetConfiguration.IngressVips); err != nil {
 			return common.NewApiError(http.StatusBadRequest, err)
 		}
-	} else {
+	} else if !network.IsLoadBalancerUserManaged(&targetConfiguration) {
 		if len(targetConfiguration.MachineNetworks) > 0 {
 			for i := range targetConfiguration.APIVips { // len of APIVips and IngressVips should be the same. asserted above.
-				err = network.VerifyVips(nil, string(targetConfiguration.MachineNetworks[i].Cidr),
-					string(targetConfiguration.APIVips[i].IP), string(targetConfiguration.IngressVips[i].IP), nil)
+				err = network.VerifyVipsForClusterManagedLoadBalancer(
+					nil,
+					string(targetConfiguration.MachineNetworks[i].Cidr),
+					string(targetConfiguration.APIVips[i].IP),
+					string(targetConfiguration.IngressVips[i].IP),
+					nil,
+				)
 				if err != nil {
 					multiErr = multierror.Append(multiErr, err)
 				}
@@ -729,6 +683,18 @@ func validateVIPAddresses(ipV6Supported bool, targetConfiguration common.Cluster
 		} else if reqDualStack {
 			return errors.New("Dual-stack cluster cannot be created with empty Machine Networks")
 		}
+	} else {
+		if len(targetConfiguration.MachineNetworks) == 0 || len(targetConfiguration.APIVips) == 0 || len(targetConfiguration.IngressVips) == 0 {
+			return nil
+		}
+
+		return network.VerifyVipsForUserManangedLoadBalancer(
+			nil,
+			targetConfiguration.MachineNetworks,
+			string(targetConfiguration.APIVips[0].IP),
+			string(targetConfiguration.IngressVips[0].IP),
+			nil,
+		)
 	}
 
 	return nil
@@ -762,7 +728,7 @@ func ValidateVIPsWereNotSetDhcpMode(apiVips []*models.APIVip, ingressVips []*mod
 	return nil
 }
 
-func ValidateDualStackNetworks(clusterParams interface{}, alreadyDualStack bool) error {
+func ValidateDualStackNetworks(clusterParams interface{}, alreadyDualStack bool, targetLoadBalancerType string, openshiftVersion string) error {
 	var machineNetworks []*models.MachineNetwork
 	var serviceNetworks []*models.ServiceNetwork
 	var clusterNetworks []*models.ClusterNetwork
@@ -807,23 +773,23 @@ func ValidateDualStackNetworks(clusterParams interface{}, alreadyDualStack bool)
 
 	if reqDualStack {
 		if common.IsSliceNonEmpty(machineNetworks) {
-			if err := network.VerifyMachineNetworksDualStack(machineNetworks, true); err != nil {
+			if err := network.VerifyMachineNetworksDualStack(machineNetworks, true, openshiftVersion); err != nil {
 				return err
 			}
 		}
 		if common.IsSliceNonEmpty(serviceNetworks) {
-			if err := network.VerifyServiceNetworksDualStack(serviceNetworks, true); err != nil {
+			if err := network.VerifyServiceNetworksDualStack(serviceNetworks, true, openshiftVersion); err != nil {
 				return err
 			}
 		}
 		if common.IsSliceNonEmpty(clusterNetworks) {
-			if err := network.VerifyClusterNetworksDualStack(clusterNetworks, true); err != nil {
+			if err := network.VerifyClusterNetworksDualStack(clusterNetworks, true, openshiftVersion); err != nil {
 				return err
 			}
 		}
 	} else {
-		if len(machineNetworks) > 1 {
-			err := errors.Errorf("Single-stack cluster cannot contain multiple Machine Networks")
+		if len(machineNetworks) > 1 && targetLoadBalancerType == models.LoadBalancerTypeClusterManaged {
+			err := errors.Errorf("Single-stack cluster with managed load balancer cannot contain multiple Machine Networks")
 			return err
 		}
 	}
@@ -832,7 +798,9 @@ func ValidateDualStackNetworks(clusterParams interface{}, alreadyDualStack bool)
 
 // ValidateIPAddressFamily returns an error if the argument contains only IPv6 networks and IPv6
 // support is turned off. Dual-stack setup is supported even if IPv6 support is turned off.
-func ValidateIPAddressFamily(ipV6Supported bool, elements ...*string) error {
+// context is used in the error message to indicate which configuration section has the issue
+// (e.g., "machine networks", "service networks", "cluster networks", "VIPs and networks").
+func ValidateIPAddressFamily(ipV6Supported bool, context string, primaryIPStack *common.PrimaryIPStack, elements ...*string) error {
 	if ipV6Supported {
 		return nil
 	}
@@ -846,8 +814,8 @@ func ValidateIPAddressFamily(ipV6Supported bool, elements ...*string) error {
 		ipv4 = ipv4 || !currRecordIPv6Stack
 		ipv6 = ipv6 || currRecordIPv6Stack
 	}
-	if ipv6 && !ipv4 {
-		return errors.Errorf("IPv6 is not supported in this setup")
+	if ipv6 && !ipv4 && primaryIPStack == nil {
+		return errors.Errorf("Single stack IPv6 is not supported in this setup. Please verify your %s configuration", context)
 	}
 	return nil
 }
@@ -856,10 +824,10 @@ func ValidateDiskEncryptionParams(diskEncryptionParams *models.DiskEncryption, D
 	if diskEncryptionParams == nil {
 		return nil
 	}
-	if !DiskEncryptionSupport && swag.StringValue(diskEncryptionParams.EnableOn) != models.DiskEncryptionEnableOnNone {
+	if !DiskEncryptionSupport && common.RequestsConfiguration(diskEncryptionParams) {
 		return errors.New("Disk encryption support is not enabled. Cannot apply configurations to the cluster")
 	}
-	if diskEncryptionParams.Mode != nil && swag.StringValue(diskEncryptionParams.Mode) == models.DiskEncryptionModeTang {
+	if common.HasMode(diskEncryptionParams, models.DiskEncryptionModeTang) {
 		if diskEncryptionParams.TangServers == "" {
 			return errors.New("Setting Tang mode but tang_servers isn't set")
 		}
@@ -879,8 +847,8 @@ func ValidateDiskEncryptionParams(diskEncryptionParams *models.DiskEncryption, D
 	return nil
 }
 
-func ValidateHighAvailabilityModeWithPlatform(highAvailabilityMode *string, platform *models.Platform) error {
-	if swag.StringValue(highAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+func ValidateControlPlaneCountWithPlatform(controlPlaneCount *int64, platform *models.Platform) error {
+	if swag.Int64Value(controlPlaneCount) == 1 {
 		if platform != nil && platform.Type != nil && *platform.Type != models.PlatformTypeNone && !common.IsPlatformExternal(platform) {
 			return errors.Errorf("Single node cluster is not supported alongside %s platform", *platform.Type)
 		}
@@ -904,36 +872,6 @@ func ValidateIgnitionImageSize(config string) error {
 	if ignitionImageSize > IgnitionImageSizePadding {
 		return errors.New(fmt.Sprintf("The ignition archive size (%d KiB) is over the maximum allowable size (%d KiB)",
 			ignitionImageSize/1024, IgnitionImageSizePadding/1024))
-	}
-
-	return nil
-}
-
-func ValidatePlatformCapability(platform *models.Platform, ctx context.Context, authzHandler auth.Authorizer) error {
-	if platform == nil || platform.Type == nil {
-		return nil
-	}
-
-	var checked bool
-
-	if common.IsOciExternalIntegrationEnabled(platform) {
-		available, err := authzHandler.HasOrgBasedCapability(ctx, ocm.PlatformOciCapabilityName)
-		if err == nil && available {
-			return nil
-		}
-		checked = true
-	}
-
-	if *platform.Type == models.PlatformTypeExternal {
-		available, err := authzHandler.HasOrgBasedCapability(ctx, ocm.PlatformExternalCapabilityName)
-		if err == nil && available {
-			return nil
-		}
-		checked = true
-	}
-
-	if checked {
-		return common.NewApiError(http.StatusBadRequest, errors.Errorf("Platform %s is not available", *platform.Type))
 	}
 
 	return nil

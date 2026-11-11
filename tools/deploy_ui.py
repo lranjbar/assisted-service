@@ -2,7 +2,7 @@ import argparse
 import os
 import utils
 import deployment_options
-import socket
+
 
 UI_REPOSITORY = "https://github.com/openshift-assisted/assisted-installer-ui"
 
@@ -29,6 +29,14 @@ def main():
 
     cmd = f"cd {clone_directory} && git pull"
 
+    if deploy_options.target == "kind":
+        utils.override_service_type_definition_and_node_port(
+            internal_definitions_path=f"{clone_directory}/apps/assisted-ui/deploy/deployment-template.yaml",
+            internal_target_definitions_path=f"{clone_directory}/apps/assisted-ui/deploy/deployment-template.yaml",
+            service_type="NodePort",
+            node_port=30004
+        )
+
     if tag == "latest":
         log.warning("No hash specified. Will run the deployment generation script from the top of master branch")
     else:
@@ -48,9 +56,7 @@ def main():
             file=dst_file
         )
 
-    if deploy_options.target == "kind":
-        hostname = socket.gethostname()
-    elif deploy_options.target == "oc-ingress":
+    if deploy_options.target == "oc-ingress":
         hostname = utils.get_service_host(
             'assisted-installer-ui',
             deploy_options.target,
@@ -60,7 +66,7 @@ def main():
     else:
         hostname = None
 
-    # in case of openshift or kind - deploy ingress as well
+    # in case of openshift - deploy ingress as well
     if hostname is not None:
         src_file = os.path.join(os.getcwd(), 'deploy/ui/ui_ingress.yaml')
         with open(src_file, "r") as src:

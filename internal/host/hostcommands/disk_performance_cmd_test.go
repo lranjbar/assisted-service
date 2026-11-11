@@ -2,9 +2,9 @@ package hostcommands
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/go-openapi/strfmt"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -12,6 +12,7 @@ import (
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/models"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -56,10 +57,21 @@ var _ = Describe("disk_performance", func() {
 		Expect(stepReply).To(BeNil())
 	})
 
+	It("returns no steps when boot device is persistent", func() {
+		inventory := &models.Inventory{Boot: &models.Boot{DeviceType: models.BootDeviceTypePersistent}}
+		invBytes, err := json.Marshal(inventory)
+		Expect(err).NotTo(HaveOccurred())
+		host.Inventory = string(invBytes)
+		steps, err := dCmd.GetSteps(ctx, &host)
+		Expect(steps).To(BeNil())
+		Expect(err).ToNot(HaveOccurred())
+	})
+
 	AfterEach(func() {
 		// cleanup
 		common.DeleteTestDB(db, dbName)
 		stepReply = nil
 		stepErr = nil
+		ctrl.Finish()
 	})
 })

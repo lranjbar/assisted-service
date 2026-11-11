@@ -22,11 +22,27 @@
     {
         "name": "multipathd.service",
         "enabled": true
-    }{{end}}{{if .StaticNetworkConfig}},
+    },
+    {
+        "name": "iscsistart.service",
+        "enabled": true,
+        "contents": {{ executeTemplate "iscsistart.service" . | toString | toJson }}
+    },
+    {
+        "name": "oci-eval-user-data.service",
+        "enabled": true,
+        "contents": {{ executeTemplate "oci-eval-user-data.service" . | toString | toJson }}
+    }
+    {{end}}{{if .StaticNetworkConfig}},
     {
         "name": "pre-network-manager-config.service",
         "enabled": true,
         "contents": {{ executeTemplate "pre-network-manager-config.service" . | toString | toJson }}
+    }{{end}}{{if .StaticNetworkConfigWithNmstatectl}},
+    {
+        "name": "pre-network-manager-config.service",
+        "enabled": true,
+        "contents": {{ executeTemplate "pre-network-manager-config-with-nmstatectl.service" . | toString | toJson }}
     }{{end}}{{if .OKDBinaries}},
     {
         "name": "okd-overlay.service",
@@ -37,12 +53,14 @@
         "name": "systemd-journal-gatewayd.socket",
         "enabled": true,
         "contents": {{ executeTemplate "systemd-journal-gatewayd.socket" . | toString | toJson }}
-    }{{end}}{{if .OKDBinaries | not}},
+    }
+    {{end}}{{if .DesiredNtpSources}},
     {
-        "name": "iscsistart.service",
+        "name": "add-ntp-sources.service",
         "enabled": true,
-        "contents": {{ executeTemplate "iscsistart.service" . | toString | toJson }}
-    }{{end}}
+        "contents": {{ executeTemplate "add-ntp-sources.service" . | toString | toJson }}
+    }
+    {{end}}
     ]
   },
   "storage": {
@@ -54,6 +72,15 @@
           "name": "root"
       },
       "contents": { "source": "data:,{{.AGENT_FIX_BZ1964591}}" }
+    },
+    {
+      "overwrite": true,
+      "path": "/usr/local/bin/agent-pull-image",
+      "mode": 493,
+      "user": {
+          "name": "root"
+      },
+      "contents": { "source": "data:,{{.AGENT_PULL_IMAGE}}" }
     },
     {
       "overwrite": true,
@@ -72,7 +99,17 @@
           "name": "root"
       },
       "contents": { "source": "data:text/plain;charset=utf-8;base64,{{ executeTemplate "multipath.conf" . | toBase64 }}" }
-    }{{end}},
+    },
+    {
+      "path": "/usr/local/bin/oci-eval-user-data.sh",
+      "mode": 493,
+      "user": {
+        "name": "root"
+      },
+      "contents": { "source": "data:text/plain;charset=utf-8;base64,{{ executeTemplate "oci-eval-user-data.sh" . | toBase64 }}" }
+    }
+
+    {{end}},
     {
       "overwrite": true,
       "path": "/etc/NetworkManager/conf.d/01-ipv6.conf",
@@ -126,14 +163,6 @@
         "name": "root"
       },
       "contents": { "source": "{{.AdditionalTrustBundle}}" }
-    }{{end}}{{if .ServiceIPs}},
-    {
-      "path": "/etc/hosts",
-      "mode": 420,
-      "user": {
-        "name": "root"
-      },
-      "append": [{ "source": "{{.ServiceIPs}}" }]
     }{{end}}{{if .MirrorRegistriesConfig}},
     {
       "path": "/etc/containers/registries.conf",
@@ -152,6 +181,15 @@
         "name": "root"
       },
       "contents": { "source": "data:text/plain;base64,{{.MirrorRegistriesCAConfig}}"}
+    }{{end}}{{if .MirrorRegistriesPolicyConfig}},
+    {
+      "path": "/etc/containers/policy.json",
+      "mode": 420,
+      "overwrite": true,
+      "user": {
+      "name": "root"
+    },
+      "contents": { "source": "data:text/plain;base64,{{.MirrorRegistriesPolicyConfig}}"}
     }{{end}}{{if .StaticNetworkConfig}},
     {
         "path": "/usr/local/bin/pre-network-manager-config.sh",
@@ -161,7 +199,43 @@
             "name": "root"
         },
         "contents": { "source": "data:text/plain;base64,{{.PreNetworkConfigScript}}"}
+    },
+    {
+        "path": "/usr/local/bin/common_network_script.sh",
+        "mode": 493,
+        "overwrite": true,
+        "user": {
+             "name": "root"
+        },
+        "contents": { "source": "data:text/plain;base64,{{.CommonScriptFunctions}}"}
     }{{end}}{{range .StaticNetworkConfig}},
+    {
+      "path": "{{.FilePath}}",
+      "mode": 384,
+      "overwrite": true,
+      "user": {
+        "name": "root"
+      },
+      "contents": { "source": "data:text/plain;base64,{{.FileContents}}"}
+    }{{end}}{{if .StaticNetworkConfigWithNmstatectl}},
+    {
+        "path": "/usr/local/bin/pre-network-manager-config.sh",
+        "mode": 493,
+        "overwrite": true,
+        "user": {
+            "name": "root"
+        },
+        "contents": { "source": "data:text/plain;base64,{{.PreNetworkConfigScript}}"}
+    },
+    {
+        "path": "/usr/local/bin/common_network_script.sh",
+        "mode": 493,
+        "overwrite": true,
+        "user": {
+             "name": "root"
+        },
+        "contents": { "source": "data:text/plain;base64,{{.CommonScriptFunctions}}"}
+    }{{end}}{{range .StaticNetworkConfigWithNmstatectl}},
     {
       "path": "{{.FilePath}}",
       "mode": 384,
@@ -204,6 +278,14 @@
         "name": "root"
       },
       "contents": { "source": "{{.ProfileProxyExports}}" }
+    }{{end}}{{if .DesiredNtpSources}},
+    {
+      "path": "/usr/local/bin/add-ntp-sources.sh",
+      "mode": 493,
+      "user": {
+        "name": "root"
+      },
+      "contents": { "source": "data:text/plain;charset=utf-8;base64,{{ executeTemplate "add-ntp-sources.sh" . | toBase64 }}" }
     }{{end}}]
   }
 }

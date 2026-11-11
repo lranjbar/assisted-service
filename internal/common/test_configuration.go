@@ -49,34 +49,36 @@ type TestConfiguration struct {
 
 const TestDiskId = "/dev/disk/by-id/test-disk-id"
 const TestDiskPath = "/dev/test-disk"
+const MinimalVersionForNmstatectl = "4.18"
 
 var (
-	OpenShiftVersion string = "4.6"
-	ReleaseVersion          = "4.6.0"
-	ReleaseImage            = "quay.io/openshift-release-dev/ocp-release:4.6.16-x86_64"
-	RhcosImage              = "rhcos_4.6.0"
-	RhcosVersion            = "version-46.123-0"
-	SupportLevel            = "beta"
-	CPUArchitecture         = DefaultCPUArchitecture
+	DefaultTestVersion = TestVersion().Latest()
+	OpenShiftVersion   = DefaultTestVersion.Version()
+	ReleaseVersion     = DefaultTestVersion.ReleaseVersion()
+	ReleaseImageURL    = DefaultTestVersion.ReleaseImageURL()
+	RhcosImageURL      = DefaultTestVersion.RhcosImageURL()
+	RhcosVersion       = DefaultTestVersion.RhcosVersion()
+	SupportLevel       = "beta"
+	CPUArchitecture    = DefaultCPUArchitecture
 )
 
 // Defaults to be used by all testing modules
 var TestDefaultConfig = &TestConfiguration{
 	OpenShiftVersion: OpenShiftVersion,
 	ReleaseVersion:   ReleaseVersion,
-	ReleaseImageUrl:  ReleaseImage,
+	ReleaseImageUrl:  ReleaseImageURL,
 	CPUArchitecture:  CPUArchitecture,
 	ReleaseImage: &models.ReleaseImage{
 		CPUArchitecture:  &CPUArchitecture,
 		OpenshiftVersion: &OpenShiftVersion,
-		URL:              &ReleaseImage,
+		URL:              &ReleaseImageURL,
 		Version:          &ReleaseVersion,
 		CPUArchitectures: []string{CPUArchitecture},
 	},
 	OsImage: &models.OsImage{
 		CPUArchitecture:  &CPUArchitecture,
 		OpenshiftVersion: &OpenShiftVersion,
-		URL:              &RhcosImage,
+		URL:              &RhcosImageURL,
 		Version:          &RhcosVersion,
 	},
 	Status:            "status",
@@ -159,6 +161,31 @@ var DomainResolutions = []*models.DomainResolutionResponseDomain{
 	},
 }
 
+var DomainResolutionsWithCname = []*models.DomainResolutionResponseDomain{
+	{
+		DomainName: &DomainAPI,
+		Cnames:     []string{"api.cname.com"},
+	},
+	{
+		DomainName: &DomainAPIInternal,
+		Cnames:     []string{"api-int.cname.com"},
+	},
+	{
+		DomainName: &DomainApps,
+		Cnames:     []string{"console.apps.cname.com"},
+	},
+	{
+		DomainName: &ReleaseDomain,
+		Cnames:     []string{"release.cname.com"},
+	},
+	{
+		DomainName: &WildcardDomain,
+	},
+	{
+		DomainName: &UndottedWildcardDomain,
+	},
+}
+
 var WildcardResolved = []*models.DomainResolutionResponseDomain{
 	{
 		DomainName:    &WildcardDomain,
@@ -169,6 +196,17 @@ var WildcardResolved = []*models.DomainResolutionResponseDomain{
 		DomainName:    &UndottedWildcardDomain,
 		IPV4Addresses: []strfmt.IPv4{"7.8.9.10/24"},
 		IPV6Addresses: []strfmt.IPv6{"1003:db8::40/120"},
+	},
+}
+
+var WildcardResolvedWithCname = []*models.DomainResolutionResponseDomain{
+	{
+		DomainName: &WildcardDomain,
+		Cnames:     []string{"a.test.com"},
+	},
+	{
+		DomainName: &UndottedWildcardDomain,
+		Cnames:     []string{"a.test.com"},
 	},
 }
 
@@ -237,12 +275,14 @@ var DomainResolutionAllEmpty = []*models.DomainResolutionResponseDomain{
 }
 
 var TestDomainNameResolutionsSuccess = &models.DomainResolutionResponse{Resolutions: DomainResolutions}
+var TestDomainNameResolutionsSuccessWithCname = &models.DomainResolutionResponse{Resolutions: DomainResolutionsWithCname}
 var TestDomainResolutionsNoAPI = &models.DomainResolutionResponse{Resolutions: DomainResolutionNoAPI}
 var TestDomainResolutionsAllEmpty = &models.DomainResolutionResponse{Resolutions: DomainResolutionAllEmpty}
 var TestDomainNameResolutionsWildcardResolved = &models.DomainResolutionResponse{Resolutions: WildcardResolved}
+var TestDomainNameResolutionsWildcardResolvedWithCname = &models.DomainResolutionResponse{Resolutions: WildcardResolvedWithCname}
 var TestSubDomainNameResolutionsWildcardResolved = &models.DomainResolutionResponse{Resolutions: SubDomainWildcardResolved}
 
-var TestDefaultRouteConfiguration = []*models.Route{{Family: FamilyIPv4, Interface: "eth0", Gateway: "1.2.3.10", Destination: "0.0.0.0", Metric: 600}}
+var TestDefaultRouteConfiguration = []*models.Route{{Family: int32(IPv4), Interface: "eth0", Gateway: "1.2.3.10", Destination: "0.0.0.0", Metric: 600}}
 
 var TestIPv4Networking = TestNetworking{
 	ClusterNetworks: []*models.ClusterNetwork{{Cidr: "1.3.0.0/16", HostPrefix: 24}},
@@ -326,6 +366,52 @@ func GenerateTestDefaultInventory() string {
 		Disks: []*models.Disk{
 			TestDefaultConfig.Disks,
 		},
+		Routes: TestDefaultRouteConfiguration,
+	}
+
+	b, err := json.Marshal(inventory)
+	Expect(err).To(Not(HaveOccurred()))
+	return string(b)
+}
+
+func GenerateTestInventoryWithExtraDisks() string {
+	disks := []*models.Disk{
+		{
+			SizeBytes: 128849018880,
+			DriveType: models.DriveTypeHDD,
+			ID:        "/dev/disk/by-id/test-disk-id",
+			Name:      "test-disk",
+			Serial:    "test-serial",
+			Path:      "/dev/disk/by-path/test-disk-path",
+			ByPath:    "/dev/disk/by-path/test-disk-path",
+		},
+		{
+			SizeBytes: 128849018880,
+			DriveType: models.DriveTypeHDD,
+			ID:        "/dev/disk/by-id/test-disk-id-2",
+			Name:      "test-disk-2",
+			Serial:    "test-serial-2",
+			Path:      "/dev/disk/by-path/test-disk-path-2",
+			ByPath:    "/dev/disk/by-path/test-disk-path-2",
+		},
+	}
+
+	inventory := &models.Inventory{
+		CPU: &models.CPU{
+			Architecture: models.ClusterCPUArchitectureX8664,
+		},
+		Interfaces: []*models.Interface{
+			{
+				Name: "eth0",
+				IPV4Addresses: []string{
+					"1.2.3.4/24",
+				},
+				IPV6Addresses: []string{
+					"1001:db8::10/120",
+				},
+			},
+		},
+		Disks:  disks,
 		Routes: TestDefaultRouteConfiguration,
 	}
 
@@ -605,4 +691,52 @@ func FormatStaticConfigHostYAML(nicPrimary, nicSecondary, ip4Master, ip4Secondar
 
 	output, _ := yaml.Marshal(staticNetworkConfig)
 	return &models.HostStaticNetworkConfig{MacInterfaceMap: macInterfaceMap, NetworkYaml: string(output)}
+}
+
+func GenerateHostInventoryInterfaceIPV4InMNetIPV6Doesnt(mutateFn func(*models.Inventory)) string {
+	inventory := &models.Inventory{
+		Interfaces: []*models.Interface{
+			{
+				Name: "eth1",
+				IPV4Addresses: []string{
+					"1.2.3.4/24",
+				},
+				IPV6Addresses: []string{
+					"1001:db9::10/120",
+				},
+			},
+		},
+		Disks:        []*models.Disk{{SizeBytes: conversions.GibToBytes(120), DriveType: models.DriveTypeHDD}},
+		CPU:          &models.CPU{Count: 16},
+		Memory:       &models.Memory{PhysicalBytes: conversions.GibToBytes(16), UsableBytes: conversions.GibToBytes(16)},
+		SystemVendor: &models.SystemVendor{Manufacturer: "Red Hat", ProductName: "RHEL", SerialNumber: "3534"},
+		Routes:       TestDefaultRouteConfiguration,
+	}
+	mutateFn(inventory)
+	b, err := json.Marshal(inventory)
+	Expect(err).To(Not(HaveOccurred()))
+	return string(b)
+}
+
+func GenerateTestInventoryWithUnnormalizedIPv6() string {
+	inventory := &models.Inventory{
+		CPU: &models.CPU{
+			Architecture: models.ClusterCPUArchitectureX8664,
+		},
+		Interfaces: []*models.Interface{
+			{
+				IPV6Addresses: []string{
+					"2A00:8A00:4000:0d80::1/64",
+				},
+			},
+		},
+		Disks: []*models.Disk{
+			TestDefaultConfig.Disks,
+		},
+		Routes: TestDefaultRouteConfiguration,
+	}
+
+	b, err := json.Marshal(inventory)
+	Expect(err).To(Not(HaveOccurred()))
+	return string(b)
 }

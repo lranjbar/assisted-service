@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
@@ -28,14 +29,15 @@ import (
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	"github.com/kelseyhightower/envconfig"
+	"github.com/lib/pq"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	gomega_format "github.com/onsi/gomega/format"
 	amgmtv1 "github.com/openshift-online/ocm-sdk-go/accountsmgmt/v1"
+	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/cluster"
 	"github.com/openshift/assisted-service/internal/cluster/validations"
 	"github.com/openshift/assisted-service/internal/common"
@@ -55,16 +57,20 @@ import (
 	"github.com/openshift/assisted-service/internal/infraenv"
 	"github.com/openshift/assisted-service/internal/installcfg"
 	installcfg_builder "github.com/openshift/assisted-service/internal/installcfg/builder"
+	"github.com/openshift/assisted-service/internal/installercache"
 	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/provider/registry"
 	"github.com/openshift/assisted-service/internal/provider/vsphere"
 	"github.com/openshift/assisted-service/internal/stream"
+	"github.com/openshift/assisted-service/internal/system"
+	testutils "github.com/openshift/assisted-service/internal/testing"
 	"github.com/openshift/assisted-service/internal/usage"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
+	"github.com/openshift/assisted-service/pkg/executer"
 	"github.com/openshift/assisted-service/pkg/filemiddleware"
 	"github.com/openshift/assisted-service/pkg/generator"
 	"github.com/openshift/assisted-service/pkg/k8sclient"
@@ -78,7 +84,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
-	"gopkg.in/yaml.v2"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -156,7 +162,7 @@ var (
 	mockEvents                        *eventsapi.MockHandler
 	mockS3Client                      *s3wrapper.MockAPI
 	mockSecretValidator               *validations.MockPullSecretValidator
-	mockGenerator                     *generator.MockISOInstallConfigGenerator
+	mockGenerator                     *generator.MockInstallConfigGenerator
 	mockVersions                      *versions.MockHandler
 	mockOSImages                      *versions.MockOSImages
 	mockMetric                        *metrics.MockAPI
@@ -170,7 +176,9 @@ var (
 	mockInstallConfigBuilder          *installcfg_builder.MockInstallConfigBuilder
 	mockStaticNetworkConfig           *staticnetworkconfig.MockStaticNetworkConfig
 	mockProviderRegistry              *registry.MockProviderRegistry
-	mockMirrorRegistriesConfigBuilder *mirrorregistries.MockMirrorRegistriesConfigBuilder
+	mockMirrorRegistriesConfigBuilder *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
+	mockInstallerCache                *installercache.MockInstallerCache
+	mockExecuter                      *executer.MockExecuter
 	secondDayWorkerIgnition           = []byte(`{
 		"ignition": {
 		  "version": "3.1.0",
@@ -199,6 +207,38 @@ var (
 	imageServiceBaseURL = fmt.Sprintf("https://%s%s", imageServiceHost, imageServicePath)
 	fakePullSecret      = `{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dG9rZW46dGVzdAo=\",\"email\":\"coyote@acme.com\"}}}"` // #nosec
 	serviceBaseURL      = "https://assisted.example.com:6008"
+	formattedInput      = "some formated input"
+	// output for flow involving generating nmconnection files
+	staticnetworkConfigOutput = []staticnetworkconfig.StaticNetworkConfigData{
+		{
+			FilePath:     "nic10.nmconnection",
+			FileContents: "nic10 nmconnection content",
+		},
+		{
+			FilePath:     "nic20.nmconnection",
+			FileContents: "nic10 nmconnection content",
+		},
+		{
+			FilePath:     "mac_interface.ini",
+			FileContents: "nic10=mac10\nnic20=mac20",
+		},
+	}
+	// output for flow involving nmpolicy and nmstate service files
+	staticNetworkConfigNmpolicyOutput = []staticnetworkconfig.StaticNetworkConfigData{
+		{
+			FilePath:     "nic10.yml",
+			FileContents: "nic10 nmpolicy content",
+		},
+		{
+			FilePath:     "nic20.yml",
+			FileContents: "nic10 nmpolicy content",
+		},
+		{
+			FilePath:     "mac_interface.ini",
+			FileContents: "nic10=mac10\nnic20=mac20",
+		},
+	}
+	ocpVersionInvolvingGenerateKeyfiles = "4.12"
 )
 
 type clusterIdMatcher struct {
@@ -227,16 +267,30 @@ func toMac(macStr string) *strfmt.MAC {
 	return &mac
 }
 
-func mockClusterRegisterSteps() {
-	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-	mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+func mockClusterRegisterSteps(withReleaseImageURL bool) {
+	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	if withReleaseImageURL {
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+	} else {
+		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+	}
+
+	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 	mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 	mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 }
 
 func mockClusterRegisterSuccess(withEvents bool) {
-	mockClusterRegisterSteps()
+	mockClusterRegisterSteps(false)
+	mockMetric.EXPECT().ClusterRegistered().Times(1)
+
+	if withEvents {
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.ClusterRegistrationSucceededEventName))).Times(1)
+	}
+}
+func mockClusterRegisterSuccessWithReleaseImageURL(withEvents bool) {
+	mockClusterRegisterSteps(true)
 	mockMetric.EXPECT().ClusterRegistered().Times(1)
 
 	if withEvents {
@@ -253,8 +307,9 @@ func mockClusterRegisterSuccessWithVersion(cpuArchitecture, openshiftVersion str
 		Version:          swag.String(openshiftVersion),
 		SupportLevel:     models.OpenshiftVersionSupportLevelProduction,
 	}
-	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 	mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).Times(1)
+
 	mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 	mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 	mockMetric.EXPECT().ClusterRegistered().Times(1)
@@ -265,8 +320,8 @@ func mockClusterRegisterSuccessWithVersion(cpuArchitecture, openshiftVersion str
 
 func createInstallConfigBuilder() installcfg_builder.InstallConfigBuilder {
 	log := common.GetTestLog().WithField("pkg", "installcfg")
-	mockMirrorRegistriesConfigBuilder = mirrorregistries.NewMockMirrorRegistriesConfigBuilder(ctrl)
-	return installcfg_builder.NewInstallConfigBuilder(log, mockMirrorRegistriesConfigBuilder, registry.InitProviderRegistry(log))
+	mockMirrorRegistriesConfigBuilder = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(ctrl)
+	return installcfg_builder.NewInstallConfigBuilder(log, mockMirrorRegistriesConfigBuilder, registry.InitProviderRegistry(log), system.NewLocalSystemInfo(), false)
 
 }
 
@@ -280,18 +335,20 @@ func mockClusterUpdateSuccess(times int, hosts int) {
 }
 
 func mockInfraEnvRegisterSuccess() {
-	mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+
+	mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 	mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(gomock.Any()).Return("", nil).Times(1)
-	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 	mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 	mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 		eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
 }
 
 func mockInfraEnvUpdateSuccess() {
-	mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+
+	mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+	mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 	mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 	mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 		eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
@@ -311,12 +368,81 @@ func mockUsageReports() {
 	mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 }
 
+func mockOperatorValidationsSuccess(mock *operators.MockAPI) {
+	mock.EXPECT().ValidateCluster(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+}
+
+func mockNoChangeInOperatorDependencies(mock *operators.MockAPI) {
+	mock.EXPECT().ResolveDependencies(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ *common.Cluster, previousOperators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
+			return previousOperators, nil
+		},
+	).AnyTimes()
+}
+
 func TestValidator(t *testing.T) {
 	RegisterFailHandler(Fail)
-	common.InitializeDBTest()
-	defer common.TerminateDBTest()
 	RunSpecs(t, "inventory_test")
 }
+
+var _ = BeforeSuite(func() {
+	common.InitializeDBTest()
+})
+
+var _ = AfterSuite(func() {
+	common.TerminateDBTest()
+})
+
+var _ = Describe("RegisterDisconnectedCluster", func() {
+	var (
+		ctx    = context.Background()
+		cfg    Config
+		bm     *bareMetalInventory
+		db     *gorm.DB
+		dbName string
+	)
+
+	BeforeEach(func() {
+		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
+		db, dbName = common.PrepareTestDB()
+		bm = createInventory(db, cfg)
+		// Avoid AMS subscription side effects during registration in this test
+		//bm.ocmClient = nil
+		// Use real cluster manager so RegisterCluster persists to DB
+		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+		mockUsageReports()
+	})
+
+	AfterEach(func() {
+		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
+	})
+
+	It("creates a disconnected cluster with Status=Unmonitored and Kind=DisconnectedCluster", func() {
+		disconnectedParams := &models.DisconnectedClusterCreateParams{
+			Name:             swag.String("test-cluster"),
+			OpenshiftVersion: swag.String(common.TestDefaultConfig.OpenShiftVersion),
+		}
+
+		reply := bm.V2RegisterDisconnectedCluster(ctx, installer.V2RegisterDisconnectedClusterParams{
+			NewClusterParams: disconnectedParams,
+		})
+
+		// Response payload
+		Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterDisconnectedClusterCreated()))
+		created := reply.(*installer.V2RegisterDisconnectedClusterCreated).Payload
+		Expect(swag.StringValue(created.Status)).To(Equal(models.ClusterStatusUnmonitored))
+		Expect(swag.StringValue(created.Kind)).To(Equal(models.ClusterKindDisconnectedCluster))
+		Expect(swag.StringValue(created.StatusInfo)).To(Equal("Cluster created for offline installation"))
+
+		// DB state
+		c, err := bm.getCluster(ctx, created.ID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(swag.StringValue(c.Status)).To(Equal(models.ClusterStatusUnmonitored))
+		Expect(swag.StringValue(c.Kind)).To(Equal(models.ClusterKindDisconnectedCluster))
+		Expect(swag.StringValue(c.StatusInfo)).To(Equal("Cluster created for offline installation"))
+	})
+})
 
 func getTestAuthHandler() auth.Authenticator {
 	return auth.NewNoneAuthenticator(common.GetTestLog().WithField("pkg", "auth"))
@@ -339,15 +465,15 @@ func getDefaultClusterCreateParams() *models.ClusterCreateParams {
 		Platform: &models.Platform{
 			Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
 		},
-		CPUArchitecture:      models.ClusterCPUArchitectureX8664,
-		HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+		CPUArchitecture:   models.ClusterCPUArchitectureX8664,
+		ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
 	}
 }
 
-func mockGenerateInstallConfigSuccess(mockGenerator *generator.MockISOInstallConfigGenerator, mockVersions *versions.MockHandler) {
+func mockGenerateInstallConfigSuccess(mockGenerator *generator.MockInstallConfigGenerator, mockVersions *versions.MockHandler) {
 	if mockGenerator != nil {
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-		mockGenerator.EXPECT().GenerateInstallConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+		mockGenerator.EXPECT().GenerateInstallConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), false).Return(nil).Times(1)
 	}
 }
 
@@ -370,15 +496,15 @@ func addVMToCluster(cluster *common.Cluster, db *gorm.DB) {
 	cluster.Hosts = append(cluster.Hosts, &host)
 }
 
-func createClusterWithAvailability(db *gorm.DB, status string, highAvailabilityMode string) *common.Cluster {
+func createClusterWithAvailability(db *gorm.DB, status string, controlPlaneCount int64) *common.Cluster {
 	clusterID := strfmt.UUID(uuid.New().String())
 	c := &common.Cluster{
 		Cluster: models.Cluster{
-			ID:                   &clusterID,
-			Status:               swag.String(status),
-			HighAvailabilityMode: &highAvailabilityMode,
-			OpenshiftVersion:     common.TestDefaultConfig.OpenShiftVersion,
-			CPUArchitecture:      common.DefaultCPUArchitecture,
+			ID:                &clusterID,
+			Status:            swag.String(status),
+			ControlPlaneCount: controlPlaneCount,
+			OpenshiftVersion:  common.TestDefaultConfig.OpenShiftVersion,
+			CPUArchitecture:   common.DefaultCPUArchitecture,
 			Platform: &models.Platform{
 				Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
 			},
@@ -389,7 +515,7 @@ func createClusterWithAvailability(db *gorm.DB, status string, highAvailabilityM
 }
 
 func createCluster(db *gorm.DB, status string) *common.Cluster {
-	return createClusterWithAvailability(db, status, models.ClusterCreateParamsHighAvailabilityModeFull)
+	return createClusterWithAvailability(db, status, common.MinMasterHostsNeededForInstallationInHaMode)
 }
 
 func createInfraEnv(db *gorm.DB, id strfmt.UUID, clusterID strfmt.UUID) *common.InfraEnv {
@@ -560,23 +686,41 @@ var _ = Describe("RegisterHost", func() {
 		Expect(apiErr.Error()).Should(Equal(err.Error()))
 	})
 
+	It("rejects host registration for disconnected-iso infraenv type", func() {
+		cluster := createCluster(db, models.ClusterStatusUnmonitored)
+		infraEnv := createInfraEnv(db, *cluster.ID, *cluster.ID)
+		// Mark infraEnv as disconnected-iso
+		Expect(db.Model(&common.InfraEnv{}).Where("id = ?", *infraEnv.ID).Update("type", models.ImageTypeDisconnectedIso).Error).To(Succeed())
+
+		reply := bm.V2RegisterHost(ctx, installer.V2RegisterHostParams{
+			InfraEnvID: *infraEnv.ID,
+			NewHostParams: &models.HostCreateParams{
+				DiscoveryAgentVersion: "v1",
+				HostID:                &hostID,
+			},
+		})
+		errResp, ok := reply.(*common.ApiErrorResponse)
+		Expect(ok).To(BeTrue())
+		Expect(errResp.StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+		Expect(errResp.Error()).To(ContainSubstring("Cannot register a host to an InfraEnv with disconnected-iso type"))
+	})
+
 	Context("Register success", func() {
 		for _, test := range []struct {
-			availability string
-			expectedRole models.HostRole
+			ctrlPlaneCount int64
+			expectedRole   models.HostRole
 		}{
-			{availability: models.ClusterHighAvailabilityModeFull, expectedRole: models.HostRoleAutoAssign},
-			{availability: models.ClusterHighAvailabilityModeNone, expectedRole: models.HostRoleMaster},
+			{ctrlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode, expectedRole: models.HostRoleAutoAssign},
+			{ctrlPlaneCount: 1, expectedRole: models.HostRoleMaster},
 		} {
-			test := test
 
-			It(fmt.Sprintf("cluster availability mode %s expected default host role %s",
-				test.availability, test.expectedRole), func() {
-				cluster := createClusterWithAvailability(db, models.ClusterStatusInsufficient, test.availability)
+			It(fmt.Sprintf("cluster availability mode %d expected default host role %s",
+				test.ctrlPlaneCount, test.expectedRole), func() {
+				cluster := createClusterWithAvailability(db, models.ClusterStatusInsufficient, test.ctrlPlaneCount)
 				infraEnv := createInfraEnv(db, *cluster.ID, *cluster.ID)
 
 				mockClusterApi.EXPECT().AcceptRegistration(gomock.Any()).Return(nil).Times(1)
-				mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrueWithClusterID(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 				mockHostApi.EXPECT().RegisterHost(gomock.Any(), gomock.Any(), gomock.Any()).
 					DoAndReturn(func(ctx context.Context, h *models.Host, db *gorm.DB) error {
 						// validate that host is registered with auto-assign role
@@ -613,11 +757,11 @@ var _ = Describe("RegisterHost", func() {
 		}
 
 		It("Should only emit HostRegistrationSucceededEventName when not in pre installation state", func() {
-			cluster := createClusterWithAvailability(db, models.ClusterStatusInstalling, models.ClusterHighAvailabilityModeFull)
+			cluster := createClusterWithAvailability(db, models.ClusterStatusInstalling, common.MinMasterHostsNeededForInstallationInHaMode)
 			infraEnv := createInfraEnv(db, *cluster.ID, *cluster.ID)
 
 			mockClusterApi.EXPECT().AcceptRegistration(gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrueWithClusterID(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockHostApi.EXPECT().RegisterHost(gomock.Any(), gomock.Any(), gomock.Any()).
 				DoAndReturn(func(ctx context.Context, h *models.Host, db *gorm.DB) error {
 					// validate that host is registered with auto-assign role
@@ -736,7 +880,7 @@ var _ = Describe("RegisterHost", func() {
 			}).Times(1)
 		mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockCRDUtils.EXPECT().CreateAgentCR(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
-		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrueWithClusterID(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 		By("trying to register a host bound to day2 cluster")
 		reply := bm.V2RegisterHost(ctx, installer.V2RegisterHostParams{
@@ -1494,6 +1638,10 @@ func mockDetectAndStoreCollidingIPsForCluster(mockClusterApi *cluster.MockAPI, t
 	mockClusterApi.EXPECT().DetectAndStoreCollidingIPsForCluster(gomock.Any(), gomock.Any()).Return(nil).Times(times)
 }
 
+func mockRefreshSchedulableMastersForcedTrue(mockClusterApi *cluster.MockAPI, times int) {
+	mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(times)
+}
+
 var _ = Describe("cluster", func() {
 	masterHostId1 := strfmt.UUID(uuid.New().String())
 	masterHostId2 := strfmt.UUID(uuid.New().String())
@@ -1802,25 +1950,10 @@ var _ = Describe("cluster", func() {
 							masterHostId3,
 						}),
 					},
-					{
-						Cidr: "10.11.0.0/16",
-						HostIds: sortedHosts([]strfmt.UUID{
-							masterHostId1,
-							masterHostId2,
-						}),
-					},
-					{
-						Cidr: "7.8.9.0/24",
-						HostIds: []strfmt.UUID{
-							masterHostId3,
-						},
-					},
 				})
 				actualNetworks := sortedNetworks(actual.Payload.HostNetworks)
-				Expect(len(actualNetworks)).To(Equal(3))
+				Expect(len(actualNetworks)).To(Equal(1))
 				actualNetworks[0].HostIds = sortedHosts(actualNetworks[0].HostIds)
-				actualNetworks[1].HostIds = sortedHosts(actualNetworks[1].HostIds)
-				actualNetworks[2].HostIds = sortedHosts(actualNetworks[2].HostIds)
 				Expect(actualNetworks).To(Equal(expectedNetworks))
 			})
 			It("exclude hosts", func() {
@@ -1847,6 +1980,33 @@ var _ = Describe("cluster", func() {
 				common.DeleteTestDB(db, dbName)
 				resp := bm.V2GetCluster(ctx, installer.V2GetClusterParams{ClusterID: clusterID})
 				Expect(resp).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusInternalServerError, errors.Errorf(""))))
+			})
+
+			It("V2GetCluster populates operator_bundles from source_bundles", func() {
+				// Add operators with source_bundles to the existing cluster
+				operatorName := "nvidia-gpu"
+				Expect(db.Create(&models.MonitoredOperator{
+					ClusterID:     clusterID,
+					Name:          operatorName,
+					OperatorType:  models.OperatorTypeOlm,
+					SourceBundles: pq.StringArray{"openshift-ai"},
+				}).Error).ShouldNot(HaveOccurred())
+
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockDurationsSuccess()
+				mockOperatorManager.EXPECT().GetBundle("openshift-ai", nil).Return(&models.Bundle{
+					ID:                "openshift-ai",
+					Operators:         []string{"openshift-ai"},
+					OptionalOperators: []string{"nvidia-gpu", "amd-gpu"},
+				}, nil).AnyTimes()
+
+				reply := bm.V2GetCluster(ctx, installer.V2GetClusterParams{ClusterID: clusterID})
+				actual, ok := reply.(*installer.V2GetClusterOK)
+				Expect(ok).To(BeTrue())
+				Expect(actual.Payload.OperatorBundles).To(HaveLen(1))
+				Expect(swag.StringValue(actual.Payload.OperatorBundles[0].ID)).To(Equal("openshift-ai"))
+				Expect(actual.Payload.OperatorBundles[0].OptionalOperators).To(ContainElement("nvidia-gpu"))
+				Expect(actual.Payload.OperatorBundles[0].OptionalOperators).NotTo(ContainElement("amd-gpu"))
 			})
 		})
 
@@ -1919,29 +2079,27 @@ var _ = Describe("cluster", func() {
 		})
 		It("happy flow", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, mockStream, mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, mockStream, mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.8")
 
-			noneHaMode := models.ClusterHighAvailabilityModeNone
 			MinimalOpenShiftVersionForNoneHA := "4.8.0-fc.0"
 			clusterParams.OpenshiftVersion = swag.String(MinimalOpenShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
 			})
 			Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
 			actual := reply.(*installer.V2RegisterClusterCreated)
-			Expect(actual.Payload.HighAvailabilityMode).To(Equal(swag.String(noneHaMode)))
+			Expect(actual.Payload.ControlPlaneCount).To(Equal(int64(1)))
 			Expect(actual.Payload.UserManagedNetworking).To(Equal(swag.Bool(true)))
 			Expect(actual.Payload.VipDhcpAllocation).To(Equal(swag.Bool(false)))
 		})
 		It("create non ha cluster fail, release version is lower than minimal", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
-			noneHaMode := models.ClusterHighAvailabilityModeNone
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			insufficientOpenShiftVersionForNoneHA := "4.7"
 			clusterParams.OpenshiftVersion = swag.String(insufficientOpenShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
 			})
@@ -1949,11 +2107,10 @@ var _ = Describe("cluster", func() {
 		})
 		It("create non ha cluster fail, release version is pre-release and lower than minimal", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
-			noneHaMode := models.ClusterHighAvailabilityModeNone
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			insufficientOpenShiftVersionForNoneHA := "4.7.0-fc.1"
 			clusterParams.OpenshiftVersion = swag.String(insufficientOpenShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
 			})
@@ -1961,48 +2118,45 @@ var _ = Describe("cluster", func() {
 		})
 		It("create non ha cluster success, release version is greater than minimal", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.8")
-			noneHaMode := models.ClusterHighAvailabilityModeNone
 			openShiftVersionForNoneHA := "4.8.0"
 			clusterParams.OpenshiftVersion = swag.String(openShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
 			})
 			Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
 			actual := reply.(*installer.V2RegisterClusterCreated)
-			Expect(actual.Payload.HighAvailabilityMode).To(Equal(swag.String(noneHaMode)))
+			Expect(actual.Payload.ControlPlaneCount).To(Equal(int64(1)))
 			Expect(actual.Payload.UserManagedNetworking).To(Equal(swag.Bool(true)))
 			Expect(actual.Payload.VipDhcpAllocation).To(Equal(swag.Bool(false)))
 		})
 		It("create non ha cluster success, release version is pre-release and greater than minimal", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.8")
-			noneHaMode := models.ClusterHighAvailabilityModeNone
 			openShiftVersionForNoneHA := "4.8.0-fc.2"
 			clusterParams.OpenshiftVersion = swag.String(openShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
 			})
 			Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
 			actual := reply.(*installer.V2RegisterClusterCreated)
-			Expect(actual.Payload.HighAvailabilityMode).To(Equal(swag.String(noneHaMode)))
+			Expect(actual.Payload.ControlPlaneCount).To(Equal(int64(1)))
 			Expect(actual.Payload.UserManagedNetworking).To(Equal(swag.Bool(true)))
 			Expect(actual.Payload.VipDhcpAllocation).To(Equal(swag.Bool(false)))
 		})
 		It("create non ha cluster fail, explicitly disabled UserManagedNetworking", func() {
 			errStr := "Can't set none platform with user-managed-networking disabled"
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
-			noneHaMode := models.ClusterHighAvailabilityModeNone
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			openShiftVersionForNoneHA := "4.8.0-fc.2"
 			clusterParams.OpenshiftVersion = swag.String(openShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			clusterParams.UserManagedNetworking = swag.Bool(false)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
@@ -2011,11 +2165,10 @@ var _ = Describe("cluster", func() {
 		})
 		It("create non ha cluster fail, explicitly enabled VipDhcpAllocation", func() {
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
-			noneHaMode := models.ClusterHighAvailabilityModeNone
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			openShiftVersionForNoneHA := "4.8.0-fc.2"
 			clusterParams.OpenshiftVersion = swag.String(openShiftVersionForNoneHA)
-			clusterParams.HighAvailabilityMode = &noneHaMode
+			clusterParams.ControlPlaneCount = swag.Int64(1)
 			clusterParams.VipDhcpAllocation = swag.Bool(true)
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: clusterParams,
@@ -2026,21 +2179,20 @@ var _ = Describe("cluster", func() {
 	})
 	It("create non ha cluster success, release version is ci-release and greater than minimal", func() {
 		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 
 		mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.8")
-		noneHaMode := models.ClusterHighAvailabilityModeNone
 		openShiftVersionForNoneHA := "4.8.0-0.ci.test-2021-05-20-000749-ci-op-7xrzwgwy-latest"
 		clusterParams := getDefaultClusterCreateParams()
 		clusterParams.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
 		clusterParams.OpenshiftVersion = swag.String(openShiftVersionForNoneHA)
-		clusterParams.HighAvailabilityMode = &noneHaMode
+		clusterParams.ControlPlaneCount = swag.Int64(1)
 		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 			NewClusterParams: clusterParams,
 		})
 		Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
 		actual := reply.(*installer.V2RegisterClusterCreated)
-		Expect(actual.Payload.HighAvailabilityMode).To(Equal(swag.String(noneHaMode)))
+		Expect(actual.Payload.ControlPlaneCount).To(Equal(int64(1)))
 		Expect(actual.Payload.UserManagedNetworking).To(Equal(swag.Bool(true)))
 		Expect(actual.Payload.VipDhcpAllocation).To(Equal(swag.Bool(false)))
 	})
@@ -2053,6 +2205,70 @@ var _ = Describe("cluster", func() {
 		mockSuccess := func() {
 			mockClusterUpdateSuccess(1, 0)
 		}
+
+		Context("OS stream", func() {
+			var cluster *common.Cluster
+
+			BeforeEach(func() {
+				clusterID = strfmt.UUID(uuid.New().String())
+				cluster = &common.Cluster{Cluster: models.Cluster{
+					ID:               &clusterID,
+					OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+					Status:           swag.String(models.ClusterStatusReady),
+					CPUArchitecture:  models.ClusterCPUArchitectureX8664,
+					Platform: &models.Platform{
+						Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
+					},
+				}}
+				Expect(db.Create(cluster).Error).ShouldNot(HaveOccurred())
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+			})
+
+			It("updates OS stream when the OS image exists for the cluster version and architecture", func() {
+				mockSuccess()
+				mockOSImages.EXPECT().GetOsImage(common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9", "").Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+				osStream := "rhel-9"
+				reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+					ClusterID: clusterID,
+					ClusterUpdateParams: &models.V2ClusterUpdateParams{
+						OsStream: &osStream,
+					},
+				})
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+
+				var dbCluster common.Cluster
+				Expect(db.First(&dbCluster, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+				Expect(dbCluster.OsStream).To(Equal("rhel-9"))
+			})
+
+			It("rejects OS stream update when no OS image exists", func() {
+				mockOSImages.EXPECT().GetOsImage(common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9", "").Return(nil, errors.New("not found")).Times(1)
+				osStream := "rhel-9"
+				reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+					ClusterID: clusterID,
+					ClusterUpdateParams: &models.V2ClusterUpdateParams{
+						OsStream: &osStream,
+					},
+				})
+				verifyApiErrorString(reply, http.StatusBadRequest,
+					fmt.Sprintf("No OS images are available for version (%s), CPU architecture (%s) and os stream (%s)",
+						common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9"))
+			})
+
+			It("rejects OS stream update when the OS image has no URL", func() {
+				mockOSImages.EXPECT().GetOsImage(common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9", "").Return(&models.OsImage{}, nil).Times(1)
+				osStream := "rhel-9"
+				reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+					ClusterID: clusterID,
+					ClusterUpdateParams: &models.V2ClusterUpdateParams{
+						OsStream: &osStream,
+					},
+				})
+				verifyApiErrorString(reply, http.StatusBadRequest,
+					fmt.Sprintf("No OS images are available for version (%s), CPU architecture (%s) and os stream (%s)",
+						common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9"))
+			})
+		})
 
 		It("update_cluster_while_installing", func() {
 			clusterID = strfmt.UUID(uuid.New().String())
@@ -2078,7 +2294,7 @@ var _ = Describe("cluster", func() {
 
 		Context("check pull secret", func() {
 			BeforeEach(func() {
-				v, err := validations.NewPullSecretValidator(validations.Config{}, getTestAuthHandler())
+				v, err := validations.NewPullSecretValidator(map[string]bool{}, getTestAuthHandler())
 				Expect(err).ShouldNot(HaveOccurred())
 				bm.secretValidator = v
 			})
@@ -2118,11 +2334,43 @@ var _ = Describe("cluster", func() {
 				})
 				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 			})
+			Context("mirror registry is configured", func() {
+				It("should successfully update if the pull secret auth does not contain a mirrored registry", func() {
+					pullSecret := "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dG9rZW46dGVzdAo=\",\"email\":\"coyote@acme.com\"}}}" // #nosec
+					mirrorRegistryConfig, _ := getMirrorRegistryConfigurations(getSecureRegistryToml("fake-registry.example.com", "fake-mirror-registry.example.com"), "fake-certificate")
+					mirrorRegistryConfigStr, err := common.ConvertMirrorRegistryConfigToString(mirrorRegistryConfig)
+					Expect(err).ShouldNot(HaveOccurred())
+					clusterID = strfmt.UUID(uuid.New().String())
+					cluster := &common.Cluster{Cluster: models.Cluster{
+						ID: &clusterID,
+						Platform: &models.Platform{
+							Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
+						},
+						OpenshiftVersion: "4.12",
+						CPUArchitecture:  common.DefaultCPUArchitecture,
+						OcpReleaseImage:  "fake-registry.example.com/ocp/release:4.18",
+					},
+						MirrorRegistryConfiguration: mirrorRegistryConfigStr,
+					}
+					err = db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+					mockSuccess()
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							PullSecret: &pullSecret,
+						},
+					})
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+				})
+			})
 		})
 
 		It("update cluster day1 with APIVipDNSName failed", func() {
 			mockOperators := operators.NewMockAPI(ctrl)
-			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+			mockNoChangeInOperatorDependencies(mockOperators)
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccess(true)
 
@@ -2151,7 +2399,8 @@ var _ = Describe("cluster", func() {
 			func(openshiftVersion, networkType string) {
 				cpuArchitecture := "irrelevant"
 				mockOperators := operators.NewMockAPI(ctrl)
-				bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+				mockNoChangeInOperatorDependencies(mockOperators)
+				bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 				mockClusterRegisterSuccessWithVersion(cpuArchitecture, openshiftVersion)
 
@@ -2165,8 +2414,8 @@ var _ = Describe("cluster", func() {
 					Platform: &models.Platform{
 						Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
 					},
-					CPUArchitecture:      models.ClusterCPUArchitectureX8664,
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					CPUArchitecture:   models.ClusterCPUArchitectureX8664,
+					ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
 				}
 
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -2199,7 +2448,8 @@ var _ = Describe("cluster", func() {
 			func(openshiftVersion, networkType string) {
 				cpuArchitecture := "irrelevant"
 				mockOperators := operators.NewMockAPI(ctrl)
-				bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+				mockNoChangeInOperatorDependencies(mockOperators)
+				bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 				mockClusterRegisterSuccessWithVersion(cpuArchitecture, openshiftVersion)
 				clusterCreateParams := &models.ClusterCreateParams{
@@ -2209,8 +2459,8 @@ var _ = Describe("cluster", func() {
 					Platform: &models.Platform{
 						Type: common.PlatformTypePtr(models.PlatformTypeBaremetal),
 					},
-					CPUArchitecture:      models.ClusterCPUArchitectureX8664,
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					CPUArchitecture:   models.ClusterCPUArchitectureX8664,
+					ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
 				}
 
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -2294,7 +2544,7 @@ var _ = Describe("cluster", func() {
 				BeforeEach(func() {
 					openshiftVersion = "4.12.0"
 					bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-						db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+						db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 				})
 				Context("RegisterCluster - Multiple-VIPs Support", func() {
 
@@ -2303,7 +2553,7 @@ var _ = Describe("cluster", func() {
 						ingressVip := "8.8.8.1"
 						apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("8.8.8.8")}}
 						ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("8.8.8.2")}}
-						err := "the second element of apiVIPs must be an IPv6 address. got: 8.8.8.8"
+						err := "dual-stack apiVIPs must include exactly one IPv6 address"
 						reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 							NewClusterParams: &models.ClusterCreateParams{
 								Name:             swag.String("some-cluster-name"),
@@ -2339,30 +2589,40 @@ var _ = Describe("cluster", func() {
 						Expect(cluster.IngressVips).To(Equal(ingressVips))
 					})
 
-					It("Two APIVips and Two IngressVips - IPv6 first and IPv4 second - negative", func() {
+					It("Two APIVips and Two IngressVips - IPv6 first and IPv4 second - positive (OCP 4.12+)", func() {
+						mockClusterRegisterSuccessWithVersion("x86_64", "4.12.0")
+						mockUsageReports()
+
 						apiVip := "2001:db8::1"
 						ingressVip := "2001:db8::2"
 						apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("8.8.8.7")}}
 						ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("8.8.8.1")}}
-						err := "the first element of apiVIPs must be an IPv4 address. got: 2001:db8::1"
+
 						reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 							NewClusterParams: &models.ClusterCreateParams{
 								Name:             swag.String("some-cluster-name"),
-								OpenshiftVersion: swag.String(openshiftVersion),
+								OpenshiftVersion: swag.String("4.12.0"), // Use 4.12+ for IPv6-primary support
 								PullSecret:       swag.String(fakePullSecret),
 								APIVips:          apiVips,
 								IngressVips:      ingressVips,
 							},
 						})
-						verifyApiErrorString(reply, http.StatusBadRequest, err)
+						Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+						actualReply := reply.(*installer.V2RegisterClusterCreated)
+						Expect(actualReply.Payload.APIVips).To(HaveLen(2))
+						Expect(actualReply.Payload.IngressVips).To(HaveLen(2))
+						Expect(string(actualReply.Payload.APIVips[0].IP)).To(Equal(apiVip))
+						Expect(string(actualReply.Payload.APIVips[1].IP)).To(Equal("8.8.8.7"))
+						Expect(string(actualReply.Payload.IngressVips[0].IP)).To(Equal(ingressVip))
+						Expect(string(actualReply.Payload.IngressVips[1].IP)).To(Equal("8.8.8.1"))
 					})
 
-					It("Two APIVips and Two IngressVips - IPv6 - negative", func() {
+					It("Two APIVips and Two IngressVips - IPv6 - negative on cluster creation", func() {
 						apiVip := "2001:db8::1"
 						ingressVip := "2001:db8::2"
 						apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("2001:db8::3")}}
 						ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::4")}}
-						err := "the first element of apiVIPs must be an IPv4 address. got: 2001:db8::1"
+						err := "dual-stack apiVIPs must include exactly one IPv4 address"
 						reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 							NewClusterParams: &models.ClusterCreateParams{
 								Name:             swag.String("some-cluster-name"),
@@ -2626,7 +2886,7 @@ var _ = Describe("cluster", func() {
 				It("OLM invalid name", func() {
 					newOperatorName := "invalid-name"
 					mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-					mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+					mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 					mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 					mockOperatorManager.EXPECT().GetOperatorByName(newOperatorName).Return(nil, errors.Errorf("error")).Times(1)
 
@@ -2642,7 +2902,7 @@ var _ = Describe("cluster", func() {
 
 				It("should return error when both cnv and lvm operator enabled", func() {
 					mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-					mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+					mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 					mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 					mockOperatorManager.EXPECT().ResolveDependencies(gomock.Any(), gomock.Any()).
 						DoAndReturn(func(commonCluster *common.Cluster, operators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
@@ -2731,7 +2991,7 @@ var _ = Describe("cluster", func() {
 					clusterParams.Platform = &models.Platform{
 						Type: common.PlatformTypePtr(models.PlatformTypeNone),
 					}
-					clusterParams.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+					clusterParams.ControlPlaneCount = swag.Int64(1)
 					clusterParams.OlmOperators = []*models.OperatorCreateParams{
 						{Name: "lvm"},
 					}
@@ -2749,6 +3009,42 @@ var _ = Describe("cluster", func() {
 						}
 					}
 					Expect(foundExpected).Should(BeTrue())
+				})
+
+				It("V2RegisterCluster populates operator_bundles with bundle operators", func() {
+					mockClusterRegisterSuccess(true)
+					newOperatorName := testOLMOperators[0].Name
+
+					mockOperatorManager.EXPECT().GetOperatorByName(newOperatorName).Return(
+						&models.MonitoredOperator{
+							Name:         testOLMOperators[0].Name,
+							OperatorType: testOLMOperators[0].OperatorType,
+						}, nil).Times(1)
+					mockOperatorManager.EXPECT().ExpandBundleOperators("openshift-ai", []string{newOperatorName}, gomock.Any()).Return(
+						[]*models.OperatorCreateParams{{Name: newOperatorName}}, nil).Times(1)
+					mockOperatorManager.EXPECT().ResolveDependencies(gomock.Any(), gomock.Any()).
+						DoAndReturn(func(commonCluster *common.Cluster, operators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
+							return operators, nil
+						}).Times(1)
+					mockOperatorManager.EXPECT().EnsureOperatorPrerequisite(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+					mockOperatorManager.EXPECT().GetBundle("openshift-ai", nil).Return(&models.Bundle{
+						ID:                "openshift-ai",
+						Operators:         []string{},
+						OptionalOperators: []string{newOperatorName},
+					}, nil).AnyTimes()
+
+					clusterParams := getDefaultClusterCreateParams()
+					clusterParams.OperatorBundles = []*models.BundleCreateParams{
+						{ID: swag.String("openshift-ai"), OptionalOperators: []string{newOperatorName}},
+					}
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: clusterParams,
+					})
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					Expect(actual.Payload.OperatorBundles).To(HaveLen(1))
+					Expect(swag.StringValue(actual.Payload.OperatorBundles[0].ID)).To(Equal("openshift-ai"))
+					Expect(actual.Payload.OperatorBundles[0].OptionalOperators).To(ContainElement(newOperatorName))
 				})
 			})
 
@@ -2900,6 +3196,57 @@ var _ = Describe("cluster", func() {
 				}
 			})
 
+			It("V2UpdateCluster populates operator_bundles in response", func() {
+				clusterID = strfmt.UUID(uuid.New().String())
+				newOperatorName := testOLMOperators[0].Name
+				originalOperators := []*models.MonitoredOperator{
+					&common.TestDefaultConfig.MonitoredOperator,
+				}
+				cluster := &common.Cluster{Cluster: models.Cluster{
+					ID:                 &clusterID,
+					MonitoredOperators: originalOperators,
+					OpenshiftVersion:   common.TestDefaultConfig.OpenShiftVersion,
+					Platform:           &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)},
+					CPUArchitecture:    common.DefaultCPUArchitecture,
+				}}
+				err := db.Create(cluster).Error
+				Expect(err).ShouldNot(HaveOccurred())
+
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+				mockSuccess()
+				mockOperatorManager.EXPECT().GetOperatorByName(newOperatorName).Return(
+					&models.MonitoredOperator{
+						Name:         testOLMOperators[0].Name,
+						OperatorType: testOLMOperators[0].OperatorType,
+					}, nil).Times(1)
+				mockOperatorManager.EXPECT().ExpandBundleOperators("openshift-ai", []string{newOperatorName}, gomock.Any()).Return(
+					[]*models.OperatorCreateParams{{Name: newOperatorName}}, nil).Times(1)
+				mockOperatorManager.EXPECT().ResolveDependencies(gomock.Any(), gomock.Any()).
+					DoAndReturn(func(commonCluster *common.Cluster, operators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
+						return operators, nil
+					}).Times(1)
+				mockOperatorManager.EXPECT().EnsureOperatorPrerequisite(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				mockOperatorManager.EXPECT().GetBundle("openshift-ai", nil).Return(&models.Bundle{
+					ID:                "openshift-ai",
+					Operators:         []string{},
+					OptionalOperators: []string{newOperatorName},
+				}, nil).AnyTimes()
+
+				reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+					ClusterID: clusterID,
+					ClusterUpdateParams: &models.V2ClusterUpdateParams{
+						OperatorBundles: []*models.BundleCreateParams{
+							{ID: swag.String("openshift-ai"), OptionalOperators: []string{newOperatorName}},
+						},
+					},
+				})
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+				actual := reply.(*installer.V2UpdateClusterCreated)
+				Expect(actual.Payload.OperatorBundles).To(HaveLen(1))
+				Expect(swag.StringValue(actual.Payload.OperatorBundles[0].ID)).To(Equal("openshift-ai"))
+				Expect(actual.Payload.OperatorBundles[0].OptionalOperators).To(ContainElement(newOperatorName))
+			})
+
 			Context("Ensure CNV or LVM enabled", func() {
 				It("Replace CNV with LVM", func() {
 					// Setup
@@ -2916,7 +3263,7 @@ var _ = Describe("cluster", func() {
 						ID:                    &clusterID,
 						MonitoredOperators:    originalOperators,
 						OpenshiftVersion:      "4.12",
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeNone),
+						ControlPlaneCount:     1,
 						UserManagedNetworking: swag.Bool(true),
 						Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)},
 						CPUArchitecture:       common.DefaultCPUArchitecture,
@@ -3013,7 +3360,7 @@ var _ = Describe("cluster", func() {
 						Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)},
 						UserManagedNetworking: swag.Bool(false),
 						CPUArchitecture:       common.X86CPUArchitecture,
-						MachineNetworks:       []*models.MachineNetwork{{Cidr: "1.3.4.0/24"}},
+						MachineNetworks:       []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}},
 					}}
 					err := db.Create(cluster).Error
 					Expect(err).ShouldNot(HaveOccurred())
@@ -3070,9 +3417,9 @@ var _ = Describe("cluster", func() {
 					ingressVip := "1.2.3.101"
 					apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("8.8.8.8")}}
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("8.8.8.2")}}
-					err := "the second element of apiVIPs must be an IPv6 address. got: 8.8.8.8"
+					err := "dual-stack apiVIPs must include exactly one IPv6 address"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3094,68 +3441,27 @@ var _ = Describe("cluster", func() {
 					mockHostApi.EXPECT().RefreshInventory(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(3)
 					mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(3)
 					mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(3)
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					apiVip := "1.2.3.100"
 					ingressVip := "1.2.3.101"
 					apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("2001:db8::1")}}
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::2")}}
-
+					machineNetworks := []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}, {Cidr: "2001:db8::/64"}}
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
 						ClusterUpdateParams: &models.V2ClusterUpdateParams{
-							Name:        swag.String("some-cluster-name"),
-							PullSecret:  swag.String(fakePullSecret),
-							APIVips:     apiVips,
-							IngressVips: ingressVips,
+							Name:            swag.String("some-cluster-name"),
+							PullSecret:      swag.String(fakePullSecret),
+							APIVips:         apiVips,
+							IngressVips:     ingressVips,
+							MachineNetworks: machineNetworks,
 						},
 					})
 					Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 					cluster := reply.(*installer.V2UpdateClusterCreated).Payload
 					Expect(cluster.APIVips).To(Equal(apiVips))
 					Expect(cluster.IngressVips).To(Equal(ingressVips))
-				})
-
-				It("Two APIVips and Two ingressVips - IPv6 first and IPv4 second - negative", func() {
-					apiVip := "2001:db8::1"
-					ingressVip := "2001:db8::2"
-					apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("8.8.8.7")}}
-					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("8.8.8.1")}}
-					err := "the first element of apiVIPs must be an IPv4 address. got: 2001:db8::1"
-
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-
-					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
-						ClusterID: clusterID,
-						ClusterUpdateParams: &models.V2ClusterUpdateParams{
-							Name:        swag.String("some-cluster-name"),
-							PullSecret:  swag.String(fakePullSecret),
-							APIVips:     apiVips,
-							IngressVips: ingressVips,
-						},
-					})
-					verifyApiErrorString(reply, http.StatusBadRequest, err)
-				})
-
-				It("Two APIVips and Two ingressVips - IPv6 - negative", func() {
-					apiVip := "2001:db8::1"
-					ingressVip := "2001:db8::2"
-					apiVips := []*models.APIVip{{IP: models.IP(apiVip)}, {IP: models.IP("2001:db8::3")}}
-					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::4")}}
-					err := "the first element of apiVIPs must be an IPv4 address. got: 2001:db8::1"
-
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-
-					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
-						ClusterID: clusterID,
-						ClusterUpdateParams: &models.V2ClusterUpdateParams{
-							Name:        swag.String("some-cluster-name"),
-							PullSecret:  swag.String(fakePullSecret),
-							APIVips:     apiVips,
-							IngressVips: ingressVips,
-						},
-					})
-					verifyApiErrorString(reply, http.StatusBadRequest, err)
 				})
 
 				It("More than two APIVips and More than two ingressVips -  negative", func() {
@@ -3165,7 +3471,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::4")}, {IP: models.IP("8.8.8.4")}}
 					err := "apiVIPs supports 2 vips. got: 3"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3186,7 +3492,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("invalid ingressVip 2")}}
 					multiErr := "4 errors occurred:\n\t* Could not parse VIP ip invalid apiVip\n\t* Could not parse VIP ip invalid apiVip 2\n\t* Could not parse VIP ip invalid ingressVip\n\t* Could not parse VIP ip invalid ingressVip 2"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3207,7 +3513,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::4")}}
 					multiErr := "1 error occurred:\n\t* Could not parse VIP ip invalid apiVip\n"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3228,7 +3534,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}}
 					err := "configuration must include the same number of apiVIPs (got 2) and ingressVIPs (got 1)"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3249,7 +3555,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP("2001:db8::3")}}
 					err := "The IP address \"1.2.3.100\" appears multiple times in apiVIPs"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3270,7 +3576,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(ingressVip)}, {IP: models.IP(ingressVip)}}
 					err := "The IP address \"1.2.3.101\" appears multiple times in ingressVIPs"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3290,7 +3596,7 @@ var _ = Describe("cluster", func() {
 					ingressVips := []*models.IngressVip{{IP: models.IP(apiVip)}, {IP: models.IP("2001:db8::4")}}
 					err := "The IP address \"1.2.3.100\" appears both in apiVIPs and ingressVIPs"
 
-					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -3514,6 +3820,13 @@ var _ = Describe("cluster", func() {
 				_ = updateCluster("http://proxy.proxy", "", "proxy.proxy")
 			})
 
+			It("set a valid https proxy", func() {
+				mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.ProxySettingsChangedEventName),
+					eventstest.WithClusterIdMatcher(clusterID.String())))
+				_ = updateCluster("", "https://proxy.proxy", "")
+			})
+
 			It("set a valid noProxy wildcard", func() {
 				mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.ProxySettingsChangedEventName),
@@ -3657,7 +3970,7 @@ var _ = Describe("cluster", func() {
 					Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)},
 					UserManagedNetworking: swag.Bool(false),
 					CPUArchitecture:       common.X86CPUArchitecture,
-					HighAvailabilityMode:  swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+					ControlPlaneCount:     common.MinMasterHostsNeededForInstallationInHaMode,
 				}}
 				err := db.Create(cluster).Error
 				Expect(err).ShouldNot(HaveOccurred())
@@ -3687,7 +4000,7 @@ var _ = Describe("cluster", func() {
 					Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterID).Updates(map[string]interface{}{
 						"user_managed_networking": true,
 						"platform_type":           models.PlatformTypeNone,
-						"high_availability_mode":  models.ClusterHighAvailabilityModeNone,
+						"control_plane_count":     int64(1),
 						"cpu_architecture":        common.X86CPUArchitecture,
 						"openshift_version":       "4.10",
 					}).Error).ShouldNot(HaveOccurred())
@@ -3925,6 +4238,8 @@ var _ = Describe("cluster", func() {
 						ClusterUpdateParams: &models.V2ClusterUpdateParams{
 							UserManagedNetworking: swag.Bool(false),
 							VipDhcpAllocation:     swag.Bool(true),
+							APIVips:               []*models.APIVip{},
+							IngressVips:           []*models.IngressVip{},
 						},
 					})
 					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
@@ -3964,11 +4279,16 @@ var _ = Describe("cluster", func() {
 					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 
 					By("Update VIPS in DB cluster to mimic DHCP allocation")
-					cluster, err := common.GetClusterFromDB(db, clusterID, common.SkipEagerLoading)
-					Expect(err).ToNot(HaveOccurred())
-					cluster.APIVips = []*models.APIVip{{IP: models.IP(apiVip)}}
-					cluster.IngressVips = []*models.IngressVip{{IP: models.IP(ingressVip)}}
-					db.Save(&cluster)
+					db.Save(&models.APIVip{
+						ClusterID: clusterID,
+						IP:        models.IP(apiVip),
+					})
+					Expect(db.Error).ToNot(HaveOccurred())
+					db.Save(&models.IngressVip{
+						ClusterID: clusterID,
+						IP:        models.IP(ingressVip),
+					})
+					Expect(db.Error).ToNot(HaveOccurred())
 
 					By("Verify VIPs updates")
 					replay := bm.V2GetCluster(ctx, installer.V2GetClusterParams{ClusterID: clusterID}).(*installer.V2GetClusterOK)
@@ -4115,7 +4435,7 @@ var _ = Describe("cluster", func() {
 						CPUArchitecture:       common.ARM64CPUArchitecture,
 						UserManagedNetworking: swag.Bool(true),
 						Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)},
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
 						OpenshiftVersion:      "4.10",
 					}}).Error
 					Expect(err).ShouldNot(HaveOccurred())
@@ -4141,7 +4461,7 @@ var _ = Describe("cluster", func() {
 						OpenshiftVersion:      "4.11",
 						UserManagedNetworking: swag.Bool(true),
 						Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)},
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
 					}}).Error
 					Expect(err).ShouldNot(HaveOccurred())
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -4263,25 +4583,10 @@ var _ = Describe("cluster", func() {
 								masterHostId3,
 							}),
 						},
-						{
-							Cidr: "10.11.0.0/16",
-							HostIds: sortedHosts([]strfmt.UUID{
-								masterHostId1,
-								masterHostId2,
-							}),
-						},
-						{
-							Cidr: "7.8.9.0/24",
-							HostIds: []strfmt.UUID{
-								masterHostId3,
-							},
-						},
 					})
 					actualNetworks := sortedNetworks(actual.Payload.HostNetworks)
-					Expect(len(actualNetworks)).To(Equal(3))
+					Expect(len(actualNetworks)).To(Equal(1))
 					actualNetworks[0].HostIds = sortedHosts(actualNetworks[0].HostIds)
-					actualNetworks[1].HostIds = sortedHosts(actualNetworks[1].HostIds)
-					actualNetworks[2].HostIds = sortedHosts(actualNetworks[2].HostIds)
 					Expect(actualNetworks).To(Equal(expectedNetworks))
 				})
 
@@ -4298,7 +4603,27 @@ var _ = Describe("cluster", func() {
 						},
 					})
 					verifyApiErrorString(reply, http.StatusBadRequest,
-						"Setting Machine network CIDR is forbidden when cluster is not in vip-dhcp-allocation mode")
+						"Setting the Machine Network CIDR is forbidden when the cluster is neither in VIP DHCP allocation mode nor using a user-managed load balancer")
+				})
+				It("Machine network CIDR in non dhcp non interactive", func() {
+					mockClusterUpdatability(2)
+					mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+					setAndCheck := func(cidr models.Subnet) {
+						_, err := bm.UpdateClusterNonInteractive(ctx, installer.V2UpdateClusterParams{
+							ClusterID: clusterID,
+							ClusterUpdateParams: &models.V2ClusterUpdateParams{
+								MachineNetworks: []*models.MachineNetwork{{Cidr: cidr}},
+							},
+						}, nil)
+						Expect(err).ToNot(HaveOccurred())
+						var machineNetworks []*models.MachineNetwork
+						Expect(db.Where("cluster_id = ?", clusterID).Find(&machineNetworks).Error).ToNot(HaveOccurred())
+						Expect(machineNetworks).To(HaveLen(1))
+						Expect(machineNetworks[0].Cidr).To(Equal(cidr))
+					}
+					setAndCheck("10.11.0.0/16")
+					setAndCheck("1.2.3.0/24")
 				})
 
 				It("Machine network CIDR in non dhcp for dual-stack", func() {
@@ -4345,7 +4670,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{{Cidr: "fd2e:6f44:5dd8:c956::/120"}, {Cidr: "10.12.0.0/16"}},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "First machine network has to be IPv4 subnet")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Inconsistent IP family order: machine_networks first IP is fd2e:6f44:5dd8:c956::/120 but existing primary IP stack is IPv4. All networks must have the same IP family first")
 				})
 				It("API VIP in wrong subnet for dual-stack", func() {
 					apiVip := "10.11.12.15"
@@ -4407,25 +4732,10 @@ var _ = Describe("cluster", func() {
 								masterHostId3,
 							}),
 						},
-						{
-							Cidr: "10.11.0.0/16",
-							HostIds: sortedHosts([]strfmt.UUID{
-								masterHostId1,
-								masterHostId2,
-							}),
-						},
-						{
-							Cidr: "7.8.9.0/24",
-							HostIds: []strfmt.UUID{
-								masterHostId3,
-							},
-						},
 					})
 					actualNetworks := sortedNetworks(actual.Payload.HostNetworks)
-					Expect(len(actualNetworks)).To(Equal(3))
+					Expect(len(actualNetworks)).To(Equal(1))
 					actualNetworks[0].HostIds = sortedHosts(actualNetworks[0].HostIds)
-					actualNetworks[1].HostIds = sortedHosts(actualNetworks[1].HostIds)
-					actualNetworks[2].HostIds = sortedHosts(actualNetworks[2].HostIds)
 					Expect(actualNetworks).To(Equal(expectedNetworks))
 				})
 				Context("Overlapping", func() {
@@ -4523,9 +4833,9 @@ var _ = Describe("cluster", func() {
 			Context("DHCP", func() {
 
 				var (
-					apiVip             = "10.11.12.15"
-					ingressVip         = "10.11.12.16"
-					primaryMachineCIDR = models.Subnet("10.11.0.0/16")
+					apiVip             = "1.2.3.15"
+					ingressVip         = "1.2.3.16"
+					primaryMachineCIDR = models.Subnet("1.2.3.0/24")
 				)
 
 				verifyMachineCIDRTimestampUpdated := func(beforeTimestamp time.Time) {
@@ -4583,25 +4893,10 @@ var _ = Describe("cluster", func() {
 									masterHostId3,
 								}),
 							},
-							{
-								Cidr: "10.11.0.0/16",
-								HostIds: sortedHosts([]strfmt.UUID{
-									masterHostId1,
-									masterHostId2,
-								}),
-							},
-							{
-								Cidr: "7.8.9.0/24",
-								HostIds: []strfmt.UUID{
-									masterHostId3,
-								},
-							},
 						})
 						actualNetworks := sortedNetworks(actual.Payload.HostNetworks)
-						Expect(len(actualNetworks)).To(Equal(3))
+						Expect(len(actualNetworks)).To(Equal(1))
 						actualNetworks[0].HostIds = sortedHosts(actualNetworks[0].HostIds)
-						actualNetworks[1].HostIds = sortedHosts(actualNetworks[1].HostIds)
-						actualNetworks[2].HostIds = sortedHosts(actualNetworks[2].HostIds)
 						Expect(actualNetworks).To(Equal(expectedNetworks))
 					})
 
@@ -4943,7 +5238,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster network CIDR : Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Empty networks - invalid CIDR, ClusterNetwork", func() {
@@ -4955,19 +5250,19 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster network CIDR : Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Empty networks - invalid HostPrefix, ClusterNetwork", func() {
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
 						ClusterUpdateParams: &models.V2ClusterUpdateParams{
-							ClusterNetworks: []*models.ClusterNetwork{{HostPrefix: 0}},
+							ClusterNetworks: []*models.ClusterNetwork{{HostPrefix: 0, Cidr: "1.2.0.0/24"}},
 							ServiceNetworks: []*models.ServiceNetwork{},
 							MachineNetworks: []*models.MachineNetwork{},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster network CIDR : Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Cluster network host prefix 0: Host prefix, now 0, must be a positive integer")
 				})
 
 				It("Empty networks - invalid empty ServiceNetwork", func() {
@@ -4979,7 +5274,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Service network CIDR : Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Service Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Empty networks - invalid CIDR, ServiceNetwork", func() {
@@ -4991,7 +5286,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Service network CIDR : Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Service Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Empty networks - invalid empty MachineNetwork", func() {
@@ -5003,7 +5298,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{{}},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Machine network CIDR '': Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Machine Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Empty networks - invalid CIDR, MachineNetwork", func() {
@@ -5015,7 +5310,7 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{{Cidr: ""}},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Machine network CIDR '': Failed to parse CIDR '': invalid CIDR address: ")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Machine Network CIDR cannot be empty (index 0)")
 				})
 
 				It("Multiple machine networks illegal for single-stack", func() {
@@ -5025,7 +5320,22 @@ var _ = Describe("cluster", func() {
 							MachineNetworks: []*models.MachineNetwork{{Cidr: "15.15.0.0/21"}, {Cidr: "16.16.0.0/21"}},
 						},
 					})
-					verifyApiErrorString(reply, http.StatusBadRequest, "Single-stack cluster cannot contain multiple Machine Networks")
+					verifyApiErrorString(reply, http.StatusBadRequest, "Single-stack cluster with managed load balancer cannot contain multiple Machine Networks")
+				})
+
+				It("Multiple machine networks allowed for single-stack cluster with user-managed networking", func() {
+					Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterID).Updates(map[string]interface{}{
+						"user_managed_networking": true,
+						"platform_type":           models.PlatformTypeNone,
+					}).Error).ShouldNot(HaveOccurred())
+					mockSuccess(1)
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							MachineNetworks: []*models.MachineNetwork{{Cidr: "15.15.0.0/21"}, {Cidr: "16.16.0.0/21"}},
+						},
+					})
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 				})
 
 				It("Override networks - additional cluster subnet", func() {
@@ -5101,6 +5411,12 @@ var _ = Describe("cluster", func() {
 			})
 
 			Context("Multiple VIPs forbidden in update for pre-4.12", func() {
+				pre412Version := "4.11"
+
+				BeforeEach(func() {
+					Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("openshift_version", pre412Version).Error).ShouldNot(HaveOccurred())
+				})
+
 				It("2 APIVips and 2 IngressVips", func() {
 					apiVip := "8.8.8.7"
 					ingressVip := "8.8.8.1"
@@ -5115,7 +5431,7 @@ var _ = Describe("cluster", func() {
 						},
 					})
 
-					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift 4.6")
+					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift "+pre412Version)
 				})
 
 				It("2 APIVips and 1 IngressVips", func() {
@@ -5132,7 +5448,7 @@ var _ = Describe("cluster", func() {
 						},
 					})
 
-					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift 4.6")
+					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift "+pre412Version)
 				})
 
 				It("1 APIVip and 2 IngressVips", func() {
@@ -5149,7 +5465,7 @@ var _ = Describe("cluster", func() {
 						},
 					})
 
-					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift 4.6")
+					verifyApiErrorString(reply, http.StatusBadRequest, "dual-stack VIPs are not supported in OpenShift "+pre412Version)
 				})
 			})
 		})
@@ -5160,11 +5476,11 @@ var _ = Describe("cluster", func() {
 		It("Fail to create Cluster with a wildcard noProxy", func() {
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: &models.ClusterCreateParams{
-					Name:                 swag.String("some-cluster-name"),
-					OpenshiftVersion:     swag.String("4.8.0-fc.1"),
-					NoProxy:              swag.String("*"),
-					PullSecret:           swag.String(fakePullSecret),
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					Name:              swag.String("some-cluster-name"),
+					OpenshiftVersion:  swag.String("4.8.0-fc.1"),
+					NoProxy:           swag.String("*"),
+					PullSecret:        swag.String(fakePullSecret),
+					ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 				},
 			})
 
@@ -5247,6 +5563,7 @@ var _ = Describe("cluster", func() {
 			ID:               &clusterID,
 			APIVips:          []*models.APIVip{{IP: "10.11.12.13"}},
 			IngressVips:      []*models.IngressVip{{IP: "10.11.20.50"}},
+			CPUArchitecture:  common.DefaultCPUArchitecture,
 			OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
 			Status:           swag.String(models.ClusterStatusReady),
 		}}
@@ -5255,6 +5572,7 @@ var _ = Describe("cluster", func() {
 			ID:               &clusterID,
 			APIVips:          []*models.APIVip{{IP: "10.11.12.13"}},
 			IngressVips:      []*models.IngressVip{{IP: "10.11.20.50"}},
+			CPUArchitecture:  common.DefaultCPUArchitecture,
 			OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
 			Status:           swag.String(models.ClusterStatusInstalling),
 		},
@@ -5283,18 +5601,11 @@ var _ = Describe("cluster", func() {
 			mockClusterRefreshStatus(mockClusterApi)
 			mockClusterDeleteLogsSuccess(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 			mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.IgnitionConfigImageGeneratedEventName),
 				eventstest.WithClusterIdMatcher(clusterID.String()),
 				eventstest.WithSeverityMatcher(models.EventSeverityInfo))).MinTimes(0)
-
-			err := db.Model(&models.Cluster{}).Where("id = ?", clusterID).Updates(&models.Cluster{
-				LastInstallationPreparation: models.LastInstallationPreparation{
-					Status: models.LastInstallationPreparationStatusFailed,
-					Reason: "Testing clear of failure reason on installation start",
-				},
-			}).Error
-			Expect(err).ShouldNot(HaveOccurred())
 
 			reply := bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
 				ClusterID: clusterID,
@@ -5305,11 +5616,6 @@ var _ = Describe("cluster", func() {
 
 			count := db.Model(&models.Cluster{}).Where("openshift_cluster_id <> ''").First(&models.Cluster{}).RowsAffected
 			Expect(count).To(Equal(int64(1)))
-
-			cluster, err := common.GetClusterFromDBWhere(db, common.UseEagerLoading, common.DeleteRecordsState(false), "id = ? AND last_installation_preparation_status = ?", clusterID, models.LastInstallationPreparationStatusNotStarted)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(cluster.LastInstallationPreparation.Status).To(Equal(models.LastInstallationPreparationStatusNotStarted))
-			Expect(cluster.LastInstallationPreparation.Reason).To(Equal("Preparation never performed"))
 		})
 
 		It("Should send event in case of ignored validations", func() {
@@ -5331,6 +5637,7 @@ var _ = Describe("cluster", func() {
 				mockClusterRefreshStatus(mockClusterApi)
 				mockClusterDeleteLogsSuccess(mockClusterApi)
 				mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+				mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 				mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.IgnitionConfigImageGeneratedEventName),
 					eventstest.WithClusterIdMatcher(clusterID.String()),
@@ -5364,6 +5671,57 @@ var _ = Describe("cluster", func() {
 				reason := reply.(*installer.V2SetIgnoredValidationsBadRequest).Payload.Reason
 				Expect(*reason).To(ContainSubstring("wrong state"))
 			})
+		})
+
+		Describe("SetIgnoredValidationsInternal", func() {
+			type rejectionCase struct {
+				name                   string
+				clusterStatus          string
+				updatabilityError      error
+				ignoredValidations     string
+				expectedErrorSubstring string
+			}
+
+			cases := []rejectionCase{
+				{
+					name:                   "rejects unknown cluster validation IDs",
+					clusterStatus:          models.ClusterStatusReady,
+					updatabilityError:      nil,
+					ignoredValidations:     `["not-a-real-validation"]`,
+					expectedErrorSubstring: "Validation ID 'not-a-real-validation' is not a known cluster validation",
+				},
+				{
+					name:                   "rejects non-ignorable cluster validations",
+					clusterStatus:          models.ClusterStatusReady,
+					updatabilityError:      nil,
+					ignoredValidations:     `["pull-secret-set"]`,
+					expectedErrorSubstring: "unable to ignore the following cluster validations (pull-secret-set)",
+				},
+				{
+					name:                   "rejects updates when the cluster is not updatable",
+					clusterStatus:          models.ClusterStatusPreparingForInstallation,
+					updatabilityError:      errors.Errorf("wrong state"),
+					ignoredValidations:     `["dns-domain-defined"]`,
+					expectedErrorSubstring: "wrong state",
+				},
+			}
+
+			for i := range cases {
+				tc := cases[i]
+				It(tc.name, func() {
+					cluster := &common.Cluster{Cluster: models.Cluster{
+						ID:               &clusterID,
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						Status:           swag.String(tc.clusterStatus),
+					}}
+					createCluster(cluster)
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(tc.updatabilityError).Times(1)
+
+					err := bm.SetIgnoredValidationsInternal(ctx, *cluster.ID, tc.ignoredValidations, "")
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring(tc.expectedErrorSubstring))
+				})
+			}
 		})
 
 		Describe("V2GetClusterUISettings", func() {
@@ -5442,9 +5800,9 @@ var _ = Describe("cluster", func() {
 				URL: swag.String("quay.io/openshift-release-dev/ocp-release:4.6.16-aarch64"),
 			}
 			mockGetInstallConfigSuccess(mockInstallConfigBuilder)
-			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), common.ARM64CPUArchitecture, gomock.Any()).Return(armRelease, nil).Times(1)
+			mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), common.ARM64CPUArchitecture).Return(armRelease, nil).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), common.DefaultCPUArchitecture, gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-			mockGenerator.EXPECT().GenerateInstallConfig(gomock.Any(), gomock.Any(), gomock.Any(), *armRelease.URL, *common.TestDefaultConfig.ReleaseImage.URL).Return(nil).Times(1)
+			mockGenerator.EXPECT().GenerateInstallConfig(gomock.Any(), gomock.Any(), gomock.Any(), *armRelease.URL, *common.TestDefaultConfig.ReleaseImage.URL, false).Return(nil).Times(1)
 
 			mockClusterPrepareForInstallationSuccess(mockClusterApi)
 			mockHostPrepareForRefresh(mockHostApi)
@@ -5455,6 +5813,7 @@ var _ = Describe("cluster", func() {
 			mockClusterRefreshStatus(mockClusterApi)
 			mockClusterDeleteLogsSuccess(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 			mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.IgnitionConfigImageGeneratedEventName),
 				eventstest.WithClusterIdMatcher(clusterID.String()),
@@ -5503,7 +5862,7 @@ var _ = Describe("cluster", func() {
 				URL: swag.String("quay.io/openshift-release-dev/ocp-release:4.6.16-aarch64"),
 			}
 			mockGetInstallConfigSuccess(mockInstallConfigBuilder)
-			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), common.ARM64CPUArchitecture, gomock.Any()).Return(armRelease, nil).Times(1)
+			mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), common.ARM64CPUArchitecture).Return(armRelease, nil).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), common.DefaultCPUArchitecture, gomock.Any()).Return(nil, errors.Errorf("Dummy")).Times(1)
 
 			mockClusterPrepareForInstallationSuccess(mockClusterApi)
@@ -5514,6 +5873,7 @@ var _ = Describe("cluster", func() {
 			mockClusterRefreshStatus(mockClusterApi)
 			mockClusterDeleteLogsSuccess(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 			mockClusterApi.EXPECT().HandlePreInstallError(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Do(func(ctx, c, err interface{}) { DoneChannel <- 1 })
 
 			_ = bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
@@ -5552,6 +5912,7 @@ var _ = Describe("cluster", func() {
 			mockClusterRefreshStatus(mockClusterApi)
 			setIsReadyForInstallationTrue(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			reply := bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
 				ClusterID: clusterID,
@@ -5568,6 +5929,7 @@ var _ = Describe("cluster", func() {
 			mockClusterRefreshStatus(mockClusterApi)
 			setIsReadyForInstallationFalse(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			Expect(db.Model(&common.Cluster{Cluster: models.Cluster{ID: &clusterID}}).UpdateColumn("status", "insufficient").Error).To(Not(HaveOccurred()))
 			reply := bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
@@ -5580,6 +5942,7 @@ var _ = Describe("cluster", func() {
 			createCluster(defaultCluster)
 			mockFalseAutoAssignSuccess(3)
 			setIsReadyForInstallationFalse(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			Expect(db.Model(&common.Cluster{Cluster: models.Cluster{ID: &clusterID}}).UpdateColumn("status", "insufficient").Error).To(Not(HaveOccurred()))
 			reply := bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
@@ -5597,6 +5960,7 @@ var _ = Describe("cluster", func() {
 			mockClusterPrepareForInstallationSuccess(mockClusterApi)
 			setIsReadyForInstallationTrue(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			mockClusterApi.EXPECT().GetMasterNodesIds(gomock.Any(), gomock.Any(), gomock.Any()).
 				Return([]*strfmt.UUID{}, nil).Times(1)
@@ -5618,6 +5982,7 @@ var _ = Describe("cluster", func() {
 			mockClusterPrepareForInstallationSuccess(mockClusterApi)
 			setIsReadyForInstallationTrue(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			reply := bm.V2InstallCluster(ctx, installer.V2InstallClusterParams{
 				ClusterID: clusterID,
@@ -5634,6 +5999,7 @@ var _ = Describe("cluster", func() {
 			mockClusterPrepareForInstallationSuccess(mockClusterApi)
 			setIsReadyForInstallationTrue(mockClusterApi)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 
 			mockClusterApi.EXPECT().GetMasterNodesIds(gomock.Any(), gomock.Any(), gomock.Any()).
 				Return([]*strfmt.UUID{&masterHostId1, &masterHostId2, &masterHostId3}, errors.Errorf("nop"))
@@ -5663,6 +6029,8 @@ var _ = Describe("cluster", func() {
 			mockClusterDeleteLogsFailure(mockClusterApi)
 			mockHandlePreInstallationSuccess(mockClusterApi, DoneChannel)
 			mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+			mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
+
 			mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.IgnitionConfigImageGeneratedEventName),
 				eventstest.WithClusterIdMatcher(clusterID.String()),
@@ -5816,7 +6184,7 @@ var _ = Describe("cluster", func() {
 	})
 })
 
-var _ = Describe("V2ClusterUpdate cluster", func() {
+var _ = Describe("V2UpdateCluster", func() {
 
 	masterHostId1 := strfmt.UUID(uuid.New().String())
 	masterHostId3 := strfmt.UUID(uuid.New().String())
@@ -5886,12 +6254,12 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 		mockClusterUpdateSuccess(1, 0)
 	}
 
-	Context("Update", func() {
+	Context("update", func() {
 		BeforeEach(func() {
 			mockDurationsSuccess()
 		})
 
-		Context("Single node", func() {
+		Context("single node cluster", func() {
 			var cluster *common.Cluster
 			BeforeEach(func() {
 				clusterID = strfmt.UUID(uuid.New().String())
@@ -5915,7 +6283,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 			JustBeforeEach(func() {
 				Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterID).Updates(map[string]interface{}{
 					"user_managed_networking": true,
-					"high_availability_mode":  models.ClusterHighAvailabilityModeNone,
+					"control_plane_count":     int64(1),
 					"platform_type":           models.PlatformTypeNone,
 					"cpu_architecture":        common.X86CPUArchitecture,
 				}).Error).ShouldNot(HaveOccurred())
@@ -5998,7 +6366,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
 					cluster = &common.Cluster{Cluster: models.Cluster{
 						ID:                    &clusterID,
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
 						UserManagedNetworking: swag.Bool(false),
 						OpenshiftVersion:      "4.14",
 						CPUArchitecture:       common.DefaultCPUArchitecture,
@@ -6275,7 +6643,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 						clusterID = strfmt.UUID(uuid.New().String())
 						err := db.Create(&common.Cluster{Cluster: models.Cluster{
 							ID:                    &clusterID,
-							HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeNone),
+							ControlPlaneCount:     1,
 							UserManagedNetworking: swag.Bool(true),
 							Platform: &models.Platform{
 								Type: common.PlatformTypePtr(models.PlatformTypeNone),
@@ -6706,7 +7074,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
 					cluster = &common.Cluster{Cluster: models.Cluster{
 						ID:                    &clusterID,
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.MinMasterHostsNeededForInstallationInHaMode,
 						UserManagedNetworking: swag.Bool(true),
 						Platform: &models.Platform{
 							Type: common.PlatformTypePtr(models.PlatformTypeNone),
@@ -7001,7 +7369,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 					cluster = &common.Cluster{Cluster: models.Cluster{
 						ID:                    &clusterID,
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.MinMasterHostsNeededForInstallationInHaMode,
 						UserManagedNetworking: swag.Bool(true),
 						Platform: &models.Platform{
 							Type: common.PlatformTypePtr(models.PlatformTypeExternal),
@@ -7363,7 +7731,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 						clusterID = strfmt.UUID(uuid.New().String())
 						err := db.Create(&common.Cluster{Cluster: models.Cluster{
 							ID:                    &clusterID,
-							HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeNone),
+							ControlPlaneCount:     1,
 							UserManagedNetworking: swag.Bool(true),
 							Platform: &models.Platform{
 								Type: common.PlatformTypePtr(models.PlatformTypeExternal),
@@ -7430,7 +7798,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
 					cluster = &common.Cluster{Cluster: models.Cluster{
 						ID:                    &clusterID,
-						HighAvailabilityMode:  swag.String(models.ClusterHighAvailabilityModeFull),
+						ControlPlaneCount:     common.MinMasterHostsNeededForInstallationInHaMode,
 						UserManagedNetworking: swag.Bool(false),
 						Platform: &models.Platform{
 							Type: common.PlatformTypePtr(models.PlatformTypeNutanix),
@@ -7664,10 +8032,10 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 		Context("Feature compatibility", func() {
 			Context("OCP Version 4.13", func() {
 
-				createCluster := func(clusterId strfmt.UUID, cpuArchitecture, openshiftVersion string, platformType models.PlatformType, umn bool, highAvailabilityMode string) {
+				createCluster := func(clusterId strfmt.UUID, cpuArchitecture, openshiftVersion string, platformType models.PlatformType, umn bool, controlPlaneCount int64) {
 					cluster := &common.Cluster{Cluster: models.Cluster{
 						ID:                    &clusterId,
-						HighAvailabilityMode:  swag.String(highAvailabilityMode),
+						ControlPlaneCount:     controlPlaneCount,
 						UserManagedNetworking: swag.Bool(umn),
 						OpenshiftVersion:      openshiftVersion,
 						Platform: &models.Platform{
@@ -7692,14 +8060,14 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 					Expect(db.Create(infraEnv).Error).ToNot(HaveOccurred())
 				}
 
-				createClusterWithInfraEnv := func(clusterId strfmt.UUID, cpuArchitecture, openshiftVersion string, platformType models.PlatformType, umn bool, highAvailabilityMode string) {
-					createCluster(clusterID, cpuArchitecture, openshiftVersion, platformType, umn, highAvailabilityMode)
+				createClusterWithInfraEnv := func(clusterId strfmt.UUID, cpuArchitecture, openshiftVersion string, platformType models.PlatformType, umn bool, controlPlaneCount int64) {
+					createCluster(clusterID, cpuArchitecture, openshiftVersion, platformType, umn, controlPlaneCount)
 					createInfraEnv(clusterID, cpuArchitecture)
 				}
 
 				It("s390x with SNO - compatible on 4.13", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.13", models.PlatformTypeNone, true, models.ClusterHighAvailabilityModeNone)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.13", models.PlatformTypeNone, true, 1)
 					mockSuccess()
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -7711,12 +8079,12 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 					Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 					actual := reply.(*installer.V2UpdateClusterCreated).Payload
-					Expect(swag.StringValue(actual.HighAvailabilityMode)).To(Equal(models.ClusterHighAvailabilityModeNone))
+					Expect(actual.ControlPlaneCount).To(Equal(int64(1)))
 				})
 
 				It("s390x with SNO - incompatible on 4.12", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.12", models.PlatformTypeNone, true, models.ClusterHighAvailabilityModeNone)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.12", models.PlatformTypeNone, true, 1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -7729,7 +8097,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 				It("ppc64le with SNO - compatible on 4.13", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.13", models.PlatformTypeNone, true, models.ClusterHighAvailabilityModeNone)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.13", models.PlatformTypeNone, true, 1)
 					mockSuccess()
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -7741,12 +8109,12 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 					Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
 					actual := reply.(*installer.V2UpdateClusterCreated).Payload
-					Expect(swag.StringValue(actual.HighAvailabilityMode)).To(Equal(models.ClusterHighAvailabilityModeNone))
+					Expect(actual.ControlPlaneCount).To(Equal(int64(1)))
 				})
 
 				It("ppc64le with SNO - incompatible on 4.12", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.12", models.PlatformTypeNone, true, models.ClusterHighAvailabilityModeNone)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.12", models.PlatformTypeNone, true, 1)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -7759,7 +8127,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 				It("update ClusterManagedNetworking with s390x - incompatible", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.13", models.PlatformTypeBaremetal, false, models.ClusterHighAvailabilityModeFull)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureS390x, "4.13", models.PlatformTypeBaremetal, false, common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -7772,7 +8140,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 				It("update ClusterManagedNetworking with arm64 - compatible", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureArm64, "4.13", models.PlatformTypeBaremetal, false, models.ClusterHighAvailabilityModeFull)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitectureArm64, "4.13", models.PlatformTypeBaremetal, false, common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)
 					mockSuccess()
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -7789,7 +8157,7 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 				It("update CNV operators with ppc64le - incompatible", func() {
 					clusterID = strfmt.UUID(uuid.New().String())
-					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.13", models.PlatformTypeNone, true, models.ClusterHighAvailabilityModeFull)
+					createClusterWithInfraEnv(clusterID, models.ClusterCPUArchitecturePpc64le, "4.13", models.PlatformTypeNone, true, common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)
 
 					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
 						ClusterID: clusterID,
@@ -7804,6 +8172,528 @@ var _ = Describe("V2ClusterUpdate cluster", func() {
 
 			})
 		})
+
+		Context("control_plane_count", func() {
+			Context("should succeed", func() {
+
+				BeforeEach(func() {
+					mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+					mockDetectAndStoreCollidingIPsForCluster(mockClusterApi, 1)
+					mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				})
+
+				It("when using nil value", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                &clusterID,
+							ControlPlaneCount: common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+							OpenshiftVersion:  "4.16",
+						}}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID:           clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+				})
+
+				It("not changing the value", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                &clusterID,
+							OpenshiftVersion:  "4.16",
+							ControlPlaneCount: common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+
+					var newCluster *common.Cluster
+					err = db.Where("id = ?", clusterID).Take(&newCluster).Error
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(newCluster.ControlPlaneCount).To(BeEquivalentTo(3))
+				})
+
+				It("increasing to 4 control planes with OCP >= 4.18 the value and multi-node", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                &clusterID,
+							OpenshiftVersion:  "4.18",
+							ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(4),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+
+					var newCluster *common.Cluster
+					err = db.Where("id = ?", clusterID).Take(&newCluster).Error
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(newCluster.ControlPlaneCount).To(BeEquivalentTo(4))
+				})
+
+				It(fmt.Sprintf("descreasing to 3 control planes with OCP >= %s the value and multi-node", common.MinimumVersionForNonStandardHAOCPControlPlane), func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                &clusterID,
+							OpenshiftVersion:  "4.18",
+							ControlPlaneCount: 4,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).Times(1)
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+
+					var newCluster *common.Cluster
+					err = db.Where("id = ?", clusterID).Take(&newCluster).Error
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(newCluster.ControlPlaneCount).To(BeEquivalentTo(3))
+				})
+			})
+
+			Context("should fail", func() {
+				It("update to invalid value, non-standard HA OCP Control Plane not supported", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                   &clusterID,
+							OpenshiftVersion:     "4.16",
+							HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+							ControlPlaneCount:    common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(4),
+						},
+					})
+
+					verifyApiErrorString(reply, http.StatusBadRequest, "there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18")
+				})
+
+				It("update to invalid value, non-standard HA OCP Control Plane supported", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                   &clusterID,
+							OpenshiftVersion:     "4.18",
+							HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+							ControlPlaneCount:    common.MinMasterHostsNeededForInstallationInHaMode,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(6),
+						},
+					})
+
+					verifyApiErrorString(reply, http.StatusBadRequest, "there should be 3-5 dedicated control plane nodes for high availability mode Full in openshift version 4.18 or newer")
+				})
+
+				It("update amount to != 1 when SNO", func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                   &clusterID,
+							OpenshiftVersion:     "4.16",
+							HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
+							ControlPlaneCount:    1,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+						},
+					})
+
+					verifyApiErrorString(reply, http.StatusBadRequest, "single-node clusters must have a single control plane node")
+				})
+
+				It(fmt.Sprintf("update amount to != 3 when multi-node, OCP version < %s", common.MinimumVersionForNonStandardHAOCPControlPlane), func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                   &clusterID,
+							OpenshiftVersion:     "4.16",
+							HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+							ControlPlaneCount:    common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(4),
+						},
+					})
+
+					verifyApiErrorString(
+						reply,
+						http.StatusBadRequest,
+						"there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18",
+					)
+				})
+
+				It(fmt.Sprintf("update amount to != 3 when multi-node, OCP version >= %s", common.MinimumVersionForNonStandardHAOCPControlPlane), func() {
+					cluster := &common.Cluster{
+						Cluster: models.Cluster{
+							ID:                   &clusterID,
+							OpenshiftVersion:     "4.18",
+							HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+							ControlPlaneCount:    4,
+						},
+					}
+
+					err := db.Create(cluster).Error
+					Expect(err).ShouldNot(HaveOccurred())
+
+					reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+						ClusterID: clusterID,
+						ClusterUpdateParams: &models.V2ClusterUpdateParams{
+							ControlPlaneCount: swag.Int64(1),
+						},
+					})
+
+					verifyApiErrorString(
+						reply,
+						http.StatusBadRequest,
+						"there should be 3-5 dedicated control plane nodes for high availability mode Full in openshift version 4.18 or newer",
+					)
+				})
+			})
+		})
+	})
+
+	Context("load_balancer", func() {
+		BeforeEach(func() {
+
+		})
+
+		DescribeTable("different update scenarios for focused on load balancer type with machine networks and vips", func(
+			clusterLoadBalancer *models.LoadBalancer,
+			newLoadBalancer *models.LoadBalancer,
+			clusterAPIVIPs []*models.APIVip,
+			newAPIVIPs []*models.APIVip,
+			clusterIngressVIPs []*models.IngressVip,
+			newIngressVIPs []*models.IngressVip,
+			clusterMachineNetworks []*models.MachineNetwork,
+			newMachineNetworks []*models.MachineNetwork,
+			errString *string,
+		) {
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &clusterID,
+					OpenshiftVersion: common.MinimumVersionForUserManagedLoadBalancerFeature,
+					Platform: &models.Platform{
+						Type: models.PlatformTypeBaremetal.Pointer(),
+					},
+					CPUArchitecture: common.X86CPUArchitecture,
+					Hosts: []*models.Host{
+						{
+							ID: &masterHostId1,
+							Inventory: common.GenerateTestInventoryWithNetwork(
+								common.NetAddress{
+									IPv4Address: []string{"192.168.127.12/24"},
+								},
+							)},
+					},
+					LoadBalancer:    clusterLoadBalancer,
+					MachineNetworks: clusterMachineNetworks,
+					APIVips:         clusterAPIVIPs,
+					IngressVips:     clusterIngressVIPs,
+				},
+			}
+			err := db.Create(cluster).Error
+			Expect(err).ShouldNot(HaveOccurred())
+
+			mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster)).Return(nil).AnyTimes()
+			if errString == nil {
+				mockDetectAndStoreCollidingIPsForCluster(mockClusterApi, 1)
+				mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockSetConnectivityMajorityGroupsForCluster(mockClusterApi)
+				mockHostApi.EXPECT().RefreshInventory(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			}
+
+			reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					LoadBalancer:    newLoadBalancer,
+					APIVips:         newAPIVIPs,
+					IngressVips:     newIngressVIPs,
+					MachineNetworks: newMachineNetworks,
+				},
+			})
+
+			if errString != nil {
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					*errString,
+				)
+				return
+			}
+
+			Expect(reply).To(BeAssignableToTypeOf(installer.NewV2UpdateClusterCreated()))
+			actual := reply.(*installer.V2UpdateClusterCreated)
+			responseCluster := actual.Payload
+
+			if newLoadBalancer != nil {
+				Expect(responseCluster.LoadBalancer).ToNot(BeNil())
+				Expect(responseCluster.LoadBalancer.Type).To(BeEquivalentTo(newLoadBalancer.Type))
+			} else {
+				Expect(responseCluster.LoadBalancer).To(Equal(clusterLoadBalancer))
+			}
+
+			if newAPIVIPs != nil {
+				Expect(len(responseCluster.APIVips)).To(Equal(len(newAPIVIPs)))
+				Expect(*responseCluster.APIVips[0]).To(Equal(*newAPIVIPs[0]))
+			} else {
+				if clusterAPIVIPs == nil {
+					Expect(responseCluster.APIVips).To(Equal([]*models.APIVip{}))
+				} else {
+					Expect(responseCluster.APIVips).To(Equal(clusterAPIVIPs))
+				}
+			}
+
+			if newIngressVIPs != nil {
+				Expect(len(responseCluster.IngressVips)).To(Equal(len(newIngressVIPs)))
+				Expect(*responseCluster.IngressVips[0]).To(Equal(*newIngressVIPs[0]))
+			} else {
+				if clusterIngressVIPs == nil {
+					Expect(responseCluster.IngressVips).To(Equal([]*models.IngressVip{}))
+				} else {
+					Expect(responseCluster.IngressVips).To(Equal(clusterIngressVIPs))
+				}
+			}
+
+			if newMachineNetworks != nil {
+				Expect(len(responseCluster.MachineNetworks)).To(Equal(len(newMachineNetworks)))
+				for k := range newMachineNetworks {
+					Expect(*responseCluster.MachineNetworks[k]).To(Equal(*newMachineNetworks[k]))
+				}
+			} else {
+				if clusterMachineNetworks == nil {
+					Expect(responseCluster.MachineNetworks).To(Equal([]*models.MachineNetwork{}))
+				} else {
+					Expect(responseCluster.MachineNetworks).To(Equal(cluster.MachineNetworks))
+				}
+			}
+		},
+			Entry("update load_balancer type to user-managed when it is nil should succeed",
+				nil,
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("update load_balancer type to user-managed when it is cluster-managed should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("update load_balancer type to cluster-managed when it is nil should succeed",
+				nil,
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("update load_balancer type to cluster-managed when it is user-managed should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("update load_balancer type to user-managed when it is user-managed should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("update load_balancer type to cluster-managed when it is cluster-managed should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			),
+
+			Entry("adding machine networks with cluster-managed load balancer should fail",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}},
+				swag.String("Setting the Machine Network CIDR is forbidden when the cluster is neither"+
+					" in VIP DHCP allocation mode nor using a user-managed load balancer"),
+			),
+
+			Entry("adding machine networks with user-managed load balancer should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}},
+				nil,
+			),
+
+			Entry("adding common VIPs with cluster-managed load balancer should fail",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				nil,
+				nil,
+				[]*models.APIVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.IngressVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}},
+				nil,
+				swag.String("appears both in apiVIPs and ingressVIPs"),
+			),
+
+			Entry("adding common VIPs with user-managed load balancer should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				[]*models.APIVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.IngressVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}},
+				nil,
+			),
+
+			Entry("update to multiple machine networks with user-managed load balancer should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				[]*models.APIVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.IngressVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}, {ClusterID: clusterID, Cidr: "192.168.128.0/24"}},
+				nil,
+			),
+
+			Entry("update to multiple machine networks such that only one satisfies the requirements with user-managed load balancer should succeed",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				[]*models.APIVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.IngressVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.127.0/24"}, {ClusterID: clusterID, Cidr: "192.168.128.0/24"}},
+				nil,
+			),
+
+			Entry("update to multiple machine networks such that none satisfies the requirements with user-managed load balancer should fail",
+				&models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				nil,
+				nil,
+				[]*models.APIVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.IngressVip{{ClusterID: clusterID, IP: "192.168.127.1"}},
+				nil,
+				[]*models.MachineNetwork{{ClusterID: clusterID, Cidr: "192.168.126.0/24"}, {ClusterID: clusterID, Cidr: "192.168.128.0/24"}},
+				swag.String("failed verification: none of the machine networks is satisfying the requirements"),
+			),
+		)
 	})
 })
 
@@ -8394,12 +9284,12 @@ var _ = Describe("infraEnvs", func() {
 		})
 
 		It("No version specified", func() {
-			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 			mockOSImages.EXPECT().GetOsImageOrLatest(
 				*common.TestDefaultConfig.OsImage.OpenshiftVersion,
-				*common.TestDefaultConfig.OsImage.CPUArchitecture).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+				*common.TestDefaultConfig.OsImage.CPUArchitecture, "", string(models.ImageTypeFullIso)).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 			mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(gomock.Any()).Return("", nil).Times(1)
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 
 			mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
@@ -8502,7 +9392,7 @@ var _ = Describe("infraEnvs", func() {
 			mockInfraEnvRegisterSuccess()
 			mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
-			mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(gomock.Any())
+			mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(gomock.Any())
 			mockUsage.EXPECT().Add(gomock.Any(), gomock.Not(usage.StaticNetworkConfigUsage), gomock.Any()).AnyTimes()
 			mockUsage.EXPECT().Remove(gomock.Any(), usage.StaticNetworkConfigUsage).Times(1)
 			mockUsage.EXPECT().Remove(gomock.Any(), gomock.Not(usage.StaticNetworkConfigUsage)).AnyTimes()
@@ -8525,15 +9415,15 @@ var _ = Describe("infraEnvs", func() {
 
 			cluster := createCluster(db, models.ClusterStatusInstallingPendingUserAction)
 
-			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-			mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+			mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 			mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
 			mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
-			mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(gomock.Any())
+			mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(gomock.Any())
 
 			mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(gomock.Any()).Return("static network format result", nil).Times(1)
 			mockUsage.EXPECT().Add(gomock.Any(), usage.StaticNetworkConfigUsage, nil)
@@ -8561,9 +9451,9 @@ var _ = Describe("infraEnvs", func() {
 			largeDiscoveryIgnition := fmt.Sprintf(`{"ignition": {"version": "3.1.0"}, "storage": {"files": [{"path": "/tmp/example", "contents": {"source": "data:text/plain;base64,%s"}}]}}`, content)
 			override := `{"ignition": {"version": "3.1.0"}, "storage": {"files": [{"path": "/tmp/example", "contents": {"source": "data:text/plain;base64,aGVscGltdHJhcHBlZGluYXN3YWdnZXJzcGVj"}}]}}`
 
-			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 			mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(gomock.Any()).Return("", nil).Times(1)
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(largeDiscoveryIgnition, nil).AnyTimes()
 			mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.InfraEnvRegistrationFailedEventName))).Times(1)
@@ -8588,6 +9478,180 @@ var _ = Describe("infraEnvs", func() {
 			}
 			err := params.Validate(nil)
 			Expect(err.Error()).To(ContainSubstring("should be at most 65535 chars long"))
+		})
+
+		Context("Cluster Mirror Registry", func() {
+			const (
+				mirrorRegistryCertificate = "-----BEGIN CERTIFICATE-----\n    certificate contents\n-----END CERTIFICATE------"
+				sourceRegistry            = "quay.io"
+				mirrorRegistry            = "example-user-registry.com"
+			)
+			It("Validate mirror registry saved on DB", func() {
+				mockInfraEnvRegisterSuccess()
+				MinimalOpenShiftVersionForNoneHA := "4.8.0-fc.0"
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
+
+				conf, _ := getMirrorRegistryConfigurations(getSecureRegistryToml(sourceRegistry, mirrorRegistry), mirrorRegistryCertificate)
+				reply, err := bm.RegisterInfraEnvInternal(ctx, nil, conf, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("some-infra-env-name"),
+						OpenshiftVersion: MinimalOpenShiftVersionForNoneHA,
+						PullSecret:       swag.String(fakePullSecret),
+					},
+				})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				var infraEnv common.InfraEnv
+				Expect(db.First(&infraEnv, "id = ?", reply.ID).Error).ShouldNot(HaveOccurred())
+				Expect(infraEnv.MirrorRegistryConfiguration).ShouldNot(BeNil())
+
+				mirrorRegistryConf, err := infraEnv.GetMirrorRegistryConfiguration()
+				Expect(err).ShouldNot(HaveOccurred())
+
+				Expect(len(mirrorRegistryConf.ImageDigestMirrors)).To(Equal(1))
+				Expect(mirrorRegistryConf.ImageDigestMirrors[0].Source).To(Equal(sourceRegistry))
+				Expect(len(mirrorRegistryConf.ImageDigestMirrors[0].Mirrors)).To(Equal(1))
+				Expect(string(mirrorRegistryConf.ImageDigestMirrors[0].Mirrors[0])).To(Equal(mirrorRegistry))
+
+				Expect(len(mirrorRegistryConf.Insecure)).To(Equal(0))
+				Expect(len(mirrorRegistryConf.ImageTagMirrors)).To(Equal(0))
+			})
+
+		})
+
+		Context("RegisterInfraEnv with a disconnected-iso type", func() {
+			var (
+				clusterID strfmt.UUID
+				cluster   *common.Cluster
+			)
+
+			BeforeEach(func() {
+				clusterID = strfmt.UUID(uuid.New().String())
+				cluster = &common.Cluster{
+					Cluster: models.Cluster{
+						ID:               &clusterID,
+						Status:           swag.String(models.ClusterStatusInsufficient),
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						CPUArchitecture:  common.DefaultCPUArchitecture,
+					},
+				}
+				Expect(db.Create(cluster).Error).To(Succeed())
+			})
+
+			It("registering a non-disconnected-iso infraenv does not change cluster status", func() {
+				mockInfraEnvRegisterSuccess()
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
+				mockUsage.EXPECT().Remove(gomock.Any(), gomock.Any()).AnyTimes()
+				mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+				reply, err := bm.RegisterInfraEnvInternal(ctx, nil, nil, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("regular-infra-env"),
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						PullSecret:       swag.String(fakePullSecret),
+						ImageType:        models.ImageTypeFullIso,
+						ClusterID:        &clusterID,
+					},
+				})
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(reply).ShouldNot(BeNil())
+
+				// Verify cluster status remains Insufficient
+				var updated common.Cluster
+				Expect(db.First(&updated, "id = ?", clusterID.String()).Error).To(Succeed())
+				Expect(swag.StringValue(updated.Status)).To(Equal(models.ClusterStatusInsufficient))
+			})
+
+			It("should fail when setting RendezvousIP on non-disconnected-iso infraenv", func() {
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegistrationFailedEventName),
+					eventstest.WithMessageContainsMatcher("RendezvousIP is only supported for disconnected ISO infra-envs"))).Times(1)
+
+				reply := bm.RegisterInfraEnv(ctx, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("infra-env-with-rendezvous"),
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						PullSecret:       swag.String(fakePullSecret),
+						ImageType:        models.ImageTypeFullIso,
+						ClusterID:        &clusterID,
+						RendezvousIP:     swag.String("192.168.1.100"),
+					},
+				})
+
+				verifyApiErrorString(reply, http.StatusBadRequest, "RendezvousIP is only supported for disconnected ISO infra-envs")
+			})
+
+			It("should fail when setting invalid IP for RendezvousIP on disconnected-iso infraenv", func() {
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegistrationFailedEventName),
+					eventstest.WithMessageContainsMatcher("Invalid rendezvous IP"))).Times(1)
+
+				reply := bm.RegisterInfraEnv(ctx, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("infra-env-invalid-rendezvous"),
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						PullSecret:       swag.String(fakePullSecret),
+						ImageType:        models.ImageTypeDisconnectedIso,
+						ClusterID:        &clusterID,
+						RendezvousIP:     swag.String("not-a-valid-ip"),
+					},
+				})
+
+				verifyApiErrorString(reply, http.StatusBadRequest, "Invalid rendezvous IP")
+			})
+
+		})
+
+		Context("OS stream", func() {
+			MinimalOpenShiftVersionForNoneHA := "4.8.0-fc.0"
+
+			It("persists OS stream from create params", func() {
+				mockInfraEnvRegisterSuccess()
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
+
+				reply := bm.RegisterInfraEnv(ctx, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("some-infra-env-name"),
+						OpenshiftVersion: MinimalOpenShiftVersionForNoneHA,
+						PullSecret:       swag.String(fakePullSecret),
+						OsStream:         "rhel-9",
+					},
+				})
+				Expect(reply).Should(BeAssignableToTypeOf(installer.NewRegisterInfraEnvCreated()))
+				actual := reply.(*installer.RegisterInfraEnvCreated)
+
+				var dbInfraEnv common.InfraEnv
+				Expect(db.First(&dbInfraEnv, "id = ?", actual.Payload.ID.String()).Error).To(Succeed())
+				Expect(dbInfraEnv.OsStream).To(Equal("rhel-9"))
+			})
+
+			It("inherits OS stream from cluster when not set on infra-env", func() {
+				cluster := createCluster(db, models.ClusterStatusInsufficient)
+				Expect(db.Model(cluster).Update("os_stream", "rhel-9").Error).ToNot(HaveOccurred())
+
+				mockUsageReports()
+				mockInfraEnvRegisterSuccess()
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.InfraEnvRegisteredEventName))).Times(1)
+
+				reply := bm.RegisterInfraEnv(ctx, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String("some-infra-env-name"),
+						OpenshiftVersion: MinimalOpenShiftVersionForNoneHA,
+						PullSecret:       swag.String(fakePullSecret),
+						ClusterID:        cluster.ID,
+					},
+				})
+				Expect(reply).Should(BeAssignableToTypeOf(installer.NewRegisterInfraEnvCreated()))
+				actual := reply.(*installer.RegisterInfraEnvCreated)
+
+				var dbInfraEnv common.InfraEnv
+				Expect(db.First(&dbInfraEnv, "id = ?", actual.Payload.ID.String()).Error).To(Succeed())
+				Expect(dbInfraEnv.OsStream).To(Equal("rhel-9"))
+			})
 		})
 	})
 
@@ -8858,6 +9922,112 @@ var _ = Describe("infraEnvs", func() {
 					})
 				})
 			})
+			Context("RendezvousIP validation", func() {
+				setInfraEnvType := func(imageType models.ImageType) {
+					err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("type", imageType).Error
+					Expect(err).ToNot(HaveOccurred())
+				}
+
+				It("should fail when setting RendezvousIP on non-disconnected-iso infraenv", func() {
+					setInfraEnvType(models.ImageTypeFullIso)
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							RendezvousIP: swag.String("192.168.1.100"),
+						},
+					})
+
+					verifyApiErrorString(reply, http.StatusBadRequest, "RendezvousIP is only supported for disconnected ISO infra-envs")
+				})
+
+				It("should fail when setting invalid RendezvousIP on disconnected-iso infraenv", func() {
+					setInfraEnvType(models.ImageTypeDisconnectedIso)
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							RendezvousIP: swag.String("not-a-valid-ip"),
+						},
+					})
+
+					verifyApiErrorString(reply, http.StatusBadRequest, "Invalid rendezvous IP")
+				})
+
+				It("should succeed when setting valid RendezvousIP on disconnected-iso infraenv", func() {
+					setInfraEnvType(models.ImageTypeDisconnectedIso)
+					mockInfraEnvUpdateSuccess()
+
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							RendezvousIP: swag.String("192.168.1.200"),
+						},
+					})
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+
+					i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(swag.StringValue(i.RendezvousIP)).To(Equal("192.168.1.200"))
+				})
+
+				It("should clear RendezvousIP when empty string is provided", func() {
+					setInfraEnvType(models.ImageTypeDisconnectedIso)
+					mockInfraEnvUpdateSuccess()
+
+					Expect(db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("rendezvous_ip", "192.168.1.100").Error).ToNot(HaveOccurred())
+
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							RendezvousIP: swag.String(""),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+					i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(i.RendezvousIP).To(BeNil())
+				})
+
+				It("should clear RendezvousIP when image type changes away from disconnected-iso", func() {
+					setInfraEnvType(models.ImageTypeDisconnectedIso)
+					mockInfraEnvUpdateSuccess()
+
+					Expect(db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("rendezvous_ip", "192.168.1.101").Error).ToNot(HaveOccurred())
+
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							ImageType: models.ImageTypeFullIso,
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+					i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(common.ImageTypeValue(i.Type)).To(Equal(models.ImageTypeFullIso))
+					Expect(i.RendezvousIP).To(BeNil())
+				})
+
+				It("should preserve RendezvousIP when field is omitted in unrelated update", func() {
+					setInfraEnvType(models.ImageTypeDisconnectedIso)
+					mockInfraEnvUpdateSuccess()
+
+					Expect(db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("rendezvous_ip", "192.168.1.100").Error).ToNot(HaveOccurred())
+
+					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+						InfraEnvID: *i.ID,
+						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+							AdditionalNtpSources: swag.String("1.1.1.1"),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+					i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+					Expect(err).ToNot(HaveOccurred())
+					Expect(swag.StringValue(i.RendezvousIP)).To(Equal("192.168.1.100"))
+				})
+
+			})
 			It("Update AdditionalNtpSources", func() {
 				mockInfraEnvUpdateSuccess()
 				Expect(i.AdditionalNtpSources).To(Equal(""))
@@ -8868,7 +10038,6 @@ var _ = Describe("infraEnvs", func() {
 					},
 				})
 				Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
-				var err error
 				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(i.AdditionalNtpSources).ToNot(Equal(nil))
@@ -8885,13 +10054,41 @@ var _ = Describe("infraEnvs", func() {
 					},
 				})
 				Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
-				var err error
 				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(i.IgnitionConfigOverride).To(Equal(override))
 			})
+			It("Update OpenshiftVersion", func() {
+				mockInfraEnvUpdateSuccess()
+				updateOCPVersion := "4.18"
+				Expect(i.OpenshiftVersion).ToNot(Equal(updateOCPVersion))
+				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+					InfraEnvID: *i.ID,
+					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+						OpenshiftVersion: swag.String(updateOCPVersion),
+					},
+				})
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(i.OpenshiftVersion).To(HaveValue(Equal(updateOCPVersion)))
+			})
+			It("updates OS stream", func() {
+				mockInfraEnvUpdateSuccess()
+				updateOsStream := "rhel-9"
+				Expect(i.OsStream).ToNot(Equal(updateOsStream))
+				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+					InfraEnvID: *i.ID,
+					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+						OsStream: swag.String(updateOsStream),
+					},
+				})
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(i.OsStream).To(HaveValue(Equal(updateOsStream)))
+			})
 			It("Update Image type", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("type", models.ImageTypeMinimalIso).Error
 				Expect(err).ToNot(HaveOccurred())
@@ -8907,9 +10104,8 @@ var _ = Describe("infraEnvs", func() {
 				Expect(common.ImageTypeValue(i.Type)).To(Equal(models.ImageTypeFullIso))
 			})
 			It("Update Image type on s390x architecture", func() {
-				var err error
-				mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+				mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 				mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
 
@@ -8927,9 +10123,8 @@ var _ = Describe("infraEnvs", func() {
 				Expect(common.ImageTypeValue(i.Type)).To(Equal(models.ImageTypeFullIso))
 			})
 			It("Update Image type on s390x architecture to full - fail", func() {
-				var err error
-				mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
-				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+				mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 				mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
 
@@ -8939,10 +10134,10 @@ var _ = Describe("infraEnvs", func() {
 				clusterID := strfmt.UUID(uuid.New().String())
 				c := &common.Cluster{
 					Cluster: models.Cluster{
-						ID:                   &clusterID,
-						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
-						OpenshiftVersion:     "4.12",
-						CPUArchitecture:      models.ClusterCPUArchitectureS390x,
+						ID:                &clusterID,
+						ControlPlaneCount: common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						OpenshiftVersion:  "4.12",
+						CPUArchitecture:   models.ClusterCPUArchitectureS390x,
 						Platform: &models.Platform{
 							Type: common.PlatformTypePtr(models.PlatformTypeNone),
 						},
@@ -8963,7 +10158,6 @@ var _ = Describe("infraEnvs", func() {
 				Expect(reply.(*common.ApiErrorResponse).Error()).To(Equal("cannot use Minimal ISO because it's not compatible with the s390x architecture on version 4.12 of OpenShift"))
 			})
 			It("Update Image type on ppc64le architecture", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("type", models.ImageTypeMinimalIso).Error
@@ -8982,7 +10176,6 @@ var _ = Describe("infraEnvs", func() {
 				Expect(common.ImageTypeValue(i.Type)).To(Equal(models.ImageTypeMinimalIso))
 			})
 			It("Update additional trust bundle", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("additional_trust_bundle", testCert).Error
@@ -9000,7 +10193,7 @@ var _ = Describe("infraEnvs", func() {
 				Expect(i.AdditionalTrustBundle).To(Equal(testCert2))
 			})
 			It("Update additional trust bundle - invalid", func() {
-				err := db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("additional_trust_bundle", testCert).Error
+				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("additional_trust_bundle", testCert).Error
 				Expect(err).ToNot(HaveOccurred())
 				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID: *i.ID,
@@ -9013,7 +10206,6 @@ var _ = Describe("infraEnvs", func() {
 				Expect(reply.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
 			})
 			It("Update additional trust bundle - empty", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("additional_trust_bundle", testCert).Error
@@ -9036,11 +10228,19 @@ var _ = Describe("infraEnvs", func() {
 				params := &models.InfraEnvUpdateParams{
 					AdditionalTrustBundle: swag.String(longString),
 				}
-				err := params.Validate(nil)
+				err = params.Validate(nil)
 				Expect(err.Error()).To(ContainSubstring("should be at most 65535 chars long"))
 			})
+			It("empty mac address is rejected", func() {
+				item := &models.MacInterfaceMapItems0{
+					LogicalNicName: "eth0",
+					MacAddress:     "",
+				}
+				err = item.Validate(nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("mac_address"))
+			})
 			It("updates proxy when http and https are the same", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 				proxyURL := "http://[1001:db9::1]:3129"
 				noProxy := ".test-infra-cluster-b0cea5e8.redhat.com,1001:db9::/120,2002:db8::/53,2003:db8::/112"
@@ -9063,7 +10263,6 @@ var _ = Describe("infraEnvs", func() {
 				Expect(swag.StringValue(i.Proxy.NoProxy)).To(Equal(noProxy))
 			})
 			It("doesn't set https proxy when not provided", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 				proxyURL := "http://[1001:db9::1]:3129"
 				noProxy := ".test-infra-cluster-b0cea5e8.redhat.com,1001:db9::/120,2002:db8::/53,2003:db8::/112"
@@ -9086,7 +10285,6 @@ var _ = Describe("infraEnvs", func() {
 			})
 
 			It("updates proxy when http and https are different", func() {
-				var err error
 				mockInfraEnvUpdateSuccess()
 				proxyURL1 := "http://[1001:db9::1]:3129"
 				proxyURL2 := "http://[1001:db9::1]:3130"
@@ -9130,7 +10328,7 @@ var _ = Describe("infraEnvs", func() {
 					common.FormatStaticConfigHostYAML("0200003ef73c", "02000048ba38", "192.168.126.40", "192.168.141.40", "192.168.126.1", map2),
 					common.FormatStaticConfigHostYAML("0200003ef75c", "02000048ba58", "192.168.126.42", "192.168.141.42", "192.168.126.1", map3),
 				}
-				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(staticNetworkConfig).Return(nil).Times(1)
+				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(staticNetworkConfig).Return(nil).Times(1)
 				mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(staticNetworkConfig).Return(staticNetworkFormatRes, nil).Times(1)
 				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID: *i.ID,
@@ -9139,13 +10337,12 @@ var _ = Describe("infraEnvs", func() {
 					},
 				})
 				Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
-				var err error
 				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *i.ID})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(i.StaticNetworkConfig).To(Equal(staticNetworkFormatRes))
 			})
+
 			It("Update StaticNetwork same", func() {
-				var err error
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", *i.ID).Update("static_network_config", "static network format result").Error
 				Expect(err).ToNot(HaveOccurred())
 				staticNetworkFormatRes := "static network format result"
@@ -9166,7 +10363,7 @@ var _ = Describe("infraEnvs", func() {
 					common.FormatStaticConfigHostYAML("0200003ef73c", "02000048ba38", "192.168.126.40", "192.168.141.40", "192.168.126.1", map2),
 					common.FormatStaticConfigHostYAML("0200003ef75c", "02000048ba58", "192.168.126.42", "192.168.141.42", "192.168.126.1", map3),
 				}
-				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(staticNetworkConfig).Return(nil).Times(1)
+				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(staticNetworkConfig).Return(nil).Times(1)
 				mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(staticNetworkConfig).Return(staticNetworkFormatRes, nil).Times(1)
 				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID: *i.ID,
@@ -9181,7 +10378,6 @@ var _ = Describe("infraEnvs", func() {
 			})
 
 			It("static network usage should be added when StaticNetworkConfig is set", func() {
-				var err error
 
 				cluster := createCluster(db, models.ClusterStatusInstallingPendingUserAction)
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", *i.ID).Update("cluster_id", cluster.ID).Error
@@ -9196,7 +10392,7 @@ var _ = Describe("infraEnvs", func() {
 				}
 
 				mockInfraEnvUpdateSuccess()
-				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(staticNetworkConfig).Return(nil).Times(1)
+				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(staticNetworkConfig).Return(nil).Times(1)
 				mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(staticNetworkConfig).Return(staticNetworkFormatRes, nil).Times(1)
 				mockUsage.EXPECT().Add(gomock.Any(), usage.StaticNetworkConfigUsage, nil).Times(1)
 				mockUsage.EXPECT().Save(gomock.Any(), *cluster.ID, gomock.Any()).Times(1)
@@ -9210,7 +10406,6 @@ var _ = Describe("infraEnvs", func() {
 			})
 
 			It("static network usage should be removed when StaticNetworkConfig is unset", func() {
-				var err error
 
 				cluster := createCluster(db, models.ClusterStatusInstallingPendingUserAction)
 				err = db.Model(&common.InfraEnv{}).Where("id = ?", *i.ID).Update("cluster_id", cluster.ID).Error
@@ -9223,7 +10418,7 @@ var _ = Describe("infraEnvs", func() {
 				staticNetworkConfig := []*models.HostStaticNetworkConfig{}
 
 				mockInfraEnvUpdateSuccess()
-				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(staticNetworkConfig).Return(nil).Times(1)
+				mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(staticNetworkConfig).Return(nil).Times(1)
 				mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(staticNetworkConfig).Return(staticNetworkFormatRes, nil).Times(1)
 				mockUsage.EXPECT().Remove(gomock.Any(), usage.StaticNetworkConfigUsage).Times(1)
 				mockUsage.EXPECT().Save(gomock.Any(), *cluster.ID, gomock.Any()).Times(1)
@@ -9237,9 +10432,64 @@ var _ = Describe("infraEnvs", func() {
 			})
 		})
 
+		Context("Update infraEnv disconnected-iso OS image validation", func() {
+			infraEnvName := "some-infra-env"
+			var (
+				i   *common.InfraEnv
+				err error
+			)
+			BeforeEach(func() {
+				mockEvents.EXPECT().SendInfraEnvEvent(ctx, gomock.Any()).AnyTimes()
+				mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(gomock.Any()).Return("", nil).Times(1)
+				mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).AnyTimes()
+				mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ string, _ string, _ string, imageType string) (*models.OsImage, error) {
+						if imageType == string(models.ImageTypeDisconnectedIso) {
+							return nil, errors.New("no disconnected OS image")
+						}
+						return common.TestDefaultConfig.OsImage, nil
+					}).AnyTimes()
+				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+				mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName))).AnyTimes()
+
+				reply := bm.RegisterInfraEnv(ctx, installer.RegisterInfraEnvParams{
+					InfraenvCreateParams: &models.InfraEnvCreateParams{
+						Name:             swag.String(infraEnvName),
+						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						PullSecret:       swag.String(fakePullSecret),
+					},
+				})
+				Expect(reply).Should(BeAssignableToTypeOf(installer.NewRegisterInfraEnvCreated()))
+				actual := reply.(*installer.RegisterInfraEnvCreated)
+				i, err = bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: *actual.Payload.ID})
+				Expect(err).ToNot(HaveOccurred())
+				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("generated_at", strfmt.DateTime(time.Now().AddDate(0, 0, -1))).Error
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("fails when changing to disconnected-iso without matching OS image and does not persist type", func() {
+				err = db.Model(&common.InfraEnv{}).Where("id = ?", i.ID).Update("type", models.ImageTypeMinimalIso).Error
+				Expect(err).ToNot(HaveOccurred())
+
+				reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+					InfraEnvID: *i.ID,
+					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+						ImageType: models.ImageTypeDisconnectedIso,
+					},
+				})
+				verifyApiError(reply, http.StatusBadRequest)
+
+				var dbInfraEnv common.InfraEnv
+				Expect(db.First(&dbInfraEnv, "id = ?", i.ID.String()).Error).To(Succeed())
+				Expect(common.ImageTypeValue(dbInfraEnv.Type)).To(Equal(models.ImageTypeMinimalIso))
+			})
+		})
+
 		Context("check pull secret", func() {
 			BeforeEach(func() {
-				v, err := validations.NewPullSecretValidator(validations.Config{}, getTestAuthHandler())
+				v, err := validations.NewPullSecretValidator(map[string]bool{}, getTestAuthHandler())
 				Expect(err).ShouldNot(HaveOccurred())
 				bm.secretValidator = v
 			})
@@ -9311,6 +10561,85 @@ var _ = Describe("infraEnvs", func() {
 			Expect(infraEnv.SSHAuthorizedKey).Should(Equal(sshKey))
 		})
 
+		It("clearing ssh key with empty string should remove the key", func() {
+			sshKey := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDi8KHZYGyPQjECHwytquI3rmpgoUn6M+lkeOD2nEKvYElLE5mPIeqF0izJIl56u" +
+				"ar2wda+3z107M9QkatE+dP4S9/Ltrlm+/ktAf4O6UoxNLUzv/TGHasb9g3Xkt8JTkohVzVK36622Sd8kLzEc61v1AonLWIADtpwq6/GvH" +
+				"MAuPK2R/H0rdKhTokylKZLDdTqQ+KUFelI6RNIaUBjtVrwkx1j0htxN11DjBVuUyPT2O1ejWegtrM0T+4vXGEA3g3YfbT2k0YnEzjXXqng" +
+				"qbXCYEJCZidp3pJLH/ilo4Y4BId/bx/bhzcbkZPeKlLwjR8g9sydce39bzPIQj+b7nlFv1Vot/77VNwkjXjYPUdUPu0d1PkFD9jKDOdB3f" +
+				"AC61aG2a/8PFS08iBrKiMa48kn+hKXC4G4D5gj/QzIAgzWSl2tEzGQSoIVTucwOAL/jox2dmAa0RyKsnsHORppanuW4qD7KAcmas1GHrAq" +
+				"IfNyDiU2JR50r1jCxj5H76QxIuM= root@ocp-edge34.lab.eng.tlv2.redhat.com"
+
+			// Create infraenv with an existing SSH key
+			infraEnvID = strfmt.UUID(uuid.New().String())
+			err := db.Create(&common.InfraEnv{
+				PullSecret: "PULL_SECRET",
+				InfraEnv: models.InfraEnv{
+					ID:               &infraEnvID,
+					PullSecretSet:    true,
+					SSHAuthorizedKey: sshKey,
+					CPUArchitecture:  common.TestDefaultConfig.CPUArchitecture,
+					OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+					Type:             models.ImageTypeFullIso.Pointer(),
+				}}).Error
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Update with empty string to clear the SSH key
+			mockInfraEnvUpdateSuccess()
+			emptyKey := ""
+			reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+				InfraEnvID: infraEnvID,
+				InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+					SSHAuthorizedKey: &emptyKey,
+				},
+			})
+			Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+
+			// Verify the SSH key was cleared
+			var infraEnv common.InfraEnv
+			err = db.First(&infraEnv, "id = ?", infraEnvID).Error
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(infraEnv.SSHAuthorizedKey).Should(Equal(""))
+		})
+
+		It("not sending ssh key should preserve existing key", func() {
+			sshKey := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDi8KHZYGyPQjECHwytquI3rmpgoUn6M+lkeOD2nEKvYElLE5mPIeqF0izJIl56u" +
+				"ar2wda+3z107M9QkatE+dP4S9/Ltrlm+/ktAf4O6UoxNLUzv/TGHasb9g3Xkt8JTkohVzVK36622Sd8kLzEc61v1AonLWIADtpwq6/GvH" +
+				"MAuPK2R/H0rdKhTokylKZLDdTqQ+KUFelI6RNIaUBjtVrwkx1j0htxN11DjBVuUyPT2O1ejWegtrM0T+4vXGEA3g3YfbT2k0YnEzjXXqng" +
+				"qbXCYEJCZidp3pJLH/ilo4Y4BId/bx/bhzcbkZPeKlLwjR8g9sydce39bzPIQj+b7nlFv1Vot/77VNwkjXjYPUdUPu0d1PkFD9jKDOdB3f" +
+				"AC61aG2a/8PFS08iBrKiMa48kn+hKXC4G4D5gj/QzIAgzWSl2tEzGQSoIVTucwOAL/jox2dmAa0RyKsnsHORppanuW4qD7KAcmas1GHrAq" +
+				"IfNyDiU2JR50r1jCxj5H76QxIuM= root@ocp-edge34.lab.eng.tlv2.redhat.com"
+
+			// Create infraenv with an existing SSH key
+			infraEnvID = strfmt.UUID(uuid.New().String())
+			err := db.Create(&common.InfraEnv{
+				PullSecret: "PULL_SECRET",
+				InfraEnv: models.InfraEnv{
+					ID:               &infraEnvID,
+					PullSecretSet:    true,
+					SSHAuthorizedKey: sshKey,
+					CPUArchitecture:  common.TestDefaultConfig.CPUArchitecture,
+					OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+					Type:             models.ImageTypeFullIso.Pointer(),
+				}}).Error
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Update without sending SSHAuthorizedKey (nil pointer)
+			mockInfraEnvUpdateSuccess()
+			reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
+				InfraEnvID:           infraEnvID,
+				InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
+					// SSHAuthorizedKey intentionally not set (nil)
+				},
+			})
+			Expect(reply).To(BeAssignableToTypeOf(installer.NewUpdateInfraEnvCreated()))
+
+			// Verify the SSH key was preserved
+			var infraEnv common.InfraEnv
+			err = db.First(&infraEnv, "id = ?", infraEnvID).Error
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(infraEnv.SSHAuthorizedKey).Should(Equal(sshKey))
+		})
+
 		It("empty pull-secret", func() {
 			pullSecret := ""
 			reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
@@ -9359,6 +10688,10 @@ var _ = Describe("infraEnvs", func() {
 				_ = updateInfraEnv("http://proxy.proxy", "", "proxy.proxy")
 			})
 
+			It("set a valid https proxy", func() {
+				_ = updateInfraEnv("", "https://proxy.proxy", "")
+			})
+
 			It("set a valid noProxy wildcard", func() {
 				_ = updateInfraEnv("", "", "*")
 			})
@@ -9385,9 +10718,7 @@ var _ = Describe("infraEnvs", func() {
 				reponse, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID:           infraEnvID,
 					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{},
-				},
-					nil,
-				)
+				}, nil, nil)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(reponse.GeneratedAt).ShouldNot(Equal(strfmt.NewDateTime()))
 			})
@@ -9396,7 +10727,7 @@ var _ = Describe("infraEnvs", func() {
 				i, err := bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: infraEnvID})
 				Expect(err).ToNot(HaveOccurred())
 
-				mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil)
+				mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 				mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil).Times(1)
 				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -9406,9 +10737,7 @@ var _ = Describe("infraEnvs", func() {
 				response, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID:           *i.ID,
 					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{ImageType: models.ImageTypeMinimalIso},
-				},
-					nil,
-				)
+				}, nil, nil)
 				Expect(err).ToNot(HaveOccurred())
 
 				parsed, err := url.Parse(response.DownloadURL)
@@ -9420,7 +10749,7 @@ var _ = Describe("infraEnvs", func() {
 				pathList := strings.Split(parsed.Path, "/")
 				Expect(pathList).To(HaveLen(8))
 				Expect(pathList[7]).To(Equal("minimal.iso"))
-				Expect(pathList[5]).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
+				Expect(pathList[5]).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 			})
 
 			It("sets the download url correctly with the image service - bounded InfraEnv", func() {
@@ -9441,7 +10770,7 @@ var _ = Describe("infraEnvs", func() {
 				err := db.Create(boundedInfraEnv).Error
 				Expect(err).ToNot(HaveOccurred())
 
-				mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil)
+				mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 				mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil).Times(1)
 				mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 					eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -9451,9 +10780,7 @@ var _ = Describe("infraEnvs", func() {
 				response, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 					InfraEnvID:           boundedInfraEnvID,
 					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{ImageType: models.ImageTypeMinimalIso},
-				},
-					nil,
-				)
+				}, nil, nil)
 				Expect(err).ToNot(HaveOccurred())
 
 				parsed, err := url.Parse(response.DownloadURL)
@@ -9465,7 +10792,16 @@ var _ = Describe("infraEnvs", func() {
 				pathList := strings.Split(parsed.Path, "/")
 				Expect(pathList).To(HaveLen(8))
 				Expect(pathList[7]).To(Equal("minimal.iso"))
-				Expect(pathList[5]).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
+				Expect(pathList[5]).To(Equal(*common.TestDefaultConfig.OsImage.Version))
+			})
+
+			It("fails when the internal ignition config is invalid", func() {
+				invalidIgnition := "{\"foo\": \"bar\"}"
+				_, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
+					InfraEnvID:           infraEnvID,
+					InfraEnvUpdateParams: &models.InfraEnvUpdateParams{},
+				}, &invalidIgnition, nil)
+				Expect(err).To(HaveOccurred())
 			})
 
 			Context("with rhsso auth", func() {
@@ -9481,7 +10817,8 @@ var _ = Describe("infraEnvs", func() {
 				It("sets a valid image_token", func() {
 					i, err := bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: infraEnvID})
 					Expect(err).ToNot(HaveOccurred())
-					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil)
+
+					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 					mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil)
 					mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 						eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -9490,9 +10827,7 @@ var _ = Describe("infraEnvs", func() {
 					response, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 						InfraEnvID:           infraEnvID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{ImageType: models.ImageTypeMinimalIso},
-					},
-						nil,
-					)
+					}, nil, nil)
 					Expect(err).ToNot(HaveOccurred())
 
 					u, err := url.Parse(response.DownloadURL)
@@ -9509,7 +10844,8 @@ var _ = Describe("infraEnvs", func() {
 				It("updates the infra-env expires_at time", func() {
 					i, err := bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: infraEnvID})
 					Expect(err).ToNot(HaveOccurred())
-					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil)
+
+					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 					mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil)
 					mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 						eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -9518,9 +10854,7 @@ var _ = Describe("infraEnvs", func() {
 					response, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 						InfraEnvID:           infraEnvID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{ImageType: models.ImageTypeMinimalIso},
-					},
-						nil,
-					)
+					}, nil, nil)
 					Expect(err).ToNot(HaveOccurred())
 
 					Expect(response.ExpiresAt.String()).ToNot(Equal("0001-01-01T00:00:00.000Z"))
@@ -9552,9 +10886,7 @@ var _ = Describe("infraEnvs", func() {
 					response, err := bm.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{
 						InfraEnvID:           infraEnvID,
 						InfraEnvUpdateParams: params,
-					},
-						nil,
-					)
+					}, nil, nil)
 					Expect(err).ToNot(HaveOccurred())
 					return response.DownloadURL
 				}
@@ -9562,7 +10894,8 @@ var _ = Describe("infraEnvs", func() {
 				It("does not update the image service url if nothing changed", func() {
 					i, err := bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: infraEnvID})
 					Expect(err).ToNot(HaveOccurred())
-					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil).Times(2)
+
+					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 					mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil).Times(1)
 					mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
 						eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -9578,7 +10911,8 @@ var _ = Describe("infraEnvs", func() {
 				It("updates the image service url when things change", func() {
 					i, err := bm.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: infraEnvID})
 					Expect(err).ToNot(HaveOccurred())
-					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "").Return(common.TestDefaultConfig.OsImage, nil).Times(7)
+
+					mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, "", "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 					mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, true, bm.authHandler.AuthType(), gomock.Any()).Return("ignitionconfigforlogging", nil).Times(7)
 					mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), bm.IgnitionConfig, false, bm.authHandler.AuthType(), gomock.Any()).Return(discovery_ignition_3_1, nil).AnyTimes()
 					mockEvents.EXPECT().SendInfraEnvEvent(ctx, eventstest.NewEventMatcher(
@@ -9642,7 +10976,7 @@ var _ = Describe("infraEnvs", func() {
 						common.FormatStaticConfigHostYAML("0200003ef73c", "02000048ba38", "192.168.126.40", "192.168.141.40", "192.168.126.1", map2),
 						common.FormatStaticConfigHostYAML("0200003ef75c", "02000048ba58", "192.168.126.42", "192.168.141.42", "192.168.126.1", map3),
 					}
-					mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParams(staticNetworkConfig).Return(nil).Times(2)
+					mockStaticNetworkConfig.EXPECT().ValidateStaticConfigParamsYAML(staticNetworkConfig).Return(nil).Times(2)
 					mockStaticNetworkConfig.EXPECT().FormatStaticNetworkConfigForDB(staticNetworkConfig).Return(staticNetworkFormatRes, nil).Times(2)
 					params.StaticNetworkConfig = staticNetworkConfig
 					newURL = updateInfraEnv(params)
@@ -9650,7 +10984,7 @@ var _ = Describe("infraEnvs", func() {
 					prevURL = newURL
 
 					By("updating pull secret")
-					mockSecretValidator.EXPECT().ValidatePullSecret("mypullsecret", gomock.Any()).Return(nil)
+					mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), "mypullsecret", gomock.Any(), gomock.Any()).Return(nil)
 					params.PullSecret = "mypullsecret"
 					newURL = updateInfraEnv(params)
 					Expect(newURL).ToNot(Equal(prevURL))
@@ -9713,6 +11047,8 @@ var _ = Describe("infraEnvs", func() {
 
 				It("Invalid NTP source", func() {
 					ntpSource := "inject'"
+
+					mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 					reply := bm.UpdateInfraEnv(ctx, installer.UpdateInfraEnvParams{
 						InfraEnvID: infraEnvID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
@@ -9748,6 +11084,7 @@ var _ = Describe("infraEnvs host", func() {
 	BeforeEach(func() {
 		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
 		db, dbName = common.PrepareTestDB()
+		Expect(cfg.TNFClustersSupport).Should(BeFalse())
 		bm = createInventory(db, cfg)
 
 		infraEnvID = strfmt.UUID(uuid.New().String())
@@ -9774,6 +11111,7 @@ var _ = Describe("infraEnvs host", func() {
 			hostID    strfmt.UUID
 			clusterID strfmt.UUID
 			host      *models.Host
+			cluster   common.Cluster
 		)
 
 		var (
@@ -9790,9 +11128,10 @@ var _ = Describe("infraEnvs host", func() {
 			hostID = strfmt.UUID(uuid.New().String())
 			clusterID = strfmt.UUID(uuid.New().String())
 
-			err := db.Create(&common.Cluster{
+			cluster = common.Cluster{
 				Cluster: models.Cluster{ID: &clusterID},
-			}).Error
+			}
+			err := db.Create(&cluster).Error
 			Expect(err).ShouldNot(HaveOccurred())
 			host = &models.Host{
 				ID:         &hostID,
@@ -9835,6 +11174,50 @@ var _ = Describe("infraEnvs host", func() {
 			Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
 		})
 
+		It("update host role arbiter success", func() {
+			mockHostApi.EXPECT().UpdateRole(gomock.Any(), gomock.Any(), models.HostRole("arbiter"), gomock.Any()).Return(nil).Times(1)
+			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateInstallationDisk(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateMachineConfigPoolName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateIgnitionEndpointToken(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+			mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			cluster.OpenshiftVersion = common.MinimumVersionForArbiterClusters
+			cluster.Platform = &models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)}
+			db.Save(&cluster)
+			resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+				InfraEnvID: infraEnvID,
+				HostID:     hostID,
+				HostUpdateParams: &models.HostUpdateParams{
+					HostRole: swag.String("arbiter"),
+				},
+			})
+			Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+		})
+
+		It("update host role arbiter success - day2", func() {
+			mockHostApi.EXPECT().UpdateRole(gomock.Any(), gomock.Any(), models.HostRole("arbiter"), gomock.Any()).Return(nil).Times(1)
+			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateInstallationDisk(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateMachineConfigPoolName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateIgnitionEndpointToken(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+			mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+			cluster.OpenshiftVersion = ""
+			db.Save(&cluster)
+			resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+				InfraEnvID: infraEnvID,
+				HostID:     hostID,
+				HostUpdateParams: &models.HostUpdateParams{
+					HostRole: swag.String("arbiter"),
+				},
+			})
+			Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+		})
+
 		It("update host role failure", func() {
 			mockHostApi.EXPECT().UpdateRole(gomock.Any(), gomock.Any(), models.HostRole("master"), gomock.Any()).Return(fmt.Errorf("some error")).Times(1)
 			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
@@ -9850,6 +11233,63 @@ var _ = Describe("infraEnvs host", func() {
 			})
 			Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
 			Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusInternalServerError)))
+		})
+
+		It("update host role arbiter failure - TNA Cluster not supported", func() {
+			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateInstallationDisk(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateMachineConfigPoolName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateIgnitionEndpointToken(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			bm.TNAClustersSupport = false
+			resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+				InfraEnvID: infraEnvID,
+				HostID:     hostID,
+				HostUpdateParams: &models.HostUpdateParams{
+					HostRole: swag.String("arbiter"),
+				},
+			})
+			Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+			Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+			Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("TNA clusters support is disabled, cannot set role arbiter to host %s in infra-env %s", hostID, infraEnvID)))
+		})
+
+		It(fmt.Sprintf("update host role arbiter failure - cluster's openshift version < %s", common.MinimumVersionForArbiterClusters), func() {
+			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateInstallationDisk(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateMachineConfigPoolName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateIgnitionEndpointToken(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			cluster.OpenshiftVersion = common.MinimumVersionForNonStandardHAOCPControlPlane
+			db.Save(&cluster)
+			resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+				InfraEnvID: infraEnvID,
+				HostID:     hostID,
+				HostUpdateParams: &models.HostUpdateParams{
+					HostRole: swag.String("arbiter"),
+				},
+			})
+			Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+			Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+			Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("Cannot set role arbiter to host %s in infra-env %s: cluster's openshift version must be at least %s", hostID, infraEnvID, common.MinimumVersionForArbiterClusters)))
+		})
+
+		It("update host role arbiter failure - cluster's platform is not allowed", func() {
+			mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateInstallationDisk(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateMachineConfigPoolName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockHostApi.EXPECT().UpdateIgnitionEndpointToken(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			cluster.OpenshiftVersion = common.MinimumVersionForArbiterClusters
+			cluster.Platform = &models.Platform{Type: models.NewPlatformType(models.PlatformTypeVsphere)}
+			db.Save(&cluster)
+			resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+				InfraEnvID: infraEnvID,
+				HostID:     hostID,
+				HostUpdateParams: &models.HostUpdateParams{
+					HostRole: swag.String("arbiter"),
+				},
+			})
+			Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+			Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+			Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("Cannot set role arbiter to host %s in infra-env %s: cluster's platform must be baremetal", hostID, infraEnvID)))
 		})
 
 		Context("Hostname", func() {
@@ -10233,7 +11673,6 @@ var _ = Describe("infraEnvs host", func() {
 					expectedNumOfUpdateCalls: 1,
 				},
 			} {
-				test := test
 				It(test.name, func() {
 					mockHostApi.EXPECT().UpdateRole(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 					mockHostApi.EXPECT().UpdateHostname(gomock.Any(), gomock.Any(), "somehostname", gomock.Any()).Times(0)
@@ -10337,6 +11776,158 @@ var _ = Describe("infraEnvs host", func() {
 			Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
 			Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusConflict)))
 		})
+
+		Context("update host fencing", func() {
+			var (
+				validFencingCredentials *models.FencingCredentialsParams
+			)
+
+			BeforeEach(func() {
+				bm.TNFClustersSupport = true
+				validFencingCredentials = &models.FencingCredentialsParams{
+					Address:  swag.String("https://bmc.example.com"),
+					Username: swag.String("admin"),
+					Password: swag.String("password123"),
+				}
+				cluster.OpenshiftVersion = common.MinimumVersionForTwoNodesWithFencing
+				cluster.Platform = &models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)}
+				db.Save(&cluster)
+			})
+
+			It("should succeed when fencingCredentialsParams is nil and TNF support is enabled", func() {
+				mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: nil,
+					},
+				})
+				Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+			})
+
+			It("should succeed when fencingCredentialsParams is nil and TNF support is disabled", func() {
+				bm.TNFClustersSupport = false
+				mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: nil,
+					},
+				})
+				Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+			})
+
+			It("should return BadRequest error when TNF clusters support is disabled", func() {
+				bm.TNFClustersSupport = false
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: validFencingCredentials,
+					},
+				})
+				Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+				Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+				Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("TNF clusters support is disabled, cannot set fencing credentials to host %s in infra-env %s", hostID, infraEnvID)))
+			})
+
+			It("should return BadRequest error when OpenShift version is below minimum required for fencing", func() {
+				cluster.OpenshiftVersion = "4.19"
+				db.Save(&cluster)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: validFencingCredentials,
+					},
+				})
+				Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+				Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+				Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("Cannot set fencing credentials to host %s in infra-env %s: cluster's openshift version must be at least %s", hostID, infraEnvID, common.MinimumVersionForTwoNodesWithFencing)))
+			})
+
+			It("should return BadRequest error when platform is not allowed for fencing", func() {
+				cluster.Platform = &models.Platform{Type: models.NewPlatformType(models.PlatformTypeVsphere)}
+				db.Save(&cluster)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: validFencingCredentials,
+					},
+				})
+				Expect(resp).To(BeAssignableToTypeOf(&common.ApiErrorResponse{}))
+				Expect(resp.(*common.ApiErrorResponse).StatusCode()).To(Equal(int32(http.StatusBadRequest)))
+				Expect(resp.(*common.ApiErrorResponse).Error()).To(Equal(fmt.Sprintf("Cannot set fencing credentials to host %s in infra-env %s: cluster's platform must be baremetal or none", hostID, infraEnvID)))
+			})
+
+			It("should successfully update fencing credentials when all validations pass", func() {
+				mockHostApi.EXPECT().UpdateFencing(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error {
+					var unmarshaledCredentials models.FencingCredentialsParams
+					err := json.Unmarshal([]byte(fencingCredentials), &unmarshaledCredentials)
+					Expect(err).To(BeNil())
+					Expect(*unmarshaledCredentials.Address).To(Equal(*validFencingCredentials.Address))
+					Expect(*unmarshaledCredentials.Username).To(Equal(*validFencingCredentials.Username))
+					Expect(*unmarshaledCredentials.Password).To(Equal(*validFencingCredentials.Password))
+					Expect(unmarshaledCredentials.CertificateVerification).Should(BeNil())
+					return nil
+				}).Times(1)
+				mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: validFencingCredentials,
+					},
+				})
+				Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+			})
+
+			It("should successfully update fencing credentials with certificate verification", func() {
+				fencingCredentialsCertVerificationDisabled := &models.FencingCredentialsParams{
+					Address:                 swag.String("https://bmc.example.com"),
+					Username:                swag.String("admin"),
+					Password:                swag.String("password123"),
+					CertificateVerification: swag.String("Disabled"),
+				}
+				mockHostApi.EXPECT().UpdateFencing(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error {
+					var unmarshaledCredentials models.FencingCredentialsParams
+					err := json.Unmarshal([]byte(fencingCredentials), &unmarshaledCredentials)
+					Expect(err).To(BeNil())
+					Expect(*unmarshaledCredentials.Address).To(Equal(*fencingCredentialsCertVerificationDisabled.Address))
+					Expect(*unmarshaledCredentials.Username).To(Equal(*fencingCredentialsCertVerificationDisabled.Username))
+					Expect(*unmarshaledCredentials.Password).To(Equal(*fencingCredentialsCertVerificationDisabled.Password))
+					Expect(*unmarshaledCredentials.CertificateVerification).To(Equal(*fencingCredentialsCertVerificationDisabled.CertificateVerification))
+					return nil
+				}).Times(1)
+				mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+				mockHostApi.EXPECT().GetStagesByRole(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+				resp := bm.V2UpdateHost(ctx, installer.V2UpdateHostParams{
+					InfraEnvID: infraEnvID,
+					HostID:     hostID,
+					HostUpdateParams: &models.HostUpdateParams{
+						FencingCredentials: fencingCredentialsCertVerificationDisabled,
+					},
+				})
+				Expect(resp).Should(BeAssignableToTypeOf(installer.NewV2UpdateHostCreated()))
+			})
+		})
 	})
 
 	AfterEach(func() {
@@ -10411,6 +12002,28 @@ var _ = Describe("KubeConfig download", func() {
 		Expect(generateReply).Should(BeAssignableToTypeOf(&installer.V2GetPresignedForClusterFilesOK{}))
 		replyPayload := generateReply.(*installer.V2GetPresignedForClusterFilesOK).Payload
 		Expect(*replyPayload.URL).Should(Equal("url"))
+	})
+
+	It("V2 presigned rejects path traversal in additional_name", func() {
+		mockS3Client.EXPECT().IsAwsS3().Return(true)
+		traversalName := "../../other-cluster-uuid/kubeconfig"
+		generateReply := bm.V2GetPresignedForClusterFiles(ctx, installer.V2GetPresignedForClusterFilesParams{
+			ClusterID:      clusterID,
+			FileName:       constants.ManifestFolder,
+			AdditionalName: &traversalName,
+		})
+		verifyApiError(generateReply, http.StatusBadRequest)
+	})
+
+	It("V2 presigned rejects absolute path in additional_name", func() {
+		mockS3Client.EXPECT().IsAwsS3().Return(true)
+		absoluteName := "/etc/passwd"
+		generateReply := bm.V2GetPresignedForClusterFiles(ctx, installer.V2GetPresignedForClusterFilesParams{
+			ClusterID:      clusterID,
+			FileName:       constants.ManifestFolder,
+			AdditionalName: &absoluteName,
+		})
+		verifyApiError(generateReply, http.StatusBadRequest)
 	})
 
 })
@@ -10520,6 +12133,109 @@ var _ = Describe("DownloadMinimalInitrd", func() {
 		Expect(db.Create(&infraEnv).Error).NotTo(HaveOccurred())
 		validateArchive(infraEnv)
 	})
+
+	Context("static networking enabled", func() {
+		validateArchiveStatNetFlow := func(infraEnv common.InfraEnv, isNewflow bool) {
+			params := installer.DownloadMinimalInitrdParams{InfraEnvID: id}
+			responsePayload := bm.DownloadMinimalInitrd(ctx, params).(*installer.DownloadMinimalInitrdOK).Payload
+
+			gzipReader, err := gzip.NewReader(responsePayload)
+			Expect(err).ToNot(HaveOccurred())
+
+			r := cpio.NewReader(gzipReader)
+			for {
+				hdr, err := r.Next()
+				if err == io.EOF {
+					break
+				}
+				Expect(err).ToNot(HaveOccurred())
+				switch hdr.Name {
+				case "/usr/local/bin/pre-network-manager-config.sh":
+					preNetMangerConfScriptBytes, err := io.ReadAll(r)
+					Expect(err).ToNot(HaveOccurred())
+					preNetMangerConfScriptContent := string(preNetMangerConfScriptBytes)
+					if isNewflow {
+						Expect(preNetMangerConfScriptContent).ToNot(ContainSubstring("function copy_physical_nics_files()"))
+						Expect(preNetMangerConfScriptContent).To(ContainSubstring("${NMSTATECTL} service"))
+					} else {
+						Expect(preNetMangerConfScriptContent).To(ContainSubstring("function copy_physical_nics_files()"))
+						Expect(preNetMangerConfScriptContent).ToNot(ContainSubstring("${NMSTATECTL} service"))
+					}
+				case "/etc/systemd/system/pre-network-manager-config.service":
+					preNetMangerConfServiceBytes, err := io.ReadAll(r)
+					Expect(err).ToNot(HaveOccurred())
+					preNetMangerConfServiceContent := string(preNetMangerConfServiceBytes)
+					if isNewflow {
+						Expect(preNetMangerConfServiceContent).ToNot(ContainSubstring("Before=coreos-copy-firstboot-network.service"))
+						Expect(preNetMangerConfServiceContent).To(ContainSubstring("After=nm-initrd.service"))
+					} else {
+						Expect(preNetMangerConfServiceContent).To(ContainSubstring("Before=coreos-copy-firstboot-network.service"))
+						Expect(preNetMangerConfServiceContent).ToNot(ContainSubstring("After=nm-initrd.service"))
+					}
+				case "/usr/local/bin/common_network_script.sh":
+					commonScriptBytes, err := io.ReadAll(r)
+					Expect(err).ToNot(HaveOccurred())
+					commonScriptContent := string(commonScriptBytes)
+					Expect(commonScriptContent).To(ContainSubstring("NM_CONFIG_DIR=${PATH_PREFIX}/etc/assisted/network"))
+				}
+			}
+		}
+		It("old flow involving generating nmconnection files", func() {
+			infraEnv := createInfraEnv(models.ImageTypeMinimalIso)
+			infraEnv.StaticNetworkConfig = formattedInput
+			infraEnv.OpenshiftVersion = ocpVersionInvolvingGenerateKeyfiles
+			infraEnv = applyProxy(infraEnv)
+			Expect(db.Create(&infraEnv).Error).NotTo(HaveOccurred())
+			mockStaticNetworkConfig.EXPECT().ShouldUseNmstateService(infraEnv.OpenshiftVersion).Return(false, nil).Times(1)
+			mockStaticNetworkConfig.EXPECT().GenerateStaticNetworkConfigData(gomock.Any(), formattedInput).Return(staticnetworkConfigOutput, nil).Times(1)
+			validateArchiveStatNetFlow(infraEnv, false)
+		})
+		It("new flow involving nmpolicy and nmstate service", func() {
+			infraEnv := createInfraEnv(models.ImageTypeMinimalIso)
+			infraEnv.StaticNetworkConfig = formattedInput
+			infraEnv.OpenshiftVersion = common.MinimalVersionForNmstatectl
+			infraEnv = applyProxy(infraEnv)
+			Expect(db.Create(&infraEnv).Error).NotTo(HaveOccurred())
+			mockStaticNetworkConfig.EXPECT().ShouldUseNmstateService(infraEnv.OpenshiftVersion).Return(true, nil).Times(1)
+			mockStaticNetworkConfig.EXPECT().GenerateStaticNetworkConfigDataYAML(formattedInput).Return(staticNetworkConfigNmpolicyOutput, nil).Times(1)
+			validateArchiveStatNetFlow(infraEnv, true)
+		})
+		It("embeds per-infra-env network discovery delay in nmstatectl minimal ISO service", func() {
+			delay := int64(8)
+			infraEnv := createInfraEnv(models.ImageTypeMinimalIso)
+			infraEnv.StaticNetworkConfig = formattedInput
+			infraEnv.OpenshiftVersion = common.MinimalVersionForNmstatectl
+			infraEnv.NetworkDiscoveryDelaySeconds = &delay
+			infraEnv = applyProxy(infraEnv)
+			Expect(db.Create(&infraEnv).Error).NotTo(HaveOccurred())
+			mockStaticNetworkConfig.EXPECT().ShouldUseNmstateService(infraEnv.OpenshiftVersion).Return(true, nil).Times(1)
+			mockStaticNetworkConfig.EXPECT().GenerateStaticNetworkConfigDataYAML(formattedInput).Return(staticNetworkConfigNmpolicyOutput, nil).Times(1)
+
+			params := installer.DownloadMinimalInitrdParams{InfraEnvID: id}
+			responsePayload := bm.DownloadMinimalInitrd(ctx, params).(*installer.DownloadMinimalInitrdOK).Payload
+
+			gzipReader, err := gzip.NewReader(responsePayload)
+			Expect(err).ToNot(HaveOccurred())
+			defer gzipReader.Close()
+
+			r := cpio.NewReader(gzipReader)
+			for {
+				hdr, err := r.Next()
+				if err == io.EOF {
+					break
+				}
+				Expect(err).ToNot(HaveOccurred())
+				if hdr.Name == "/etc/systemd/system/pre-network-manager-config.service" {
+					serviceBytes, err := io.ReadAll(r)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(string(serviceBytes)).To(ContainSubstring("Environment=DISCOVERY_DELAY_SECONDS=8"))
+					Expect(string(serviceBytes)).To(ContainSubstring("TimeoutSec=68"))
+					return
+				}
+			}
+			Fail("pre-network-manager-config.service not found in archive")
+		})
+	})
 })
 
 var _ = Describe("V2UploadClusterIngressCert test", func() {
@@ -10554,8 +12270,9 @@ var _ = Describe("V2UploadClusterIngressCert test", func() {
 		clusterID = strfmt.UUID(uuid.New().String())
 		bm = createInventory(db, cfg)
 		mockOperators := operators.NewMockAPI(ctrl)
+		mockNoChangeInOperatorDependencies(mockOperators)
 		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-			db, commontesting.GetDummyNotificationStream(ctrl), nil, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+			db, commontesting.GetDummyNotificationStream(ctrl), nil, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 		c = common.Cluster{Cluster: models.Cluster{
 			ID:               &clusterID,
 			OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
@@ -11497,6 +13214,19 @@ var _ = Describe("GetClusterInstallConfig", func() {
 		_, ok := response.(*installer.V2GetClusterInstallConfigOK)
 		Expect(ok).To(BeTrue())
 	})
+
+	It("fail to get install config for Day2 cluster", func() {
+		c.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		db.Save(&c)
+
+		params := installer.V2GetClusterInstallConfigParams{ClusterID: clusterID}
+		response := bm.V2GetClusterInstallConfig(ctx, params)
+
+		errorResponse, ok := response.(*common.ApiErrorResponse)
+		Expect(ok).To(BeTrue(), "Expected response to be ApiErrorResponse but got %T", response)
+		Expect(int(errorResponse.StatusCode())).To(Equal(http.StatusBadRequest))
+	})
+
 })
 
 var _ = Describe("UpdateClusterInstallConfig", func() {
@@ -11591,6 +13321,40 @@ var _ = Describe("UpdateClusterInstallConfig", func() {
 		bm.V2UpdateClusterInstallConfig(ctx, params)
 	})
 
+	It("sets FIPS feature usage when fips is enabled in install config overrides", func() {
+		override := `{"fips":true}`
+		params := installer.V2UpdateClusterInstallConfigParams{
+			ClusterID:           clusterID,
+			InstallConfigParams: override,
+		}
+		mockUsage.EXPECT().Add(gomock.Any(), usage.InstallConfigOverrides, gomock.Any()).Times(1)
+		mockUsage.EXPECT().Add(gomock.Any(), usage.FIPSUsage, gomock.Any()).Times(1)
+		mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.InstallConfigAppliedEventName),
+			eventstest.WithClusterIdMatcher(params.ClusterID.String())))
+		mockInstallConfigBuilder.EXPECT().ValidateInstallConfigPatch(gomock.Any(), gomock.Any(), params.InstallConfigParams).Return(nil).Times(1)
+		mockGetInstallConfigSuccess(mockInstallConfigBuilder)
+		bm.V2UpdateClusterInstallConfig(ctx, params)
+	})
+
+	It("removes FIPS feature usage when fips is disabled in install config overrides", func() {
+		override := `{"fips":false}`
+		params := installer.V2UpdateClusterInstallConfigParams{
+			ClusterID:           clusterID,
+			InstallConfigParams: override,
+		}
+		mockUsage.EXPECT().Add(gomock.Any(), usage.InstallConfigOverrides, gomock.Any()).Times(1)
+		mockUsage.EXPECT().Remove(gomock.Any(), usage.FIPSUsage).Times(1)
+		mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.InstallConfigAppliedEventName),
+			eventstest.WithClusterIdMatcher(params.ClusterID.String())))
+		mockInstallConfigBuilder.EXPECT().ValidateInstallConfigPatch(gomock.Any(), gomock.Any(), params.InstallConfigParams).Return(nil).Times(1)
+		mockGetInstallConfigSuccess(mockInstallConfigBuilder)
+		bm.V2UpdateClusterInstallConfig(ctx, params)
+	})
+
 	It("doesn't update the install config overrides feature usage if it's empty", func() {
 		params := installer.V2UpdateClusterInstallConfigParams{
 			ClusterID:           clusterID,
@@ -11615,28 +13379,23 @@ var _ = Describe("UpdateClusterInstallConfig", func() {
 		func(version string) {
 			err := db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("openshift_version", version).Error
 			Expect(err).ToNot(HaveOccurred())
+			override := `{"capabilities": {"baselineCapabilitySet": "None", "additionalEnabledCapabilities": ["baremetal"]}}`
+			//err = db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("install_config_overrides", override).Error
+			//Expect(err).ToNot(HaveOccurred())
 			operator := &models.MonitoredOperator{
 				ClusterID: clusterID,
 				Name:      "console",
 			}
 			err = db.FirstOrCreate(operator).Error
 			Expect(err).ToNot(HaveOccurred())
-			installConfig := installcfg.InstallerConfigBaremetal{
-				Capabilities: &installcfg.Capabilities{
-					BaselineCapabilitySet: "None",
-					AdditionalEnabledCapabilities: []installcfg.ClusterVersionCapability{
-						"baremetal",
-					},
-				},
-			}
-			installConfigData, err := yaml.Marshal(installConfig)
-			Expect(err).ToNot(HaveOccurred())
 			mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).AnyTimes()
 			mockInstallConfigBuilder.EXPECT().ValidateInstallConfigPatch(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-			mockInstallConfigBuilder.EXPECT().GetInstallConfig(gomock.Any(), gomock.Any(), gomock.Any()).Return(installConfigData, nil).AnyTimes()
+			mockUsage.EXPECT().Add(gomock.Any(), usage.InstallConfigOverrides, gomock.Any()).Times(1)
+			mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+			mockUsage.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(0)
 			params := installer.V2UpdateClusterInstallConfigParams{
 				ClusterID:           clusterID,
-				InstallConfigParams: "{}",
+				InstallConfigParams: override,
 			}
 			bm.V2UpdateClusterInstallConfig(ctx, params)
 			err = db.First(&operator).Error
@@ -11652,28 +13411,21 @@ var _ = Describe("UpdateClusterInstallConfig", func() {
 		func(version string) {
 			err := db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("openshift_version", version).Error
 			Expect(err).ToNot(HaveOccurred())
+			override := `{"capabilities": {"baselineCapabilitySet": "None", "additionalEnabledCapabilities": ["console"]}}`
 			operator := &models.MonitoredOperator{
 				ClusterID: clusterID,
 				Name:      "console",
 			}
 			err = db.FirstOrCreate(operator).Error
 			Expect(err).ToNot(HaveOccurred())
-			installConfig := installcfg.InstallerConfigBaremetal{
-				Capabilities: &installcfg.Capabilities{
-					BaselineCapabilitySet: "None",
-					AdditionalEnabledCapabilities: []installcfg.ClusterVersionCapability{
-						"baremetal",
-					},
-				},
-			}
-			installConfigData, err := yaml.Marshal(installConfig)
-			Expect(err).ToNot(HaveOccurred())
 			mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).AnyTimes()
 			mockInstallConfigBuilder.EXPECT().ValidateInstallConfigPatch(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-			mockInstallConfigBuilder.EXPECT().GetInstallConfig(gomock.Any(), gomock.Any(), gomock.Any()).Return(installConfigData, nil).AnyTimes()
+			mockUsage.EXPECT().Add(gomock.Any(), usage.InstallConfigOverrides, gomock.Any()).Times(1)
+			mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+			mockUsage.EXPECT().Remove(gomock.Any(), gomock.Any()).Times(0)
 			params := installer.V2UpdateClusterInstallConfigParams{
 				ClusterID:           clusterID,
-				InstallConfigParams: "{}",
+				InstallConfigParams: override,
 			}
 			bm.V2UpdateClusterInstallConfig(ctx, params)
 			err = db.First(&operator).Error
@@ -11685,7 +13437,10 @@ var _ = Describe("UpdateClusterInstallConfig", func() {
 	)
 
 	It("Adds the console from the list of monitored operators", func() {
+		override := `{"capabilities": {"baselineCapabilitySet": "None", "additionalEnabledCapabilities": ["console"]}}`
 		err := db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("openshift_version", "4.12.7").Error
+		Expect(err).ToNot(HaveOccurred())
+		err = db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("install_config_overrides", override).Error
 		Expect(err).ToNot(HaveOccurred())
 		operator := &models.MonitoredOperator{
 			ClusterID: clusterID,
@@ -11693,22 +13448,11 @@ var _ = Describe("UpdateClusterInstallConfig", func() {
 		}
 		err = db.Delete(operator).Error
 		Expect(err).ToNot(HaveOccurred())
-		installConfig := installcfg.InstallerConfigBaremetal{
-			Capabilities: &installcfg.Capabilities{
-				BaselineCapabilitySet: "None",
-				AdditionalEnabledCapabilities: []installcfg.ClusterVersionCapability{
-					"Console",
-				},
-			},
-		}
-		installConfigData, err := yaml.Marshal(installConfig)
-		Expect(err).ToNot(HaveOccurred())
 		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).AnyTimes()
 		mockInstallConfigBuilder.EXPECT().ValidateInstallConfigPatch(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-		mockInstallConfigBuilder.EXPECT().GetInstallConfig(gomock.Any(), gomock.Any(), gomock.Any()).Return(installConfigData, nil).AnyTimes()
 		params := installer.V2UpdateClusterInstallConfigParams{
 			ClusterID:           clusterID,
-			InstallConfigParams: "{}",
+			InstallConfigParams: "",
 		}
 		bm.V2UpdateClusterInstallConfig(ctx, params)
 		err = db.First(&operator).Error
@@ -11736,12 +13480,16 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		infraEnvID = strfmt.UUID(uuid.New().String())
+		infraEnvName := "test-infra-env"
 		infraEnv := common.InfraEnv{
 			InfraEnv: models.InfraEnv{
 				ID:               &infraEnvID,
+				Name:             &infraEnvName,
 				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				CPUArchitecture:  common.DefaultCPUArchitecture,
 				PullSecretSet:    true,
 				Type:             common.ImageTypePtr(models.ImageTypeFullIso),
+				SSHAuthorizedKey: "ssh-rsa sshkey",
 			},
 			ImageTokenKey: testTokenKey,
 			PullSecret:    fakePullSecret,
@@ -11754,7 +13502,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		ctrl.Finish()
 	})
 
-	getResponse := func(fileName string, withMac bool, ipxeScriptType *string, discoveryIsoType string) middleware.Responder {
+	getResponse := func(fileName string, withMac bool, ipxeScriptType *string, discoveryIsoType string, infraEnvID strfmt.UUID) middleware.Responder {
 		params := installer.V2DownloadInfraEnvFilesParams{InfraEnvID: infraEnvID, FileName: fileName, DiscoveryIsoType: &discoveryIsoType}
 		if withMac {
 			params.Mac = toMac("f8:75:a4:a4:00:fe")
@@ -11763,8 +13511,8 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		return bm.V2DownloadInfraEnvFiles(ctx, params)
 	}
 
-	getResponseData := func(fileName string, withMac bool, ipxeScriptType *string, discoveryIsoType string) []byte {
-		response := getResponse(fileName, withMac, ipxeScriptType, discoveryIsoType)
+	getResponseData := func(fileName string, withMac bool, ipxeScriptType *string, discoveryIsoType string, infraEnvID strfmt.UUID) []byte {
+		response := getResponse(fileName, withMac, ipxeScriptType, discoveryIsoType, infraEnvID)
 		fileMw, ok := response.(*filemiddleware.FileMiddlewareResponder)
 		Expect(ok).To(BeTrue())
 		innerType, ok := fileMw.GetNext().(*installer.V2DownloadInfraEnvFilesOK)
@@ -11798,7 +13546,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 
 	It("should ensure the correct discovery iso type is passed to the ignition builder", func() {
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), "").Return(discovery_ignition_3_1, nil).Times(1)
-		body := getResponseData("discovery.ign", false, nil, "")
+		body := getResponseData("discovery.ign", false, nil, "", infraEnvID)
 		config, report, err := ign_3_1.Parse(body)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(report.IsFatal()).To(BeFalse())
@@ -11808,7 +13556,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 	It("returns discovery.ign successfully when asked to use full-iso", func() {
 		discoveryIsoType := string(models.ImageTypeFullIso)
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), discoveryIsoType).Return(discovery_ignition_3_1, nil).Times(1)
-		body := getResponseData("discovery.ign", false, nil, discoveryIsoType)
+		body := getResponseData("discovery.ign", false, nil, discoveryIsoType, infraEnvID)
 		config, report, err := ign_3_1.Parse(body)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(report.IsFatal()).To(BeFalse())
@@ -11818,11 +13566,69 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 	It("returns discovery.ign successfully when asked to use minimal-iso", func() {
 		discoveryIsoType := string(models.ImageTypeMinimalIso)
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), discoveryIsoType).Return(discovery_ignition_3_1, nil).Times(1)
-		body := getResponseData("discovery.ign", false, nil, discoveryIsoType)
+		body := getResponseData("discovery.ign", false, nil, discoveryIsoType, infraEnvID)
 		config, report, err := ign_3_1.Parse(body)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(report.IsFatal()).To(BeFalse())
 		Expect(config.Ignition.Version).To(Equal("3.1.0"))
+	})
+
+	It("returns OVE ignition for discovery.ign when InfraEnv has disconnected-iso type", func() {
+		clusterID := strfmt.UUID(uuid.New().String())
+		cluster := common.Cluster{
+			Cluster: models.Cluster{
+				ID:               &clusterID,
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				CPUArchitecture:  common.DefaultCPUArchitecture,
+			},
+		}
+		Expect(db.Create(&cluster).Error).To(Succeed())
+
+		var infraEnv common.InfraEnv
+		Expect(db.First(&infraEnv, "id = ?", infraEnvID).Error).To(Succeed())
+		infraEnv.Type = common.ImageTypePtr(models.ImageTypeDisconnectedIso)
+		infraEnv.ClusterID = clusterID
+		Expect(db.Save(&infraEnv).Error).To(Succeed())
+
+		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(&models.ReleaseImage{
+				CPUArchitecture:  swag.String(common.DefaultCPUArchitecture),
+				OpenshiftVersion: swag.String(common.TestDefaultConfig.OpenShiftVersion),
+				URL:              swag.String("test-url"),
+				Version:          swag.String("4.16.0"),
+			}, nil)
+		mockInstallerCache.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(installercache.NewMockRelease("/tmp/test", mockEvents), nil)
+		mockEvents.EXPECT().V2AddMetricsEvent(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		mockExecuter.EXPECT().Execute(gomock.Any(), "agent", "create", "unconfigured-ignition", gomock.Any(), gomock.Any()).
+			DoAndReturn(func(command string, args ...string) (string, string, int) {
+				tempDir := args[len(args)-1]
+				mockIgnition := `{"ignition": {"version": "3.2.0"},"storage":{"files":[]}}`
+				err := os.WriteFile(filepath.Join(tempDir, "unconfigured-agent.ign"),
+					[]byte(mockIgnition), 0600)
+				Expect(err).NotTo(HaveOccurred())
+				return "", "", 0
+			})
+
+		body := getResponseData("discovery.ign", false, nil, "", infraEnvID)
+
+		var ignitionConfig map[string]interface{}
+		err := json.Unmarshal(body, &ignitionConfig)
+		Expect(err).NotTo(HaveOccurred())
+
+		ignition, ok := ignitionConfig["ignition"].(map[string]interface{})
+		Expect(ok).To(BeTrue())
+		Expect(ignition["version"]).To(Equal("3.2.0"))
+	})
+
+	It("returns error when infraEnv has disconnected-iso type but is not bound to a cluster", func() {
+		imageType := models.ImageTypeDisconnectedIso
+		err := db.Model(&common.InfraEnv{}).Where("id = ?", infraEnvID).Update("type", imageType).Error
+		Expect(err).NotTo(HaveOccurred())
+
+		params := installer.V2DownloadInfraEnvFilesParams{InfraEnvID: infraEnvID, FileName: "discovery.ign"}
+		response := bm.V2DownloadInfraEnvFiles(ctx, params)
+		verifyApiError(response, http.StatusNotFound)
 	})
 
 	It("returns not found with a non-existant InfraEnv", func() {
@@ -11838,8 +13644,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 	})
 
 	It("returns ipxe-script successfully", func() {
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
-		content := getResponseData("ipxe-script", false, nil, "")
+
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+		content := getResponseData("ipxe-script", false, nil, "", infraEnvID)
 		lines := strings.Split(string(content), "\n")
 
 		Expect(lines[0]).To(Equal("#!ipxe"))
@@ -11855,14 +13662,14 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kernelURL.Host).To(Equal(imageServiceHost))
 		Expect(kernelURL.Path).To(Equal(imageServicePath + "/boot-artifacts/kernel"))
-		Expect(kernelURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(kernelURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(kernelURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		rootfsURL, err := url.Parse(match[2])
 		Expect(err).NotTo(HaveOccurred())
 		Expect(rootfsURL.Host).To(Equal(imageServiceHost))
 		Expect(rootfsURL.Path).To(Equal(imageServicePath + "/boot-artifacts/rootfs"))
-		Expect(rootfsURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(rootfsURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(rootfsURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		Expect(match[3]).To(Equal(`random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8 coreos.inst.persistent-kargs="console=tty1 console=ttyS1,115200n8"`))
@@ -11877,7 +13684,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		Expect(initrdURL.Scheme).To(Equal("http"))
 		Expect(initrdURL.Host).To(Equal(imageServiceHost))
 		Expect(initrdURL.Path).To(Equal(fmt.Sprintf("%s/images/%s/pxe-initrd", imageServicePath, infraEnvID)))
-		Expect(initrdURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(initrdURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(initrdURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		Expect(lines[3]).To(Equal("boot"))
@@ -11890,8 +13697,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 			"p3=\"this is an argument\"",
 		}
 		initialKernelArguments := `random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8 coreos.inst.persistent-kargs="console=tty1 console=ttyS1,115200n8"`
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(3)
-		content := getResponseData("ipxe-script", false, nil, "")
+
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
+		content := getResponseData("ipxe-script", false, nil, "", infraEnvID)
 		lines := strings.Split(string(content), "\n")
 
 		Expect(lines[0]).To(Equal("#!ipxe"))
@@ -11910,7 +13718,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 			gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 		updateKernelArgs(kernelArguments...)
 		By("get ipxe script again")
-		content = getResponseData("ipxe-script", false, nil, "")
+		content = getResponseData("ipxe-script", false, nil, "", infraEnvID)
 		lines = strings.Split(string(content), "\n")
 
 		Expect(lines[0]).To(Equal("#!ipxe"))
@@ -11924,8 +13732,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 	})
 
 	It("returns ipxe-script successfully with mac", func() {
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
-		content := getResponseData("ipxe-script", true, nil, "")
+
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+		content := getResponseData("ipxe-script", true, nil, "", infraEnvID)
 		lines := strings.Split(string(content), "\n")
 
 		Expect(lines[0]).To(Equal("#!ipxe"))
@@ -11941,14 +13750,14 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(kernelURL.Host).To(Equal(imageServiceHost))
 		Expect(kernelURL.Path).To(Equal(imageServicePath + "/boot-artifacts/kernel"))
-		Expect(kernelURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(kernelURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(kernelURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		rootfsURL, err := url.Parse(match[2])
 		Expect(err).NotTo(HaveOccurred())
 		Expect(rootfsURL.Host).To(Equal(imageServiceHost))
 		Expect(rootfsURL.Path).To(Equal(imageServicePath + "/boot-artifacts/rootfs"))
-		Expect(rootfsURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(rootfsURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(rootfsURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		Expect(match[3]).To(Equal(`random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8 coreos.inst.persistent-kargs="console=tty1 console=ttyS1,115200n8"`))
@@ -11963,21 +13772,23 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		Expect(initrdURL.Scheme).To(Equal("http"))
 		Expect(initrdURL.Host).To(Equal(imageServiceHost))
 		Expect(initrdURL.Path).To(Equal(fmt.Sprintf("%s/images/%s/pxe-initrd", imageServicePath, infraEnvID)))
-		Expect(initrdURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.OpenshiftVersion))
+		Expect(initrdURL.Query().Get("version")).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 		Expect(initrdURL.Query().Get("arch")).To(Equal(*common.TestDefaultConfig.OsImage.CPUArchitecture))
 
 		Expect(lines[3]).To(Equal("boot"))
 	})
 
 	It("fails to return ipxe-script when openshift version is nil", func() {
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(&models.OsImage{}, nil).Times(1)
+
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(&models.OsImage{}, nil).Times(1)
 		params := installer.V2DownloadInfraEnvFilesParams{InfraEnvID: infraEnvID, FileName: "ipxe-script"}
 		response := bm.V2DownloadInfraEnvFiles(ctx, params)
 		verifyApiError(response, http.StatusInternalServerError)
 	})
 
 	It("fails to return ipxe-script when openshift version can't be found", func() {
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(nil, fmt.Errorf("some error")).Times(1)
+
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(nil, fmt.Errorf("some error")).Times(1)
 		params := installer.V2DownloadInfraEnvFilesParams{InfraEnvID: infraEnvID, FileName: "ipxe-script"}
 		response := bm.V2DownloadInfraEnvFiles(ctx, params)
 		verifyApiError(response, http.StatusBadRequest)
@@ -12018,8 +13829,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 				}
 			}
 			Expect(db.Create(&host).Error).ToNot(HaveOccurred())
-			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
-			content := getResponseData("ipxe-script", true, nil, "")
+
+			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			content := getResponseData("ipxe-script", true, nil, "", infraEnvID)
 			initrdRegex := regexp.MustCompile(`^initrd --name initrd (.+)`)
 			match := initrdRegex.FindStringSubmatch(strings.Split(string(content), "\n")[1])
 			Expect(match).NotTo(BeNil())
@@ -12073,7 +13885,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 				}
 			}
 			Expect(db.Create(&host).Error).ToNot(HaveOccurred())
-			response := getResponse("ipxe-script", true, nil, "")
+			response := getResponse("ipxe-script", true, nil, "", infraEnvID)
 			verifyApiErrorString(response, http.StatusNotFound, "IPXE booting skipped")
 			Expect(db.Delete(&models.Host{ID: &id, InfraEnvID: infraEnvID}).Error).ToNot(HaveOccurred())
 		}
@@ -12091,7 +13903,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 			Expect(db.Create(&host).Error).ToNot(HaveOccurred())
 		}
 
-		response := getResponse("ipxe-script", true, swag.String(BootOrderControl), "")
+		response := getResponse("ipxe-script", true, swag.String(BootOrderControl), "", infraEnvID)
 		verifyApiErrorString(response, http.StatusInternalServerError, "Unexpected number of hosts")
 	})
 
@@ -12114,7 +13926,7 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		})
 
 		It("IPXE without mac with script type BootOrderControl", func() {
-			content := getResponseData("ipxe-script", false, swag.String(BootOrderControl), "")
+			content := getResponseData("ipxe-script", false, swag.String(BootOrderControl), "", infraEnvID)
 			chainRegex := regexp.MustCompile(`^chain +(.*file_name=ipxe-script&mac=[$]{net0/mac})`)
 			match := chainRegex.FindStringSubmatch(strings.Split(string(content), "\n")[1])
 			Expect(match).NotTo(BeNil())
@@ -12127,8 +13939,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		})
 
 		It("signs the initrd ipxe-script url correctly", func() {
-			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
-			content := getResponseData("ipxe-script", false, nil, "")
+
+			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			content := getResponseData("ipxe-script", false, nil, "", infraEnvID)
 			initrdRegex := regexp.MustCompile(`^initrd --name initrd (.+)`)
 			match := initrdRegex.FindStringSubmatch(strings.Split(string(content), "\n")[1])
 			Expect(match).NotTo(BeNil())
@@ -12150,8 +13963,9 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 		})
 
 		It("signs the initrd ipxe-script url correctly", func() {
-			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
-			content := getResponseData("ipxe-script", false, nil, "")
+
+			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			content := getResponseData("ipxe-script", false, nil, "", infraEnvID)
 			initrdRegex := regexp.MustCompile(`^initrd --name initrd (.+)`)
 			match := initrdRegex.FindStringSubmatch(strings.Split(string(content), "\n")[1])
 			Expect(match).NotTo(BeNil())
@@ -12161,6 +13975,36 @@ var _ = Describe("V2DownloadInfraEnvFiles", func() {
 			tok := initrdURL.Query().Get("image_token")
 			_, err = bm.authHandler.AuthImageAuth(tok)
 			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("static-network-config case", func() {
+		infraEnvWithStatNetID := strfmt.UUID(uuid.New().String())
+		infraEnvWithStatNet := common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID:                  &infraEnvWithStatNetID,
+				StaticNetworkConfig: formattedInput,
+				PullSecretSet:       true,
+				Type:                common.ImageTypePtr(models.ImageTypeFullIso),
+			},
+			ImageTokenKey: testTokenKey,
+			PullSecret:    fakePullSecret,
+		}
+		It("old flow involving generating nmconnection files", func() {
+			infraEnvWithStatNet.OpenshiftVersion = ocpVersionInvolvingGenerateKeyfiles
+			Expect(db.Create(&infraEnvWithStatNet).Error).To(Succeed())
+			mockStaticNetworkConfig.EXPECT().ShouldUseNmstateService(infraEnvWithStatNet.OpenshiftVersion).Return(false, nil).Times(1)
+			mockStaticNetworkConfig.EXPECT().GenerateStaticNetworkConfigData(gomock.Any(), formattedInput).Return(staticnetworkConfigOutput, nil).Times(1)
+			content := getResponseData("static-network-config", false, nil, "", infraEnvWithStatNetID)
+			Expect(string(content)).To(ContainSubstring("/etc/assisted/network/nic10.nmconnection"))
+		})
+		It("new flow involving nmpolicy and nmstate service", func() {
+			infraEnvWithStatNet.OpenshiftVersion = common.MinimalVersionForNmstatectl
+			Expect(db.Create(&infraEnvWithStatNet).Error).To(Succeed())
+			mockStaticNetworkConfig.EXPECT().ShouldUseNmstateService(infraEnvWithStatNet.OpenshiftVersion).Return(true, nil).Times(1)
+			mockStaticNetworkConfig.EXPECT().GenerateStaticNetworkConfigDataYAML(formattedInput).Return(staticNetworkConfigNmpolicyOutput, nil).Times(1)
+			content := getResponseData("static-network-config", false, nil, "", infraEnvWithStatNetID)
+			Expect(string(content)).To(ContainSubstring("/etc/assisted/network/nic10.yml"))
 		})
 	})
 })
@@ -12204,7 +14048,8 @@ var _ = Describe("UpdateInfraEnv - Ignition", func() {
 			InfraEnvUpdateParams: &models.InfraEnvUpdateParams{IgnitionConfigOverride: override},
 		}
 		mockUsageReports()
-		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).AnyTimes()
 		mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 			eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -12278,7 +14123,8 @@ var _ = Describe("UpdateInfraEnv - Ignition", func() {
 			InfraEnvID:           *infraEnv.ID,
 			InfraEnvUpdateParams: &models.InfraEnvUpdateParams{IgnitionConfigOverride: override},
 		}
-		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).AnyTimes()
 		mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 			eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -12311,7 +14157,8 @@ var _ = Describe("UpdateInfraEnv - Ignition", func() {
 			InfraEnvID:           *infraEnv.ID,
 			InfraEnvUpdateParams: &models.InfraEnvUpdateParams{IgnitionConfigOverride: override},
 		}
-		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(discovery_ignition_3_1, nil).Times(1)
 		mockEvents.EXPECT().SendInfraEnvEvent(gomock.Any(), eventstest.NewEventMatcher(
 			eventstest.WithNameMatcher(eventgen.ImageInfoUpdatedEventName),
@@ -12332,6 +14179,7 @@ var _ = Describe("UpdateInfraEnv - Ignition", func() {
 		largeDiscoveryIgnition := fmt.Sprintf(`{"ignition": {"version": "3.1.0"}, "storage": {"files": [{"path": "/tmp/example", "contents": {"source": "data:text/plain;base64,%s"}}]}}`, content)
 		override := `{"ignition": {"version": "3.1.0"}, "storage": {"files": [{"path": "/tmp/example", "contents": {"source": "data:text/plain;base64,aGVscGltdHJhcHBlZGluYXN3YWdnZXJzcGVj"}}]}}`
 
+		mockOSImages.EXPECT().GetOsImageOrLatest("", gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).AnyTimes()
 		mockIgnitionBuilder.EXPECT().FormatDiscoveryIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(largeDiscoveryIgnition, nil).AnyTimes()
 		mockUsage.EXPECT().Add(gomock.Any(), usage.IgnitionConfigOverrideUsage, gomock.Any()).Times(1)
 		mockUsage.EXPECT().Save(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
@@ -12362,16 +14210,16 @@ var _ = Describe("GetSupportedPlatformsFromInventory", func() {
 		db, dbName = common.PrepareTestDB()
 		bm = createInventory(db, cfg)
 		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 		mockUsageReports()
 		mockClusterRegisterSuccess(true)
 		mockAMSSubscription(ctx)
 		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 			NewClusterParams: &models.ClusterCreateParams{
-				Name:                 swag.String("some-cluster-name"),
-				OpenshiftVersion:     swag.String(common.TestDefaultConfig.OpenShiftVersion),
-				PullSecret:           swag.String(fakePullSecret),
-				HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+				Name:              swag.String("some-cluster-name"),
+				OpenshiftVersion:  swag.String(common.TestDefaultConfig.OpenShiftVersion),
+				PullSecret:        swag.String(fakePullSecret),
+				ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
 			},
 		})
 		Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
@@ -12435,8 +14283,10 @@ var _ = Describe("GetSupportedPlatformsFromInventory", func() {
 	})
 
 	It("single SNO vsphere host", func() {
-		*c.HighAvailabilityMode = models.ClusterHighAvailabilityModeNone
-		db.Save(c)
+		db.Model(&models.Cluster{}).
+			Where("id = ?", clusterID).
+			Update("control_plane_count", int64(1))
+		Expect(db.Error).ToNot(HaveOccurred())
 
 		addVsphereHost(clusterID, models.HostRoleMaster)
 		validateHostsInventory(1, 0)
@@ -12447,20 +14297,11 @@ var _ = Describe("GetSupportedPlatformsFromInventory", func() {
 		Expect(platforms[0]).Should(Equal(models.PlatformTypeNone))
 	})
 
-	It("HighAvailabilityMode is nil with single host", func() {
-		c.HighAvailabilityMode = nil
-		db.Save(c)
-
-		addVsphereHost(clusterID, models.HostRoleMaster)
-		validateHostsInventory(1, 0)
-		mockProviderRegistry.EXPECT().GetSupportedProvidersByHosts(gomock.Any())
-		platformReplay := bm.GetClusterSupportedPlatforms(ctx, installer.GetClusterSupportedPlatformsParams{ClusterID: clusterID})
-		Expect(platformReplay).Should(BeAssignableToTypeOf(installer.NewGetClusterSupportedPlatformsOK()))
-	})
-
 	It("Unsupported platform - nutanix", func() {
-		c.OpenshiftVersion = "4.10"
-		db.Save(c)
+		db.Model(&models.Cluster{}).
+			Where("id = ?", clusterID).
+			Update("openshift_version", "4.10")
+		Expect(db.Error).ToNot(HaveOccurred())
 
 		addNutanixHost(clusterID, models.HostRoleMaster)
 		addNutanixHost(clusterID, models.HostRoleMaster)
@@ -12473,18 +14314,23 @@ var _ = Describe("GetSupportedPlatformsFromInventory", func() {
 		Expect(platforms).To(Not(ContainElement(models.PlatformTypeNutanix)))
 
 		// Nutanix is supported platform on OCP > 4.11
-		c.OpenshiftVersion = "4.12"
-		db.Save(c)
+		db.Model(&models.Cluster{}).
+			Where("id = ?", clusterID).
+			Update("openshift_version", "4.12")
+		Expect(db.Error).ToNot(HaveOccurred())
 		mockProviderRegistry.EXPECT().GetSupportedProvidersByHosts(gomock.Any()).Return(expectedPlatforms, nil)
 		platformReplay = bm.GetClusterSupportedPlatforms(ctx, installer.GetClusterSupportedPlatformsParams{ClusterID: clusterID})
 		platforms = platformReplay.(*installer.GetClusterSupportedPlatformsOK).Payload
+		fmt.Fprintf(GinkgoWriter, "platforms: %v\n", platforms)
 		Expect(len(platforms)).Should(Equal(3))
 		Expect(platforms).To(ContainElement(models.PlatformTypeNutanix))
 	})
 
 	It("Unsupported platform - external", func() {
-		c.OpenshiftVersion = "4.13"
-		db.Save(c)
+		db.Model(&models.Cluster{}).
+			Where("id = ?", clusterID).
+			Update("openshift_version", "4.13")
+		Expect(db.Error).ToNot(HaveOccurred())
 
 		addNutanixHost(clusterID, models.HostRoleMaster)
 		addNutanixHost(clusterID, models.HostRoleMaster)
@@ -12497,8 +14343,10 @@ var _ = Describe("GetSupportedPlatformsFromInventory", func() {
 		Expect(platforms).To(Not(ContainElement(models.PlatformTypeExternal)))
 
 		// external is supported platform on OCP > 4.13
-		c.OpenshiftVersion = "4.14"
-		db.Save(c)
+		db.Model(&models.Cluster{}).
+			Where("id = ?", clusterID).
+			Update("openshift_version", "4.14")
+		Expect(db.Error).ToNot(HaveOccurred())
 		mockProviderRegistry.EXPECT().GetSupportedProvidersByHosts(gomock.Any()).Return(expectedPlatforms, nil)
 		platformReplay = bm.GetClusterSupportedPlatforms(ctx, installer.GetClusterSupportedPlatformsParams{ClusterID: clusterID})
 		platforms = platformReplay.(*installer.GetClusterSupportedPlatformsOK).Payload
@@ -12527,6 +14375,29 @@ func verifyFeatureSupportApiErrorString(responder middleware.Responder, expected
 	ExpectWithOffset(1, concreteError.Error()).To(ContainSubstring("cannot use"))
 	ExpectWithOffset(1, concreteError.Error()).To(ContainSubstring(featuresupport.GetFeatureByID(featureA).GetName()))
 	ExpectWithOffset(1, concreteError.Error()).To(ContainSubstring(featuresupport.GetFeatureByID(featureB).GetName()))
+}
+
+func buildAPIVipConnectivityWithCoreOSImage(osImageURL string) string {
+	mcJSON := fmt.Sprintf(`{"apiVersion":"machineconfiguration.openshift.io/v1","kind":"MachineConfig","spec":{"osImageURL":"%s","config":{"ignition":{"version":"3.5.0"}}}}`, osImageURL)
+	source := "data:," + url.PathEscape(mcJSON)
+	ign := map[string]interface{}{
+		"ignition": map[string]interface{}{"version": "3.2.0"},
+		"storage": map[string]interface{}{
+			"files": []map[string]interface{}{
+				{
+					"path":     "/etc/ignition-machine-config-encapsulated.json",
+					"contents": map[string]interface{}{"source": source},
+				},
+			},
+		},
+	}
+	ignBytes, _ := json.Marshal(ign)
+	resp := models.APIVipConnectivityResponse{
+		IsSuccess: true,
+		Ignition:  string(ignBytes),
+	}
+	respBytes, _ := json.Marshal(resp)
+	return string(respBytes)
 }
 
 func addHost(hostId strfmt.UUID, role models.HostRole, state, kind string, infraEnvId, clusterId strfmt.UUID, inventory string, db *gorm.DB) models.Host {
@@ -12625,14 +14496,14 @@ var _ = Describe("Register AddHostsCluster test", func() {
 				OpenshiftClusterID: &openshiftClusterID,
 			},
 		}
-		mockClusterApi.EXPECT().RegisterAddHostsCluster(ctx, gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RegisterCluster(ctx, gomock.Any()).Return(nil).Times(1)
 		mockMetric.EXPECT().ClusterRegistered().Times(1)
 		res := bm.V2ImportCluster(ctx, params)
 		actual := res.(*installer.V2ImportClusterCreated)
 
 		Expect(actual.Payload.HostNetworks).To(Equal(defaultHostNetworks))
 		Expect(actual.Payload.Hosts).To(Equal(defaultHosts))
-		Expect(actual.Payload.OpenshiftVersion).To(BeEmpty())
+		Expect(actual.Payload.OpenshiftVersion).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
 		Expect(actual.Payload.OcpReleaseImage).To(BeEmpty())
 		Expect(actual.Payload.OpenshiftClusterID).To(Equal(openshiftClusterID))
 		Expect(res).Should(BeAssignableToTypeOf(installer.NewV2ImportClusterCreated()))
@@ -12652,14 +14523,14 @@ var _ = Describe("Register AddHostsCluster test", func() {
 				OpenshiftClusterID: &openshiftClusterID,
 			},
 		}
-		mockClusterApi.EXPECT().RegisterAddHostsCluster(ctx, gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RegisterCluster(ctx, gomock.Any()).Return(nil).Times(1)
 		mockMetric.EXPECT().ClusterRegistered().Times(1)
 		res := bm.V2ImportCluster(ctx, params)
 		actual := res.(*installer.V2ImportClusterCreated)
 
 		Expect(actual.Payload.HostNetworks).To(Equal(defaultHostNetworks))
 		Expect(actual.Payload.Hosts).To(Equal(defaultHosts))
-		Expect(actual.Payload.OpenshiftVersion).To(BeEmpty())
+		Expect(actual.Payload.OpenshiftVersion).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
 		Expect(actual.Payload.OcpReleaseImage).To(BeEmpty())
 		Expect(actual.Payload.OpenshiftClusterID).To(Equal(openshiftClusterID))
 		Expect(res).Should(BeAssignableToTypeOf(installer.NewV2ImportClusterCreated()))
@@ -12751,15 +14622,29 @@ var _ = Describe("Install Host test", func() {
 		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
 		db, dbName = common.PrepareTestDB()
 		clusterID = strfmt.UUID(uuid.New().String())
-		infraEnvId = clusterID
 		hostID = strfmt.UUID(uuid.New().String())
-		err := db.Create(&common.Cluster{Cluster: models.Cluster{
-			ID:               &clusterID,
-			Kind:             swag.String(models.ClusterKindAddHostsCluster),
-			OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
-			Status:           swag.String(models.ClusterStatusAddingHosts),
-		}}).Error
+		err := db.Create(&common.Cluster{
+			PullSecret: fakePullSecret,
+			Cluster: models.Cluster{
+				ID:               &clusterID,
+				Kind:             swag.String(models.ClusterKindAddHostsCluster),
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				Status:           swag.String(models.ClusterStatusAddingHosts),
+			},
+		}).Error
 		Expect(err).ShouldNot(HaveOccurred())
+		infraEnvId = strfmt.UUID(uuid.New().String())
+		infraEnv := common.InfraEnv{
+			PullSecret: fakePullSecret,
+			InfraEnv: models.InfraEnv{
+				ID:              &infraEnvId,
+				PullSecretSet:   true,
+				ClusterID:       clusterID,
+				Type:            models.ImageTypeFullIso.Pointer(),
+				CPUArchitecture: "x86_64",
+			},
+		}
+		Expect(db.Create(&infraEnv).Error).ShouldNot(HaveOccurred())
 		bm = createInventory(db, cfg)
 	})
 
@@ -12774,7 +14659,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
@@ -12792,7 +14677,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
@@ -12808,7 +14693,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      strfmt.UUID(uuid.New().String()),
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		res := bm.V2InstallHost(ctx, params)
 		verifyApiError(res, http.StatusNotFound)
 	})
@@ -12819,7 +14704,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		res := bm.V2InstallHost(ctx, params)
 		verifyApiError(res, http.StatusConflict)
 	})
@@ -12830,7 +14715,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusInsufficient, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusInsufficient, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		res := bm.V2InstallHost(ctx, params)
 		verifyApiError(res, http.StatusConflict)
 	})
@@ -12841,7 +14726,7 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error")).Times(0)
@@ -12856,11 +14741,67 @@ var _ = Describe("Install Host test", func() {
 			InfraEnvID:  infraEnvId,
 			HostID:      hostID,
 		}
-		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error")).Times(1)
 		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
+		res := bm.V2InstallHost(ctx, params)
+		verifyApiError(res, http.StatusInternalServerError)
+	})
+
+	It("succeeds when being installed to the rootfs", func() {
+		params := installer.V2InstallHostParams{
+			HTTPRequest: request,
+			InfraEnvID:  infraEnvId,
+			HostID:      hostID,
+		}
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, inventory, db)
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(common.TestDefaultConfig.ReleaseImage, nil)
+		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
+
+		res := bm.V2InstallHost(ctx, params)
+		Expect(res).Should(BeAssignableToTypeOf(installer.NewV2InstallHostAccepted()))
+	})
+
+	It("uses the cluster OcpReleaseImage URL when installing to the rootfs", func() {
+		ocpReleaseImage := "registry.mirror.example.com/ocp/release:4.18"
+		Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterID).Update("ocp_release_image", ocpReleaseImage).Error).ToNot(HaveOccurred())
+		params := installer.V2InstallHostParams{
+			HTTPRequest: request,
+			InfraEnvID:  infraEnvId,
+			HostID:      hostID,
+		}
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, inventory, db)
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(common.TestDefaultConfig.ReleaseImage, nil)
+		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
+
+		res := bm.V2InstallHost(ctx, params)
+		Expect(res).Should(BeAssignableToTypeOf(installer.NewV2InstallHostAccepted()))
+	})
+
+	It("fails if the release image doesn't exist when the host is being installed to the rootfs", func() {
+		params := installer.V2InstallHostParams{
+			HTTPRequest: request,
+			InfraEnvID:  infraEnvId,
+			HostID:      hostID,
+		}
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		addHost(hostID, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvId, clusterID, inventory, db)
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(nil, fmt.Errorf("failed to find release image"))
+
 		res := bm.V2InstallHost(ctx, params)
 		verifyApiError(res, http.StatusInternalServerError)
 	})
@@ -12869,25 +14810,41 @@ var _ = Describe("Install Host test", func() {
 var _ = Describe("InstallSingleDay2Host test", func() {
 
 	var (
-		bm        *bareMetalInventory
-		cfg       Config
-		db        *gorm.DB
-		ctx       = context.Background()
-		clusterID strfmt.UUID
-		dbName    string
+		bm         *bareMetalInventory
+		cfg        Config
+		db         *gorm.DB
+		ctx        = context.Background()
+		clusterID  strfmt.UUID
+		infraEnvID strfmt.UUID
+		dbName     string
 	)
 
 	BeforeEach(func() {
 		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
 		db, dbName = common.PrepareTestDB()
 		clusterID = strfmt.UUID(uuid.New().String())
-		err := db.Create(&common.Cluster{Cluster: models.Cluster{
-			ID:               &clusterID,
-			Kind:             swag.String(models.ClusterKindAddHostsCluster),
-			OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
-			Status:           swag.String(models.ClusterStatusAddingHosts),
-		}}).Error
+		err := db.Create(&common.Cluster{
+			PullSecret: fakePullSecret,
+			Cluster: models.Cluster{
+				ID:               &clusterID,
+				Kind:             swag.String(models.ClusterKindAddHostsCluster),
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				Status:           swag.String(models.ClusterStatusAddingHosts),
+			},
+		}).Error
 		Expect(err).ShouldNot(HaveOccurred())
+		infraEnvID = strfmt.UUID(uuid.New().String())
+		infraEnv := common.InfraEnv{
+			PullSecret: fakePullSecret,
+			InfraEnv: models.InfraEnv{
+				ID:              &infraEnvID,
+				PullSecretSet:   true,
+				ClusterID:       clusterID,
+				Type:            models.ImageTypeFullIso.Pointer(),
+				CPUArchitecture: "x86_64",
+			},
+		}
+		Expect(db.Create(&infraEnv).Error).ShouldNot(HaveOccurred())
 
 		bm = createInventory(db, cfg)
 	})
@@ -12899,32 +14856,86 @@ var _ = Describe("InstallSingleDay2Host test", func() {
 
 	It("Install Single Day2 Host", func() {
 		hostId := strfmt.UUID(uuid.New().String())
-		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
 			eventstest.WithNameMatcher(eventgen.HostInstallationStartedEventName),
 			eventstest.WithHostIdMatcher(hostId.String()),
-			eventstest.WithInfraEnvIdMatcher(clusterID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
 			eventstest.WithClusterIdMatcher(clusterID.String())))
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
-		res := bm.InstallSingleDay2HostInternal(ctx, clusterID, clusterID, hostId)
+		res := bm.InstallSingleDay2HostInternal(ctx, clusterID, infraEnvID, hostId)
 		Expect(res).Should(BeNil())
 	})
 
 	It("Install fail Single Day2 Host", func() {
 		expectedErrMsg := "some-internal-error"
 		hostId := strfmt.UUID(uuid.New().String())
-		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, clusterID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
+		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvID, clusterID, getInventoryStr("hostname0", "bootMode", "1.2.3.4/24", "10.11.50.90/16"), db)
 		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
 		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New(expectedErrMsg)).Times(1)
 		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
-		res := bm.InstallSingleDay2HostInternal(ctx, clusterID, clusterID, hostId)
+		res := bm.InstallSingleDay2HostInternal(ctx, clusterID, infraEnvID, hostId)
 		Expect(res.Error()).Should(Equal(expectedErrMsg))
+	})
+
+	It("succeeds when being installed to the rootfs", func() {
+		hostId := strfmt.UUID(uuid.New().String())
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvID, clusterID, inventory, db)
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostInstallationStartedEventName),
+			eventstest.WithHostIdMatcher(hostId.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithClusterIdMatcher(clusterID.String())))
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(common.TestDefaultConfig.ReleaseImage, nil)
+		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
+
+		Expect(bm.InstallSingleDay2HostInternal(ctx, clusterID, infraEnvID, hostId)).To(Succeed())
+	})
+
+	It("fails if the release image doesn't exist when the host is being installed to the rootfs", func() {
+		hostId := strfmt.UUID(uuid.New().String())
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvID, clusterID, inventory, db)
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(nil, fmt.Errorf("failed to find release image"))
+
+		Expect(bm.InstallSingleDay2HostInternal(ctx, clusterID, infraEnvID, hostId)).ToNot(Succeed())
+	})
+
+	It("succeeds when release image is unavailable but CoreOS image is in worker ignition for persistent-boot", func() {
+		hostId := strfmt.UUID(uuid.New().String())
+		inventory := `{"boot": {"device_type": "persistent"}}`
+		host := addHost(hostId, models.HostRoleWorker, models.HostStatusKnown, models.HostKindAddToExistingClusterHost, infraEnvID, clusterID, inventory, db)
+
+		testCoreOSImage := "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:abc123"
+		apiVipConnectivity := buildAPIVipConnectivityWithCoreOSImage(testCoreOSImage)
+		Expect(db.Model(&host).UpdateColumn("api_vip_connectivity", apiVipConnectivity).Error).ToNot(HaveOccurred())
+
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostInstallationStartedEventName),
+			eventstest.WithHostIdMatcher(hostId.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithClusterIdMatcher(clusterID.String())))
+		mockHostApi.EXPECT().AutoAssignRole(gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(1)
+		mockHostApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), "x86_64").Return(nil, fmt.Errorf("failed to find release image"))
+		mockHostApi.EXPECT().Install(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockS3Client.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockIgnitionBuilder.EXPECT().FormatSecondDayWorkerIgnitionFile(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(secondDayWorkerIgnition, nil).Times(1)
+
+		Expect(bm.InstallSingleDay2HostInternal(ctx, clusterID, infraEnvID, hostId)).To(Succeed())
 	})
 })
 
@@ -12970,7 +14981,63 @@ var _ = Describe("Transform day1 cluster to a day2 cluster test", func() {
 	})
 })
 
-var _ = Describe("TestRegisterCluster", func() {
+var _ = Describe("RegisterCluster with image service disabled", func() {
+	var (
+		bm     *bareMetalInventory
+		cfg    Config
+		db     *gorm.DB
+		dbName string
+		ctx    = context.Background()
+	)
+
+	BeforeEach(func() {
+		cfg.DefaultNTPSource = ""
+		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
+		db, dbName = common.PrepareTestDB()
+		Expect(cfg.DiskEncryptionSupport).Should(BeTrue())
+		bm = createInventoryWithImageService(db, cfg, false)
+		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
+			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperatorManager, nil, nil, nil, nil, nil, false, nil)
+		mockUsageReports()
+	})
+
+	AfterEach(func() {
+		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
+	})
+
+	It("register cluster succeeds when image service is disabled", func() {
+		// Mock successful release image retrieval and other required dependencies
+		mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		customReleaseImage := &models.ReleaseImage{
+			CPUArchitecture:  swag.String(common.DefaultCPUArchitecture),
+			OpenshiftVersion: swag.String(common.TestDefaultConfig.OpenShiftVersion),
+			URL:              swag.String("quay.io/openshift-release-dev/ocp-release:" + common.TestDefaultConfig.OpenShiftVersion),
+			Version:          swag.String(common.TestDefaultConfig.OpenShiftVersion),
+			SupportLevel:     models.OpenshiftVersionSupportLevelProduction,
+		}
+		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(customReleaseImage, nil).Times(1)
+		mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
+		mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockMetric.EXPECT().ClusterRegistered().Times(1)
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.ClusterRegistrationSucceededEventName))).Times(1)
+		mockAMSSubscription(ctx)
+
+		clusterParams := getDefaultClusterCreateParams()
+		clusterParams.OpenshiftVersion = swag.String(common.TestDefaultConfig.OpenShiftVersion)
+
+		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+			NewClusterParams: clusterParams,
+		})
+
+		// Should succeed without any OS image validation when image service is disabled
+		Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+		actual := reply.(*installer.V2RegisterClusterCreated)
+		Expect(actual.Payload.OpenshiftVersion).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
+	})
+})
+var _ = Describe("RegisterCluster", func() {
 	var (
 		bm     *bareMetalInventory
 		cfg    Config
@@ -12986,7 +15053,7 @@ var _ = Describe("TestRegisterCluster", func() {
 		Expect(cfg.DiskEncryptionSupport).Should(BeTrue())
 		bm = createInventory(db, cfg)
 		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperatorManager, nil, nil, nil, nil, nil, false)
+			db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperatorManager, nil, nil, nil, nil, nil, false, nil)
 		mockUsageReports()
 	})
 
@@ -13034,7 +15101,8 @@ var _ = Describe("TestRegisterCluster", func() {
 			}
 
 			mockVersions.EXPECT().GetReleaseImage(ctx, gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).Times(1)
-			mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+			mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13048,96 +15116,98 @@ var _ = Describe("TestRegisterCluster", func() {
 	)
 
 	// Testing the default network type setting during register flow, with various combinations of platforms,
-	// OpenShift version and high availability modes
+	// OpenShift version and control plane counts
 	// Note: SNO is supported starting OpenShift v4.8, and currently only supports Platform "none"
 	It("Default Network Type Setting", func() {
 		type clusterParamsForTest struct {
-			OpenShiftVersion     *string
-			HighAvailabilityMode *string
-			DesiredNetworkType   string
-			Platform             models.Platform
+			OpenShiftVersion   *string
+			ControlPlaneCount  *int64
+			DesiredNetworkType string
+			Platform           models.Platform
 		}
 
 		tests := []clusterParamsForTest{
 			// OpenShift version >= 4.12.0-0.0, not SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.13"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
+				OpenShiftVersion:   swag.String("4.13"),
+				ControlPlaneCount:  swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
 			},
 			// OpenShift version >= 4.12.0-0.0, SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.14.2"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.14.2"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
 			// OpenShift version < 4.12.0-0.0, not SNO => OpenShiftSDN
 			{
-				OpenShiftVersion:     swag.String("4.10.3"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOpenShiftSDN,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
+				OpenShiftVersion:   swag.String("4.10.3"),
+				ControlPlaneCount:  swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOpenShiftSDN,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
 			},
 			// OpenShift version < 4.12.0-0.0, SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.11.17"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.11.17"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
-			// OpenShift version >= 4.12.0-0.0, HighAvailability = nil => OVNKubernetes
+			// OpenShift version >= 4.12.0-0.0, ControlPlaneCount = nil => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.13.2"),
-				HighAvailabilityMode: nil,
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
+				OpenShiftVersion:   swag.String("4.13.2"),
+				ControlPlaneCount:  nil,
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
 			},
-			// OpenShift version < 4.12.0-0.0, HighAvailability = nil => OpenShiftSDN
+			// OpenShift version < 4.12.0-0.0, ControlPlaneCount = nil => OpenShiftSDN
 			{
-				OpenShiftVersion:     swag.String("4.8.5"),
-				HighAvailabilityMode: nil,
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOpenShiftSDN,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
+				OpenShiftVersion:   swag.String("4.8.5"),
+				ControlPlaneCount:  nil,
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOpenShiftSDN,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeBaremetal)},
 			},
 			// OpenShift version >= 4.12.0-0.0, SNO, IPv4 => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.12.0-ec.3"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.12.0-ec.3"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
 			// OpenShift version < 4.12.0-0.0, SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.11.0-rc.3"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.11.0-rc.3"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
 			// OpenShift version >= 4.12.0-0.0, SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.12-fc.2"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.12-fc.2"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
 			// OpenShift version >= 4.12.0-0.0, SNO => OVNKubernetes
 			{
-				OpenShiftVersion:     swag.String("4.12-rc.1"),
-				HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
-				DesiredNetworkType:   models.ClusterCreateParamsNetworkTypeOVNKubernetes,
-				Platform:             models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
+				OpenShiftVersion:   swag.String("4.12-rc.1"),
+				ControlPlaneCount:  swag.Int64(1),
+				DesiredNetworkType: models.ClusterCreateParamsNetworkTypeOVNKubernetes,
+				Platform:           models.Platform{Type: models.NewPlatformType(models.PlatformTypeNone)},
 			},
 		}
 
-		for _, t := range tests {
+		for _, test := range tests {
+			t := test
+
 			mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, *t.OpenShiftVersion)
 			mockAMSSubscription(ctx)
 
 			NewClusterParams := getDefaultClusterCreateParams()
 			NewClusterParams.OpenshiftVersion = t.OpenShiftVersion
-			NewClusterParams.HighAvailabilityMode = t.HighAvailabilityMode
+			NewClusterParams.ControlPlaneCount = t.ControlPlaneCount
 			NewClusterParams.Platform = &t.Platform
 
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13150,19 +15220,72 @@ var _ = Describe("TestRegisterCluster", func() {
 		}
 	})
 
-	Context("Platform", func() {
-		getClusterCreateParams := func(highAvailabilityMode *string) *models.ClusterCreateParams {
+	Context("Cluster Mirror Registry", func() {
+		const (
+			mirrorRegistryCertificate = "-----BEGIN CERTIFICATE-----\n    certificate contents\n-----END CERTIFICATE------"
+			sourceRegistry            = "quay.io"
+			mirrorRegistry            = "example-user-registry.com"
+		)
 
+		getClusterCreateParams := func() *models.ClusterCreateParams {
 			return &models.ClusterCreateParams{
-				Name:                 swag.String("some-cluster-name"),
-				OpenshiftVersion:     swag.String(common.TestDefaultConfig.OpenShiftVersion),
-				PullSecret:           swag.String(fakePullSecret),
-				CPUArchitecture:      models.ClusterCPUArchitectureX8664,
-				HighAvailabilityMode: highAvailabilityMode,
+				Name:              swag.String("some-cluster-name"),
+				OpenshiftVersion:  swag.String(common.TestDefaultConfig.OpenShiftVersion),
+				PullSecret:        swag.String(fakePullSecret),
+				CPUArchitecture:   models.ClusterCPUArchitectureX8664,
+				ControlPlaneCount: swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode),
 			}
 		}
 
-		Context("HighAvailabilityMode = High", func() {
+		It("Validate mirror registry saved on DB", func() {
+			mockClusterRegisterSuccess(true)
+			mockAMSSubscription(ctx)
+			conf, _ := getMirrorRegistryConfigurations(getSecureRegistryToml(sourceRegistry, mirrorRegistry), mirrorRegistryCertificate)
+			params := getClusterCreateParams()
+			c, err := bm.RegisterClusterInternal(ctx, nil, conf, installer.V2RegisterClusterParams{NewClusterParams: params})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			var clusterObj common.Cluster
+			Expect(db.First(&clusterObj, "id = ?", c.ID).Error).ShouldNot(HaveOccurred())
+			Expect(clusterObj.MirrorRegistryConfiguration).ShouldNot(BeNil())
+
+			mirrorRegistryConf, err := clusterObj.GetMirrorRegistryConfiguration()
+			Expect(err).ShouldNot(HaveOccurred())
+
+			Expect(len(mirrorRegistryConf.ImageDigestMirrors)).To(Equal(1))
+			Expect(mirrorRegistryConf.ImageDigestMirrors[0].Source).To(Equal(sourceRegistry))
+			Expect(len(mirrorRegistryConf.ImageDigestMirrors[0].Mirrors)).To(Equal(1))
+			Expect(string(mirrorRegistryConf.ImageDigestMirrors[0].Mirrors[0])).To(Equal(mirrorRegistry))
+
+			Expect(len(mirrorRegistryConf.Insecure)).To(Equal(0))
+			Expect(len(mirrorRegistryConf.ImageTagMirrors)).To(Equal(0))
+		})
+		Context("Pull secret validation", func() {
+			It("Successfully validates the pull secret if it does not contain auth for a mirrored registry", func() {
+				mockClusterRegisterSuccessWithReleaseImageURL(true)
+				mockAMSSubscription(ctx)
+				conf, _ := getMirrorRegistryConfigurations(getSecureRegistryToml("fake-registry.example.com", mirrorRegistry), mirrorRegistryCertificate)
+				params := getClusterCreateParams()
+				params.OcpReleaseImage = "fake-registry.example.com/ocp/release:4.18"
+				_, err := bm.RegisterClusterInternal(ctx, nil, conf, installer.V2RegisterClusterParams{NewClusterParams: params})
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+		})
+	})
+
+	Context("Platform", func() {
+		getClusterCreateParams := func(controlPlaneCount *int64) *models.ClusterCreateParams {
+
+			return &models.ClusterCreateParams{
+				Name:              swag.String("some-cluster-name"),
+				OpenshiftVersion:  swag.String(common.TestDefaultConfig.OpenShiftVersion),
+				PullSecret:        swag.String(fakePullSecret),
+				CPUArchitecture:   models.ClusterCPUArchitectureX8664,
+				ControlPlaneCount: controlPlaneCount,
+			}
+		}
+
+		Context("Highly Availabile Cluster", func() {
 			It("user-managed-networking false", func() {
 				mockClusterRegisterSuccess(true)
 				mockAMSSubscription(ctx)
@@ -13284,7 +15407,8 @@ var _ = Describe("TestRegisterCluster", func() {
 					Version:          swag.String("4.13.0"),
 				}, nil).Times(1)
 				mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
-				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+				mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 
 				params := getClusterCreateParams(nil)
 				params.Platform = &models.Platform{
@@ -13334,6 +15458,7 @@ var _ = Describe("TestRegisterCluster", func() {
 					URL:              swag.String("release_4.11.1"),
 					Version:          swag.String("4.11.1-multi"),
 				}, nil).Times(1)
+
 				mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 
 				params := getClusterCreateParams(nil)
@@ -13354,7 +15479,7 @@ var _ = Describe("TestRegisterCluster", func() {
 				mockOSImages.EXPECT().GetCPUArchitectures(gomock.Any()).Return(
 					[]string{minimalOpenShiftVersionForNutanix, common.ARM64CPUArchitecture}).Times(1)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeFull))
+				params := getClusterCreateParams(swag.Int64(common.MinMasterHostsNeededForInstallationInHaMode))
 				params.Platform = &models.Platform{
 					Type: common.PlatformTypePtr(models.PlatformTypeNone),
 				}
@@ -13499,17 +15624,52 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(result.Platform.None).Should(BeNil())
 				Expect(result.Platform.Baremetal).Should(BeNil())
 
+				Expect(result.Platform.Vsphere.APIVIPs).Should(ContainElement(apiVip))
+				Expect(result.Platform.Vsphere.IngressVIPs).Should(ContainElement(ingressVip))
+			})
+
+			It("vsphere platform pre-4.12 populates deprecated single-VIP fields", func() {
+				oldVersion := "4.11"
+
+				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, oldVersion)
+				mockAMSSubscription(ctx)
+
+				apiVip := "1.2.3.5"
+				ingressVip := "1.2.3.6"
+
+				params := getClusterCreateParams(nil)
+				params.OpenshiftVersion = swag.String(oldVersion)
+				params.APIVips = []*models.APIVip{{IP: models.IP(apiVip)}}
+				params.IngressVips = []*models.IngressVip{{IP: models.IP(ingressVip)}}
+				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeVsphere)}
+				params.UserManagedNetworking = swag.Bool(false)
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: params,
+				})
+				Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated).Payload
+				Expect(*actual.Platform.Type).To(Equal(models.PlatformTypeVsphere))
+
+				var result installcfg.InstallerConfigBaremetal
+				installConfig := createInstallConfigBuilder()
+				mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+				data, err := installConfig.GetInstallConfig(&common.Cluster{Cluster: *actual}, []*common.InfraEnv{}, "")
+				Expect(err).ShouldNot(HaveOccurred())
+				err = json.Unmarshal(data, &result)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(result.Platform.Vsphere).ShouldNot(BeNil())
+
 				Expect(result.Platform.Vsphere.DeprecatedAPIVIP).Should(Equal(apiVip))
 				Expect(result.Platform.Vsphere.DeprecatedIngressVIP).Should(Equal(ingressVip))
 			})
 		})
 
-		Context("HighAvailabilityMode = None", func() {
-			It("None platform when HighAvailabilityMode is None", func() {
+		Context("ControlPlaneCount = None", func() {
+			It("None platform when ControlPlaneCount is None", func() {
 				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.9")
 				mockAMSSubscription(ctx)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 					NewClusterParams: params,
@@ -13520,8 +15680,8 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(*actual.Platform.Type).To(Equal(models.PlatformTypeNone))
 			})
 
-			It("Fail to disable UserManagedNetworking when HighAvailabilityMode is None", func() {
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+			It("Fail to disable UserManagedNetworking when ControlPlaneCount is None", func() {
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(false)
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13534,7 +15694,7 @@ var _ = Describe("TestRegisterCluster", func() {
 				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.9")
 				mockAMSSubscription(ctx)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(true)
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13546,9 +15706,9 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(*actual.Platform.Type).To(Equal(models.PlatformTypeNone))
 			})
 
-			It("Fail to set baremetal platform when HighAvailabilityMode is None", func() {
+			It("Fail to set baremetal platform when ControlPlaneCount is 1", func() {
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)}
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13557,8 +15717,8 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Fail to set baremetal platform when HighAvailabilityMode is None", func() {
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+			It("Fail to set baremetal platform when ControlPlaneCount is 1", func() {
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(false)
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)}
@@ -13568,8 +15728,8 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Fail to set vsphere platform when HighAvailabilityMode is None", func() {
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+			It("Fail to set vsphere platform when ControlPlaneCount is 1", func() {
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeVsphere)}
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13578,8 +15738,8 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Fail to set nutanix platform when HighAvailabilityMode is None", func() {
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+			It("Fail to set nutanix platform when ControlPlaneCount is 1", func() {
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.11")
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNutanix)}
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13588,9 +15748,9 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Fail to set baremetal platform and enable UserManagedNetworking when HighAvailabilityMode is None", func() {
+			It("Fail to set baremetal platform and enable UserManagedNetworking when ControlPlaneCount is 1", func() {
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(true)
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)}
@@ -13600,11 +15760,11 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Set none platform when HighAvailabilityMode is None", func() {
+			It("Set none platform when ControlPlaneCount is 1", func() {
 				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.9")
 				mockAMSSubscription(ctx)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
 				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
@@ -13616,11 +15776,11 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(*actual.Platform.Type).To(Equal(models.PlatformTypeNone))
 			})
 
-			It("Set vsphere platform when HighAvailabilityMode is None", func() {
+			It("Set vsphere platform when ControlPlaneCount is 1", func() {
 				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.9")
 				mockAMSSubscription(ctx)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(true)
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
@@ -13633,8 +15793,8 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(*actual.Platform.Type).To(Equal(models.PlatformTypeNone))
 			})
 
-			It("Fail to set none platform and disable UserManagedNetworking when HighAvailabilityMode is None", func() {
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+			It("Fail to set none platform and disable UserManagedNetworking when ControlPlaneCount is 1", func() {
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(false)
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)}
@@ -13644,11 +15804,11 @@ var _ = Describe("TestRegisterCluster", func() {
 				verifyApiError(reply, http.StatusBadRequest)
 			})
 
-			It("Set none platform and enable UserManagedNetworking when HighAvailabilityMode is None", func() {
+			It("Set none platform and enable UserManagedNetworking when ControlPlaneCount is 1", func() {
 				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.9")
 				mockAMSSubscription(ctx)
 
-				params := getClusterCreateParams(swag.String(models.ClusterCreateParamsHighAvailabilityModeNone))
+				params := getClusterCreateParams(swag.Int64(1))
 				params.OpenshiftVersion = swag.String("4.9")
 				params.UserManagedNetworking = swag.Bool(true)
 				params.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
@@ -13674,9 +15834,36 @@ var _ = Describe("TestRegisterCluster", func() {
 		Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
 	})
 
+	Context("OS stream", func() {
+		It("persists OS stream and validates OS image for the selected stream", func() {
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+			mockOSImages.EXPECT().GetOsImage(common.TestDefaultConfig.OpenShiftVersion, models.ClusterCPUArchitectureX8664, "rhel-9", "").Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
+			mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockMetric.EXPECT().ClusterRegistered().Times(1)
+			mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.ClusterRegistrationSucceededEventName))).Times(1)
+			mockAMSSubscription(ctx)
+
+			clusterParams := getDefaultClusterCreateParams()
+			clusterParams.OsStream = "rhel-9"
+			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+				NewClusterParams: clusterParams,
+			})
+			Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+			actual := reply.(*installer.V2RegisterClusterCreated).Payload
+			Expect(actual.OsStream).To(Equal("rhel-9"))
+
+			var clusterObj common.Cluster
+			Expect(db.First(&clusterObj, "id = ?", actual.ID.String()).Error).ShouldNot(HaveOccurred())
+			Expect(clusterObj.OsStream).To(Equal("rhel-9"))
+		})
+	})
+
 	Context("ValidateIncompatibleFeatures", func() {
 		It("s390x on 4.13 OCP version", func() {
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 			mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			mockMetric.EXPECT().ClusterRegistered().Times(1)
@@ -13729,6 +15916,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: params,
 			})
@@ -13754,6 +15942,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: params,
 			})
@@ -13768,7 +15957,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			}
 			params.OpenshiftVersion = swag.String("4.12")
 			params.CPUArchitecture = models.ClusterCPUArchitectureS390x
-			params.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+			params.ControlPlaneCount = swag.Int64(1)
 
 			releaseImage := &models.ReleaseImage{
 				CPUArchitectures: []string{models.ClusterCPUArchitectureX8664, params.CPUArchitecture},
@@ -13780,6 +15969,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: params,
 			})
@@ -13787,7 +15977,7 @@ var _ = Describe("TestRegisterCluster", func() {
 		})
 
 		It("Sno is compatible with s390x on 4.13", func() {
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 			mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			mockMetric.EXPECT().ClusterRegistered().Times(1)
@@ -13798,7 +15988,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			params.OpenshiftVersion = swag.String("4.13")
 			params.CPUArchitecture = models.ClusterCPUArchitectureS390x
-			params.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+			params.ControlPlaneCount = swag.Int64(1)
 			params.Platform = nil
 
 			mockOSImages.EXPECT().GetCPUArchitectures(gomock.Any()).Return([]string{common.X86CPUArchitecture, common.S390xCPUArchitecture}).Times(1)
@@ -13818,7 +16008,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			})
 			Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
 			actual := reply.(*installer.V2RegisterClusterCreated).Payload
-			Expect(swag.StringValue(actual.HighAvailabilityMode)).To(Equal(models.ClusterHighAvailabilityModeNone))
+			Expect(actual.ControlPlaneCount).To(Equal(int64(1)))
 			Expect(actual.CPUArchitecture).To(Equal(models.ClusterCPUArchitectureS390x))
 		})
 
@@ -13908,6 +16098,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: params,
 			})
@@ -13915,7 +16106,7 @@ var _ = Describe("TestRegisterCluster", func() {
 		})
 
 		It("s390x on 4.13 OCP version", func() {
-			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{&common.TestDefaultConfig.MonitoredOperator}).Times(1)
 			mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			mockMetric.EXPECT().ClusterRegistered().Times(1)
@@ -13949,6 +16140,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			}
 
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			mockOperatorManager.EXPECT().ResolveDependencies(gomock.Any(), gomock.Any()).
 				DoAndReturn(func(commonCluster *common.Cluster, operators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
 					return append(operators, &models.MonitoredOperator{
@@ -14007,6 +16199,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 			mockVersions.EXPECT().GetReleaseImage(ctx, *params.OpenshiftVersion, params.CPUArchitecture, *params.PullSecret).Return(releaseImage, nil).Times(1)
+
 			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 				NewClusterParams: params,
 			})
@@ -14091,29 +16284,11 @@ var _ = Describe("TestRegisterCluster", func() {
 		clusterParams.UserManagedNetworking = swag.Bool(true)
 		clusterParams.APIVips = []*models.APIVip{{IP: "10.35.10.11"}}
 		clusterParams.IngressVips = []*models.IngressVip{{IP: "10.35.10.10"}}
-		clusterParams.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+		clusterParams.ControlPlaneCount = swag.Int64(1)
 		clusterParams.OpenshiftVersion = swag.String("4.12")
 		clusterParams.Platform = &models.Platform{
 			Type: common.PlatformTypePtr(models.PlatformTypeNone),
 		}
-		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
-			NewClusterParams: clusterParams,
-		})
-		verifyApiError(reply, http.StatusBadRequest)
-	})
-
-	It("Fail openshift version support level is maintenance", func() {
-		clusterParams := getDefaultClusterCreateParams()
-		openShiftVersionWithMaintenanceSupportLevel := "4.7.0"
-		clusterParams.OpenshiftVersion = swag.String(openShiftVersionWithMaintenanceSupportLevel)
-		releaseImage := &models.ReleaseImage{
-			CPUArchitecture:  common.TestDefaultConfig.ReleaseImage.CPUArchitecture,
-			OpenshiftVersion: &openShiftVersionWithMaintenanceSupportLevel,
-			URL:              common.TestDefaultConfig.ReleaseImage.URL,
-			Version:          &openShiftVersionWithMaintenanceSupportLevel,
-			SupportLevel:     models.OpenshiftVersionSupportLevelMaintenance,
-		}
-		mockVersions.EXPECT().GetReleaseImage(ctx, *releaseImage.OpenshiftVersion, *releaseImage.CPUArchitecture, *clusterParams.PullSecret).Return(releaseImage, nil).Times(1)
 		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 			NewClusterParams: clusterParams,
 		})
@@ -14129,8 +16304,8 @@ var _ = Describe("TestRegisterCluster", func() {
 						EnableOn: swag.String(models.DiskEncryptionEnableOnAll),
 						Mode:     swag.String(models.DiskEncryptionModeTang),
 					},
-					OpenshiftVersion:     swag.String("4.12.0"),
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					OpenshiftVersion:  swag.String("4.12.0"),
+					ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 				},
 			})
 			verifyApiErrorString(reply, http.StatusBadRequest, "Setting Tang mode but tang_servers isn't set")
@@ -14145,8 +16320,8 @@ var _ = Describe("TestRegisterCluster", func() {
 							Mode:        swag.String(models.DiskEncryptionModeTang),
 							TangServers: `[{"URL":"","Thumbprint":""}]`,
 						},
-						OpenshiftVersion:     swag.String("4.12.0"),
-						HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull)},
+						OpenshiftVersion:  swag.String("4.12.0"),
+						ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "empty url")
 			})
@@ -14159,8 +16334,8 @@ var _ = Describe("TestRegisterCluster", func() {
 							Mode:        swag.String(models.DiskEncryptionModeTang),
 							TangServers: `[{"URL":"invalidUrl","Thumbprint":""}]`,
 						},
-						OpenshiftVersion:     swag.String("4.12.0"),
-						HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+						OpenshiftVersion:  swag.String("4.12.0"),
+						ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "invalid URI for reques")
@@ -14175,8 +16350,8 @@ var _ = Describe("TestRegisterCluster", func() {
 						Mode:        swag.String(models.DiskEncryptionModeTang),
 						TangServers: `[{"URL":"http://tang.example.com:7500","Thumbprint":""}]`,
 					},
-					OpenshiftVersion:     swag.String("4.12.0"),
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					OpenshiftVersion:  swag.String("4.12.0"),
+					ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 				},
 			})
 			verifyApiErrorString(reply, http.StatusBadRequest, "Tang thumbprint isn't set")
@@ -14277,7 +16452,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			var c *models.Cluster
 			diskEncryptionBm := createInventory(db, cfg)
 			diskEncryptionBm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperatorManager, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperatorManager, nil, nil, nil, nil, nil, false, nil)
 
 			By("Register cluster", func() {
 
@@ -14296,6 +16471,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			By("Update cluster with full object", func() {
 
+				mockNoChangeInOperatorDependencies(mockOperatorManager)
 				mockOperatorManager.EXPECT().ValidateCluster(ctx, gomock.Any())
 				mockEvents.EXPECT().SendClusterEvent(ctx, gomock.Any())
 
@@ -14316,6 +16492,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			By("Update cluster with partial object", func() {
 
+				mockNoChangeInOperatorDependencies(mockOperatorManager)
 				mockOperatorManager.EXPECT().ValidateCluster(ctx, gomock.Any())
 
 				reply := diskEncryptionBm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -14334,6 +16511,7 @@ var _ = Describe("TestRegisterCluster", func() {
 
 			By("Update cluster with emtpy object", func() {
 
+				mockNoChangeInOperatorDependencies(mockOperatorManager)
 				mockOperatorManager.EXPECT().ValidateCluster(ctx, gomock.Any())
 
 				reply := diskEncryptionBm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
@@ -14378,7 +16556,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			cfg.DiskEncryptionSupport = false
 			bm = createInventory(db, cfg)
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			mockUsageReports()
 		})
 
@@ -14454,6 +16632,7 @@ var _ = Describe("TestRegisterCluster", func() {
 						MachineNetworks:   common.TestDualStackNetworking.MachineNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "The IP address \"1.2.3.5\" appears both in apiVIPs and ingressVIPs")
@@ -14470,6 +16649,7 @@ var _ = Describe("TestRegisterCluster", func() {
 						MachineNetworks:   common.TestDualStackNetworking.MachineNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "api-vip <10.11.12.15> does not belong to machine-network-cidr <1.2.3.0/24>")
@@ -14486,6 +16666,7 @@ var _ = Describe("TestRegisterCluster", func() {
 						MachineNetworks:   common.TestDualStackNetworking.MachineNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "ingress-vip <10.11.12.16> does not belong to machine-network-cidr <1.2.3.0/24>")
@@ -14501,6 +16682,7 @@ var _ = Describe("TestRegisterCluster", func() {
 						ClusterNetworks:   common.TestDualStackNetworking.ClusterNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, "Dual-stack cluster cannot be created with empty Machine Networks")
@@ -14518,9 +16700,10 @@ var _ = Describe("TestRegisterCluster", func() {
 						MachineNetworks:   common.TestDualStackNetworking.MachineNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
-				verifyApiErrorString(reply, http.StatusBadRequest, "api-vip <1001:db8::64> does not belong to machine-network-cidr <1.2.3.0/24>")
+				verifyApiErrorString(reply, http.StatusBadRequest, "Inconsistent IP family order: machine_networks first IP is 1.2.3.0/24 but api_vips first IP is 1001:db8::64. All networks must have the same IP family first")
 			})
 
 			It("Ingress VIP from IPv6 Machine Network", func() {
@@ -14535,9 +16718,10 @@ var _ = Describe("TestRegisterCluster", func() {
 						MachineNetworks:   common.TestDualStackNetworking.MachineNetworks,
 						ServiceNetworks:   common.TestDualStackNetworking.ServiceNetworks,
 						VipDhcpAllocation: swag.Bool(false),
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
 					},
 				})
-				verifyApiErrorString(reply, http.StatusBadRequest, "ingress-vip <1001:db8::65> does not belong to machine-network-cidr <1.2.3.0/24>")
+				verifyApiErrorString(reply, http.StatusBadRequest, "Inconsistent IP family order: machine_networks first IP is 1.2.3.0/24 but ingress_vips first IP is 1001:db8::65. All networks must have the same IP family first")
 			})
 		})
 
@@ -14590,6 +16774,48 @@ var _ = Describe("TestRegisterCluster", func() {
 			})
 		})
 	})
+	var _ = Describe("Network CIDR validations", func() {
+		BeforeEach(func() {
+			Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
+			db, dbName = common.PrepareTestDB()
+			cfg.DiskEncryptionSupport = false
+			bm = createInventory(db, cfg)
+			bm.Config.DefaultClusterNetworkCidr = "1.2.3.0/24"
+			bm.Config.DefaultServiceNetworkCidr = "1.2.4.0/24"
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+			mockUsageReports()
+		})
+
+		AfterEach(func() {
+			ctrl.Finish()
+			common.DeleteTestDB(db, dbName)
+		})
+		Context("Register cluster", func() {
+			var createClusterParams *models.ClusterCreateParams
+			BeforeEach(func() {
+				createClusterParams = &models.ClusterCreateParams{
+					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+					ControlPlaneCount:    swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+					OpenshiftVersion:     swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
+				}
+			})
+			It("Invalid network CIDR should fail", func() {
+				createClusterParams.MachineNetworks = []*models.MachineNetwork{{Cidr: "invalid"}}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: createClusterParams,
+				})
+				verifyApiErrorString(reply, http.StatusBadRequest, "Could not parse Machine Network CIDR invalid")
+			})
+			It("Empty network CIDR should fail", func() {
+				createClusterParams.MachineNetworks = []*models.MachineNetwork{{Cidr: ""}}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: createClusterParams,
+				})
+				verifyApiErrorString(reply, http.StatusBadRequest, "Machine Network CIDR cannot be empty (index 0)")
+			})
+		})
+	})
 
 	var _ = Describe("Disk encryption disabled", func() {
 
@@ -14601,7 +16827,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			cfg.DiskEncryptionSupport = false
 			bm = createInventory(db, cfg)
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 			mockUsageReports()
 		})
 
@@ -14636,8 +16862,8 @@ var _ = Describe("TestRegisterCluster", func() {
 						DiskEncryption: &models.DiskEncryption{
 							EnableOn: swag.String(models.DiskEncryptionEnableOnAll),
 						},
-						OpenshiftVersion:     swag.String("4.12.0"),
-						HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+						OpenshiftVersion:  swag.String("4.12.0"),
+						ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, errorMsg)
@@ -14649,8 +16875,8 @@ var _ = Describe("TestRegisterCluster", func() {
 						DiskEncryption: &models.DiskEncryption{
 							EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
 						},
-						OpenshiftVersion:     swag.String("4.12.0"),
-						HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull)},
+						OpenshiftVersion:  swag.String("4.12.0"),
+						ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, errorMsg)
 			})
@@ -14661,8 +16887,8 @@ var _ = Describe("TestRegisterCluster", func() {
 						DiskEncryption: &models.DiskEncryption{
 							EnableOn: swag.String(models.DiskEncryptionEnableOnWorkers),
 						},
-						OpenshiftVersion:     swag.String("4.12.0"),
-						HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeFull),
+						OpenshiftVersion:  swag.String("4.12.0"),
+						ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
 					},
 				})
 				verifyApiErrorString(reply, http.StatusBadRequest, errorMsg)
@@ -14795,7 +17021,7 @@ var _ = Describe("TestRegisterCluster", func() {
 	It("cluster api failed to register", func() {
 		bm.clusterApi = mockClusterApi
 		mockClusterApi.EXPECT().RegisterCluster(ctx, gomock.Any()).Return(errors.Errorf("error")).Times(1)
-		mockClusterRegisterSteps()
+		mockClusterRegisterSteps(false)
 
 		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 			NewClusterParams: getDefaultClusterCreateParams(),
@@ -14817,11 +17043,11 @@ var _ = Describe("TestRegisterCluster", func() {
 	})
 
 	It("cluster api failed to register with invalid pull secret", func() {
-		mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).
+		mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(errors.New("error")).Times(1)
 		mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).Times(1)
 		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
-		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 
 		clusterParams := getDefaultClusterCreateParams()
 		clusterParams.PullSecret = swag.String("")
@@ -14848,6 +17074,20 @@ var _ = Describe("TestRegisterCluster", func() {
 		mockAMSSubscription(ctx)
 		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
 			NewClusterParams: getDefaultClusterCreateParams(),
+		})
+		Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
+		actual := reply.(*installer.V2RegisterClusterCreated)
+		Expect(actual.Payload.OpenshiftVersion).To(Equal(common.TestDefaultConfig.ReleaseVersion))
+		Expect(actual.Payload.OcpReleaseImage).To(Equal(common.TestDefaultConfig.ReleaseImageUrl))
+	})
+
+	It("successfully registers cluster with openshift release image URL defined in the cluster create params", func() {
+		mockClusterRegisterSuccessWithReleaseImageURL(true)
+		mockAMSSubscription(ctx)
+		clusterParams := getDefaultClusterCreateParams()
+		clusterParams.OcpReleaseImage = common.TestDefaultConfig.ReleaseImageUrl
+		reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+			NewClusterParams: clusterParams,
 		})
 		Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
 		actual := reply.(*installer.V2RegisterClusterCreated)
@@ -14892,7 +17132,7 @@ var _ = Describe("TestRegisterCluster", func() {
 	})
 
 	It("Register cluster with arm64 CPU architecture as multiarch if multiarch release image used", func() {
-		mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{
 			CPUArchitecture:  swag.String(common.MultiCPUArchitecture),
 			CPUArchitectures: []string{common.X86CPUArchitecture, common.ARM64CPUArchitecture, common.PowerCPUArchitecture},
@@ -14953,6 +17193,38 @@ var _ = Describe("TestRegisterCluster", func() {
 		actual := reply.(*installer.V2RegisterClusterCreated)
 		Expect(actual.Payload.CPUArchitecture).To(Equal(common.TestDefaultConfig.CPUArchitecture))
 	})
+	Context("Register with release image URL", func() {
+		It("should register cluster with release image URL successfully", func() {
+			mockClusterRegisterSuccessWithReleaseImageURL(true)
+			mockAMSSubscription(ctx)
+			clusterParams := getDefaultClusterCreateParams()
+			clusterParams.OcpReleaseImage = common.TestDefaultConfig.ReleaseImageUrl
+			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+				NewClusterParams: clusterParams,
+			})
+			Expect(reflect.TypeOf(reply)).Should(Equal(reflect.TypeOf(installer.NewV2RegisterClusterCreated())))
+			actual := reply.(*installer.V2RegisterClusterCreated)
+			Expect(actual.Payload.OpenshiftVersion).To(Equal(common.TestDefaultConfig.ReleaseVersion))
+			Expect(actual.Payload.OcpReleaseImage).To(Equal(common.TestDefaultConfig.ReleaseImageUrl))
+		})
+
+		It("should fail if openshift release image is different from cluster architecture", func() {
+			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{
+				CPUArchitecture:  swag.String(common.ARM64CPUArchitecture),
+				CPUArchitectures: []string{common.ARM64CPUArchitecture},
+				OpenshiftVersion: swag.String("4.12.0"),
+				URL:              swag.String(common.TestDefaultConfig.ReleaseImageUrl),
+				Version:          swag.String("4.12.0"),
+			}, nil).Times(1)
+
+			clusterParams := getDefaultClusterCreateParams()
+			clusterParams.OcpReleaseImage = common.TestDefaultConfig.ReleaseImageUrl
+			reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+				NewClusterParams: clusterParams,
+			})
+			Expect(reply).Should(BeAssignableToTypeOf(common.NewApiError(http.StatusBadRequest, errors.Errorf("Requested CPU architecture %s is not supported for release image URL %s. Supported architectures in release image: %v", common.ARM64CPUArchitecture, common.TestDefaultConfig.ReleaseImageUrl, []string{common.ARM64CPUArchitecture}))))
+		})
+	})
 
 	Context("Cluster Tags", func() {
 		It("Register cluster with tags", func() {
@@ -15004,9 +17276,9 @@ var _ = Describe("TestRegisterCluster", func() {
 		}
 
 		It("Networking defaults", func() {
-			defaultClusterNetwork := "1.2.3.4/14"
+			defaultClusterNetwork := "1.0.0.0/14"
 			bm.Config.DefaultClusterNetworkCidr = defaultClusterNetwork
-			defultServiceNetwork := "1.2.3.5/14"
+			defultServiceNetwork := "1.0.0.0/14"
 			bm.Config.DefaultServiceNetworkCidr = defultServiceNetwork
 
 			mockClusterRegisterSuccess(true)
@@ -15058,7 +17330,10 @@ var _ = Describe("TestRegisterCluster", func() {
 			db, dbName = common.PrepareTestDB()
 			bm = createInventory(db, Config{})
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+			// Default Config for CIDRs are required to be set
+			bm.Config.DefaultClusterNetworkCidr = "10.0.0.0/16"
+			bm.Config.DefaultServiceNetworkCidr = "172.30.0.0/16"
 			cfg := auth.GetConfigRHSSO()
 			cfg.EnableOrgBasedFeatureGates = true
 			mockOcmAuthz = ocm.NewMockOCMAuthorization(ctrl)
@@ -15068,7 +17343,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			payload.Username = userName1
 			payload.Organization = orgID1
 			authCtx = context.WithValue(ctx, restapi.AuthKey, payload)
-			mockClusterRegisterSteps()
+			mockClusterRegisterSteps(false)
 			mockUsageReports()
 			mockAMSSubscription(authCtx)
 			mockMetric.EXPECT().ClusterRegistered().Times(1)
@@ -15114,7 +17389,10 @@ var _ = Describe("TestRegisterCluster", func() {
 			db, dbName = common.PrepareTestDB()
 			bm = createInventory(db, Config{})
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+			// Default Config for CIDRs are required to be set
+			bm.Config.DefaultClusterNetworkCidr = "10.0.0.0/16"
+			bm.Config.DefaultServiceNetworkCidr = "172.30.0.0/16"
 		})
 
 		Context("with EnableOrgBasedFeatureGates true", func() {
@@ -15133,7 +17411,7 @@ var _ = Describe("TestRegisterCluster", func() {
 			})
 
 			It("Register a cluster with multi CPU architecture - success", func() {
-				mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 				mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{
 					CPUArchitecture:  swag.String(common.MultiCPUArchitecture),
 					CPUArchitectures: []string{common.X86CPUArchitecture, common.ARM64CPUArchitecture, common.PowerCPUArchitecture},
@@ -15148,7 +17426,6 @@ var _ = Describe("TestRegisterCluster", func() {
 					eventstest.WithNameMatcher(eventgen.ClusterRegistrationSucceededEventName))).Times(1)
 				mockAMSSubscription(authCtx)
 				mockUsageReports()
-				mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), userName1, ocm.MultiarchCapabilityName, ocm.OrganizationCapabilityType).Return(true, nil).Times(1)
 				mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), userName1, ocm.SoftTimeoutsCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
 
 				reply := bm.V2RegisterCluster(authCtx, installer.V2RegisterClusterParams{
@@ -15164,25 +17441,47 @@ var _ = Describe("TestRegisterCluster", func() {
 				Expect(actual.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 			})
 
-			It("Register a cluster with multi CPU architecture - fail with no capability", func() {
+			It("Register a cluster with multi CPU architecture - allowed for all organizations", func() {
+				mockSecretValidator.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 				mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{
 					CPUArchitecture:  swag.String(common.MultiCPUArchitecture),
 					CPUArchitectures: []string{common.X86CPUArchitecture, common.ARM64CPUArchitecture, common.PowerCPUArchitecture},
-					OpenshiftVersion: swag.String("its-just-a-mock"),
+					OpenshiftVersion: swag.String("4.12"),
 					URL:              swag.String("url-of-this-release"),
-					Version:          swag.String("doesnt-really-matter"),
-				}, nil).Times(1)
-				mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), userName1, ocm.MultiarchCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
+					Version:          swag.String("4.12.0"),
+				}, nil).AnyTimes()
+				mockOperatorManager.EXPECT().GetSupportedOperatorsByType(models.OperatorTypeBuiltin).Return([]*models.MonitoredOperator{}).AnyTimes()
+				mockProviderRegistry.EXPECT().SetPlatformUsages(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockMetric.EXPECT().ClusterRegistered().AnyTimes()
+				mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+					eventstest.WithNameMatcher(eventgen.ClusterRegistrationSucceededEventName))).AnyTimes()
+				mockUsageReports()
+				mockOcmAuthz.EXPECT().
+					CapabilityReview(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(false, nil).AnyTimes()
 
-				reply := bm.V2RegisterCluster(authCtx, installer.V2RegisterClusterParams{
-					NewClusterParams: &models.ClusterCreateParams{
-						Name:             swag.String("some-cluster-name"),
-						OpenshiftVersion: swag.String("4.12.0-someFakeFlavour"),
-						CPUArchitecture:  common.MultiCPUArchitecture,
-						PullSecret:       swag.String(fakePullSecret),
-					},
-				})
-				verifyApiError(reply, http.StatusBadRequest)
+				orgs := []string{"org1", "org2", "org3"}
+				for _, org := range orgs {
+					orgPayload := &ocm.AuthPayload{
+						Username:     "user-" + org,
+						Organization: org,
+						Role:         ocm.UserRole,
+					}
+					orgCtx := context.WithValue(context.Background(), restapi.AuthKey, orgPayload)
+					mockAMSSubscription(orgCtx)
+
+					reply := bm.V2RegisterCluster(orgCtx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							Name:             swag.String("some-cluster-name"),
+							OpenshiftVersion: swag.String("4.12.0-someFakeFlavour"),
+							CPUArchitecture:  common.MultiCPUArchitecture,
+							PullSecret:       swag.String(fakePullSecret),
+						},
+					})
+					Expect(reply).To(BeAssignableToTypeOf(&installer.V2RegisterClusterCreated{}))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					Expect(actual.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
+				}
 			})
 		})
 
@@ -15198,6 +17497,9 @@ var _ = Describe("TestRegisterCluster", func() {
 				payload.Username = userName1
 				payload.Organization = orgID1
 				authCtx = context.WithValue(ctx, restapi.AuthKey, payload)
+				// Default Config for CIDRs are required to be set
+				bm.Config.DefaultClusterNetworkCidr = "10.0.0.0/16"
+				bm.Config.DefaultServiceNetworkCidr = "172.30.0.0/16"
 			})
 
 			It("Register cluster with multi CPU architecture - success", func() {
@@ -15219,6 +17521,665 @@ var _ = Describe("TestRegisterCluster", func() {
 			})
 		})
 	})
+
+	Context("registering control_plane_count", func() {
+		Context("should succeed", func() {
+			BeforeEach(func() {
+				mockAMSSubscription(ctx)
+			})
+
+			Context("using defaults", func() {
+				It("control_plane_count is set to 3", func() {
+					mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							OpenshiftVersion:  swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+							ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					clusterID := actual.Payload.ID
+
+					var dbCluster common.Cluster
+					db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(3))
+				})
+
+				It("control_plane_count is set to 1", func() {
+					mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							OpenshiftVersion:  swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+							ControlPlaneCount: swag.Int64(1),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					clusterID := actual.Payload.ID
+
+					var dbCluster common.Cluster
+					db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(1))
+				})
+
+				It("control_plane_count is set to 3", func() {
+					mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							OpenshiftVersion:  swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+							ControlPlaneCount: swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					clusterID := actual.Payload.ID
+
+					var dbCluster common.Cluster
+					db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder)))
+				})
+
+				It("control_plane_count is set to 1", func() {
+					mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							OpenshiftVersion:  swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+							ControlPlaneCount: swag.Int64(1),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					clusterID := actual.Payload.ID
+
+					var dbCluster common.Cluster
+					db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(int64(1)))
+				})
+
+				It("not set", func() {
+					mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+					reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+						NewClusterParams: &models.ClusterCreateParams{
+							OpenshiftVersion: swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						},
+					})
+
+					Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+					actual := reply.(*installer.V2RegisterClusterCreated)
+					clusterID := actual.Payload.ID
+
+					var dbCluster common.Cluster
+					db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(int64(common.MinMasterHostsNeededForInstallationInHaMode)))
+					Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(common.MinMasterHostsNeededForInstallationInHaMode))
+				})
+			})
+
+			It(fmt.Sprintf("setting 5 control planes, multi-node with OCP version >= %s", common.MinimumVersionForNonStandardHAOCPControlPlane), func() {
+				mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, common.MinimumVersionForNonStandardHAOCPControlPlane)
+
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:  swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount: swag.Int64(5),
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				clusterID := actual.Payload.ID
+
+				var dbCluster common.Cluster
+				db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+				Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(5))
+			})
+
+			It(fmt.Sprintf("setting 2 control planes, multi-node with OCP version >= %s", common.MinimumVersionForArbiterClusters), func() {
+				mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, common.MinimumVersionForArbiterClusters)
+
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:  swag.String(common.MinimumVersionForArbiterClusters),
+						ControlPlaneCount: swag.Int64(2),
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				clusterID := actual.Payload.ID
+
+				var dbCluster common.Cluster
+				db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+				Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(2))
+			})
+
+			It("setting 1 control plane, single-node", func() {
+				mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, testutils.ValidOCPVersionForNonStandardHAOCPControlPlane)
+
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:  swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount: swag.Int64(1),
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				clusterID := actual.Payload.ID
+
+				var dbCluster common.Cluster
+				db.Where("id = ?", clusterID.String()).Take(&dbCluster)
+
+				Expect(dbCluster.ControlPlaneCount).To(BeEquivalentTo(1))
+			})
+		})
+
+		Context("should fail", func() {
+			It("setting 6 control planes, multi-node, non-standard HA OCP Control Plane not supported", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount:    swag.Int64(6),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18",
+				)
+			})
+
+			It("setting 6 control planes, multi-node, non-standard HA OCP Control Plane supported", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount:    swag.Int64(6),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be 3-5 dedicated control plane nodes for high availability mode Full in openshift version 4.18 or newer",
+				)
+			})
+
+			It("setting 6 control planes, multi-node, Arbiter Clusters supported", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(common.MinimumVersionForArbiterClusters),
+						ControlPlaneCount:    swag.Int64(6),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be 2-5 dedicated control plane nodes for high availability mode Full in openshift version 4.19 or newer",
+				)
+			})
+
+			It("setting 3 control planes, single-node", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount:    swag.Int64(common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeNone),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"single-node clusters must have a single control plane node",
+				)
+			})
+
+			It("setting 1 control plane, mutli-node", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						ControlPlaneCount:    swag.Int64(1),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18",
+				)
+			})
+
+			It("setting 4 control planes, multi-node, non-standard HA OCP Control Plane not supported", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+						ControlPlaneCount:    swag.Int64(4),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18",
+				)
+			})
+
+			It("setting 2 control planes, multi-node, Arbiter Clusters not supported", func() {
+				bm.TNAClustersSupport = false
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+						ControlPlaneCount:    swag.Int64(2),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be 3-5 dedicated control plane nodes for high availability mode Full in openshift version 4.18 or newer",
+				)
+			})
+
+			It("setting 2 control planes, multi-node, non-standard HA OCP Control Plane not supported", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:     swag.String(testutils.ValidOCPVersionForNonStandardHAOCPControlPlane),
+						HighAvailabilityMode: swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+						ControlPlaneCount:    swag.Int64(2),
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"there should be exactly 3 dedicated control plane nodes for high availability mode Full in openshift version older than 4.18",
+				)
+			})
+		})
+	})
+
+	Context("load_balancer", func() {
+		BeforeEach(func() {
+			Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
+			db, dbName = common.PrepareTestDB()
+			bm = createInventory(db, cfg)
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+		})
+
+		AfterEach(func() {
+			ctrl.Finish()
+			common.DeleteTestDB(db, dbName)
+		})
+
+		Context("should succeed", func() {
+
+			BeforeEach(func() {
+				mockUsageReports()
+				mockClusterRegisterSuccessWithVersion(common.X86CPUArchitecture, "4.16")
+				mockAMSSubscription(context.Background())
+			})
+
+			It("when registering cluster with user managed load balancer and common VIP", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.127.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.10"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				responseCluster := actual.Payload
+
+				Expect(responseCluster.LoadBalancer).ToNot(BeNil())
+				Expect(responseCluster.LoadBalancer.Type).To(BeEquivalentTo(models.LoadBalancerTypeUserManaged))
+
+				Expect(responseCluster.APIVips).To(ContainElement(apiVips[0]))
+				Expect(responseCluster.IngressVips).To(ContainElement(ingressVIPs[0]))
+			})
+
+			It("when registering cluster with user managed load balancer and distinct VIPs", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.127.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				responseCluster := actual.Payload
+
+				Expect(responseCluster.LoadBalancer).ToNot(BeNil())
+				Expect(responseCluster.LoadBalancer.Type).To(BeEquivalentTo(models.LoadBalancerTypeUserManaged))
+
+				Expect(responseCluster.APIVips).To(ContainElement(apiVips[0]))
+				Expect(responseCluster.IngressVips).To(ContainElement(ingressVIPs[0]))
+			})
+
+			It("when registering cluster with user managed load balancer and VIPs inside machine network", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.127.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+						},
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				responseCluster := actual.Payload
+
+				Expect(responseCluster.LoadBalancer).ToNot(BeNil())
+				Expect(responseCluster.LoadBalancer.Type).To(BeEquivalentTo(models.LoadBalancerTypeUserManaged))
+
+				Expect(responseCluster.APIVips).To(ContainElement(apiVips[0]))
+				Expect(responseCluster.IngressVips).To(ContainElement(ingressVIPs[0]))
+			})
+
+			It("when registering cluster with user managed load balancer and VIPs inside second machine network", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.128.1"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.128.2"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+							{Cidr: "192.168.128.0/30"},
+						},
+					},
+				})
+
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				responseCluster := actual.Payload
+
+				Expect(responseCluster.LoadBalancer).ToNot(BeNil())
+				Expect(responseCluster.LoadBalancer.Type).To(BeEquivalentTo(models.LoadBalancerTypeUserManaged))
+
+				Expect(responseCluster.APIVips).To(ContainElement(apiVips[0]))
+				Expect(responseCluster.IngressVips).To(ContainElement(ingressVIPs[0]))
+			})
+
+			It("when registering cluster with user-managed networking and multiple machine networks", func() {
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion:      swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:       common.X86CPUArchitecture,
+						UserManagedNetworking: swag.Bool(true),
+						Platform: &models.Platform{
+							Type: models.PlatformTypeNone.Pointer(),
+						},
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+							{Cidr: "192.168.128.0/24"},
+						},
+					},
+				})
+				Expect(reply).To(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				actual := reply.(*installer.V2RegisterClusterCreated)
+				Expect(actual.Payload.MachineNetworks).To(HaveLen(2))
+			})
+		})
+
+		Context("should fail", func() {
+			It("when registering cluster with user managed load balancer and API VIP outside all machine networks", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.129.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.128.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+							{Cidr: "192.168.128.0/24"},
+						},
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"api-vip '192.168.129.10' failed verification: "+
+						"none of the machine networks is satisfying the requirements, description: "+
+						"machine network CIDR <192.168.127.0/24> verification failed: "+
+						"api-vip <192.168.129.10> does not belong to machine-network-cidr <192.168.127.0/24>; "+
+						"machine network CIDR <192.168.128.0/24> verification failed: "+
+						"api-vip <192.168.129.10> does not belong to machine-network-cidr <192.168.128.0/24>",
+				)
+			})
+
+			It("when registering cluster with user managed load balancer and Ingress VIP outside all machine networks", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.129.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeUserManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.128.0/24"},
+							{Cidr: "192.168.129.0/24"},
+						},
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"ingress-vip '192.168.127.11' failed verification: "+
+						"none of the machine networks is satisfying the requirements, description: "+
+						"machine network CIDR <192.168.128.0/24> verification failed: "+
+						"ingress-vip <192.168.127.11> does not belong to machine-network-cidr <192.168.128.0/24>; "+
+						"machine network CIDR <192.168.129.0/24> verification failed: "+
+						"ingress-vip <192.168.127.11> does not belong to machine-network-cidr <192.168.129.0/24>",
+				)
+			})
+
+			It("when registering cluster with cluster managed load balancer and VIPs outside machine network", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.128.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.128.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeClusterManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+						},
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"api-vip <192.168.128.10> does not belong to machine-network-cidr <192.168.127.0/24>",
+				)
+			})
+
+			It("when cluster managed load balancer with multiple machine networks provided", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.127.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.11"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeClusterManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+							{Cidr: "192.168.128.0/24"},
+						},
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"Single-stack cluster with managed load balancer cannot contain multiple Machine Networks",
+				)
+			})
+
+			It("when cluster managed load balancer with common VIP", func() {
+				apiVips := []*models.APIVip{
+					{IP: "192.168.127.10"},
+				}
+				ingressVIPs := []*models.IngressVip{
+					{IP: "192.168.127.10"},
+				}
+				reply := bm.V2RegisterCluster(ctx, installer.V2RegisterClusterParams{
+					NewClusterParams: &models.ClusterCreateParams{
+						OpenshiftVersion: swag.String(common.MinimumVersionForUserManagedLoadBalancerFeature),
+						CPUArchitecture:  common.X86CPUArchitecture,
+						Platform: &models.Platform{
+							Type: models.PlatformTypeBaremetal.Pointer(),
+						},
+						LoadBalancer: &models.LoadBalancer{
+							Type: models.LoadBalancerTypeClusterManaged,
+						},
+						APIVips:     apiVips,
+						IngressVips: ingressVIPs,
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "192.168.127.0/24"},
+						},
+					},
+				})
+
+				verifyApiErrorString(
+					reply,
+					http.StatusBadRequest,
+					"The IP address \"192.168.127.10\" appears both in apiVIPs and ingressVIPs",
+				)
+			})
+		})
+	})
 })
 
 var _ = Describe("AMS subscriptions", func() {
@@ -15236,7 +18197,7 @@ var _ = Describe("AMS subscriptions", func() {
 		Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
 		db, dbName = common.PrepareTestDB()
 		bm = createInventory(db, cfg)
-		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false)
+		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
 		mockUsageReports()
 	})
 
@@ -15265,7 +18226,7 @@ var _ = Describe("AMS subscriptions", func() {
 		It("register cluster - deregister if we failed to create AMS subscription", func() {
 			bm.clusterApi = mockClusterApi
 			mockClusterApi.EXPECT().RegisterCluster(ctx, gomock.Any()).Return(nil)
-			mockClusterRegisterSteps()
+			mockClusterRegisterSteps(false)
 			mockAccountsMgmt.EXPECT().CreateSubscription(ctx, gomock.Any(), clusterName).Return(nil, errors.New("dummy"))
 			mockClusterApi.EXPECT().DeregisterCluster(ctx, gomock.Any())
 
@@ -15280,7 +18241,7 @@ var _ = Describe("AMS subscriptions", func() {
 		It("register cluster - delete AMS subscription if we failed to patch DB with ams_subscription_id", func() {
 			bm.clusterApi = mockClusterApi
 			mockClusterApi.EXPECT().RegisterCluster(ctx, gomock.Any()).Return(nil)
-			mockClusterRegisterSteps()
+			mockClusterRegisterSteps(false)
 			mockAMSSubscription(ctx)
 			mockClusterApi.EXPECT().UpdateAmsSubscriptionID(ctx, gomock.Any(), strfmt.UUID("")).Return(common.NewApiError(http.StatusInternalServerError, errors.New("dummy")))
 			mockClusterApi.EXPECT().DeregisterCluster(ctx, gomock.Any())
@@ -15297,7 +18258,7 @@ var _ = Describe("AMS subscriptions", func() {
 		It("deregister cluster that don't have 'Reserved' subscriptions", func() {
 			mockS3Client = s3wrapper.NewMockAPI(ctrl)
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, mockS3Client, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, mockS3Client, nil, nil, nil, false, nil)
 			mockClusterRegisterSuccess(true)
 			mockAMSSubscription(ctx)
 
@@ -15319,10 +18280,12 @@ var _ = Describe("AMS subscriptions", func() {
 
 		It("update cluster name happy flow", func() {
 			mockOperators := operators.NewMockAPI(ctrl)
-			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+			mockNoChangeInOperatorDependencies(mockOperators)
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccess(true)
 			mockAMSSubscription(ctx)
+			mockOperatorValidationsSuccess(mockOperators)
 
 			clusterParams := getDefaultClusterCreateParams()
 			clusterParams.Name = swag.String(clusterName)
@@ -15335,7 +18298,6 @@ var _ = Describe("AMS subscriptions", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			newClusterName := "ams-cluster-new-name"
-			mockOperators.EXPECT().ValidateCluster(ctx, gomock.Any())
 			mockEvents.EXPECT().SendClusterEvent(ctx, eventstest.NewEventMatcher(
 				eventstest.WithNameMatcher(eventgen.ClusterStatusUpdatedEventName),
 				eventstest.WithClusterIdMatcher(c.ID.String())))
@@ -15352,7 +18314,8 @@ var _ = Describe("AMS subscriptions", func() {
 
 		It("update cluster name with same name", func() {
 			mockOperators := operators.NewMockAPI(ctrl)
-			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+			mockNoChangeInOperatorDependencies(mockOperators)
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccess(true)
 			mockAMSSubscription(ctx)
@@ -15382,7 +18345,8 @@ var _ = Describe("AMS subscriptions", func() {
 
 		It("update cluster without name field", func() {
 			mockOperators := operators.NewMockAPI(ctrl)
-			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+			mockNoChangeInOperatorDependencies(mockOperators)
+			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 
 			mockClusterRegisterSuccess(true)
 			mockAMSSubscription(ctx)
@@ -15455,6 +18419,7 @@ var _ = Describe("AMS subscriptions", func() {
 					err := db.Create(&common.Cluster{Cluster: models.Cluster{
 						ID:               &clusterID,
 						OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+						CPUArchitecture:  common.DefaultCPUArchitecture,
 						Status:           swag.String(models.ClusterStatusReady),
 					}}).Error
 					Expect(err).ShouldNot(HaveOccurred())
@@ -15470,6 +18435,7 @@ var _ = Describe("AMS subscriptions", func() {
 					mockClusterApi.EXPECT().DeleteClusterLogs(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 					mockGetInstallConfigSuccess(mockInstallConfigBuilder)
 					mockGenerateInstallConfigSuccess(mockGenerator, mockVersions)
+					mockRefreshSchedulableMastersForcedTrue(mockClusterApi, 1)
 					mockS3Client.EXPECT().Download(gomock.Any(), gomock.Any()).Return(ignitionReader, int64(0), nil).MinTimes(0)
 					if test.status == "succeed" {
 						mockAccountsMgmt.EXPECT().UpdateSubscriptionOpenshiftClusterID(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
@@ -15491,7 +18457,7 @@ var _ = Describe("AMS subscriptions", func() {
 		It("register and deregister cluster happy flow - nil OCM client", func() {
 			mockS3Client = s3wrapper.NewMockAPI(ctrl)
 			bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
-				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, mockS3Client, nil, nil, nil, false)
+				db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, mockS3Client, nil, nil, nil, false, nil)
 			bm.ocmClient = nil
 			mockClusterRegisterSuccess(true)
 
@@ -16082,7 +19048,7 @@ var _ = Describe("BindHost", func() {
 		hostID = strfmt.UUID(uuid.New().String())
 		infraEnvID = strfmt.UUID(uuid.New().String())
 		bm = createInventory(db, cfg)
-		err := db.Create(&common.Cluster{Cluster: models.Cluster{ID: &clusterID, Kind: swag.String(models.ClusterKindCluster)}}).Error
+		err := db.Create(&common.Cluster{Cluster: models.Cluster{ID: &clusterID, Kind: swag.String(models.ClusterKindCluster), OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion}}).Error
 		Expect(err).ShouldNot(HaveOccurred())
 		err = db.Create(&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID}}).Error
 		Expect(err).ShouldNot(HaveOccurred())
@@ -16368,6 +19334,192 @@ var _ = Describe("BindHost", func() {
 		response = bm.V2DeregisterCluster(ctx, deregisterParams)
 		Expect(response).To(BeAssignableToTypeOf(&installer.V2DeregisterClusterNoContent{}))
 	})
+
+	It("successful bind for arbiter host", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", common.MinimumVersionForArbiterClusters).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeBaremetal).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("role", models.HostRoleArbiter).Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindSucceededEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+		mockClusterApi.EXPECT().AcceptRegistration(gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any())
+
+		response := bm.BindHost(ctx, params)
+		Expect(response).To(BeAssignableToTypeOf(&installer.BindHostOK{}))
+	})
+
+	It("failed bind for arbiter host - openshift version doesn't support TNA clusters", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", "4.18").Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeBaremetal).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("role", models.HostRoleArbiter).Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindFailedEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityError)))
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any()).Times(0)
+
+		response := bm.BindHost(ctx, params)
+		verifyApiErrorString(response, http.StatusBadRequest, "is assigned the arbiter role")
+	})
+
+	It("failed bind for arbiter host - platform isn't allowed for TNA clusters", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", common.MinimumVersionForArbiterClusters).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeVsphere).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("role", models.HostRoleArbiter).Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindFailedEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityError)))
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any()).Times(0)
+
+		response := bm.BindHost(ctx, params)
+		verifyApiErrorString(response, http.StatusBadRequest, "is assigned the arbiter role")
+	})
+
+	It("successful bind with fencing credentials", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", common.MinimumVersionForTwoNodesWithFencing).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeBaremetal).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("fencing_credentials", "credentials").Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindSucceededEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+		mockClusterApi.EXPECT().AcceptRegistration(gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any())
+
+		response := bm.BindHost(ctx, params)
+		Expect(response).To(BeAssignableToTypeOf(&installer.BindHostOK{}))
+	})
+
+	It("failed bind because openshift version doesn't support fencing credentials", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", "4.19").Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeBaremetal).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("fencing_credentials", "credentials").Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindFailedEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityError)))
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any()).Times(0)
+
+		response := bm.BindHost(ctx, params)
+		verifyApiErrorString(response, http.StatusBadRequest, "has fencing credentials")
+	})
+
+	It("failed bind because host has fencing credentials and cluster's platform is not allowed", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", common.MinimumVersionForTwoNodesWithFencing).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("platform_type", models.PlatformTypeVsphere).Error).ShouldNot(HaveOccurred())
+
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("fencing_credentials", "credentials").Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindFailedEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityError)))
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any()).Times(0)
+
+		response := bm.BindHost(ctx, params)
+		verifyApiErrorString(response, http.StatusBadRequest, "has fencing credentials")
+	})
+
+	It("successfully binds day-2 hosts to cluster", func() {
+		var clusterObj models.Cluster
+		Expect(db.First(&clusterObj, "id = ?", clusterID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("kind", models.ClusterKindAddHostsCluster).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&clusterObj).Update("openshift_version", "").Error).ShouldNot(HaveOccurred())
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+
+		params := installer.BindHostParams{
+			HostID:         hostID,
+			InfraEnvID:     infraEnvID,
+			BindHostParams: &models.BindHostParams{ClusterID: &clusterID},
+		}
+		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.HostBindSucceededEventName),
+			eventstest.WithHostIdMatcher(params.HostID.String()),
+			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
+			eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+		mockClusterApi.EXPECT().AcceptRegistration(gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockHostApi.EXPECT().BindHost(ctx, gomock.Any(), clusterID, gomock.Any())
+
+		response := bm.BindHost(ctx, params)
+		Expect(response).To(BeAssignableToTypeOf(&installer.BindHostOK{}))
+	})
 })
 
 var _ = Describe("BindHost - with rhsso auth", func() {
@@ -16402,9 +19554,10 @@ var _ = Describe("BindHost - with rhsso auth", func() {
 
 		err := db.Create(&common.Cluster{
 			Cluster: models.Cluster{
-				ID:       &clusterID,
-				Kind:     swag.String(models.ClusterKindCluster),
-				UserName: userName1}}).Error
+				ID:               &clusterID,
+				Kind:             swag.String(models.ClusterKindCluster),
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				UserName:         userName1}}).Error
 		Expect(err).ShouldNot(HaveOccurred())
 		err = db.Create(&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID}}).Error
 		Expect(err).ShouldNot(HaveOccurred())
@@ -16547,7 +19700,7 @@ var _ = Describe("V2DeregisterHost", func() {
 			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
 			eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
 		mockClusterApi.EXPECT().RefreshStatus(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("Bad Refresh Status"))
-		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrueWithClusterID(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		response := bm.V2DeregisterHost(ctx, params)
 		Expect(response).To(BeAssignableToTypeOf(&installer.V2DeregisterHostNoContent{}))
 	})
@@ -16592,7 +19745,7 @@ var _ = Describe("UnbindHost", func() {
 			eventstest.WithInfraEnvIdMatcher(infraEnvID.String()),
 			eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
 		mockHostApi.EXPECT().UnbindHost(ctx, gomock.Any(), gomock.Any(), false)
-		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockClusterApi.EXPECT().RefreshSchedulableMastersForcedTrueWithClusterID(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		response := bm.UnbindHost(ctx, params)
 		Expect(response).To(BeAssignableToTypeOf(&installer.UnbindHostOK{}))
 	})
@@ -16643,6 +19796,18 @@ var _ = Describe("UnbindHost", func() {
 		Expect(db.Model(&infraEnvObj).Update("cluster_id", clusterID).Error).ShouldNot(HaveOccurred())
 		response := bm.UnbindHost(ctx, params)
 		verifyApiError(response, http.StatusConflict)
+	})
+
+	It("unbind during installation should fail", func() {
+		params := installer.UnbindHostParams{
+			HostID:     hostID,
+			InfraEnvID: infraEnvID,
+		}
+		var hostObj models.Host
+		Expect(db.First(&hostObj, "id = ?", hostID).Error).ShouldNot(HaveOccurred())
+		Expect(db.Model(&hostObj).Update("status", models.HostStatusInstalling).Error).ShouldNot(HaveOccurred())
+		response := bm.UnbindHost(ctx, params)
+		verifyApiErrorString(response, http.StatusConflict, fmt.Sprintf("Cannot unbind Host %s while it is in the middle of installing.", hostID))
 	})
 
 	It("transition failed", func() {
@@ -17049,6 +20214,50 @@ var _ = Describe("Calculate host networks", func() {
 		Expect(networks[1].HostIds[0]).To(Equal(hostID))
 
 	})
+	It("includes only networks present on all hosts with inventory", func() {
+		hostID1 := strfmt.UUID(uuid.New().String())
+		hostID2 := strfmt.UUID(uuid.New().String())
+
+		addHost(hostID1, models.HostRoleMaster, models.HostStatusKnown, "kind", clusterID, clusterID,
+			getInventoryStr("host1", "bios", "10.0.0.1/24", "192.168.1.1/24"), db)
+
+		addHost(hostID2, models.HostRoleMaster, models.HostStatusKnown, "kind", clusterID, clusterID,
+			getInventoryStr("host2", "bios", "192.168.1.2/24"), db)
+
+		cfg.IPv6Support = false
+		inventory = createInventory(db, *cfg)
+		cluster, err := common.GetClusterFromDB(db, clusterID, common.UseEagerLoading)
+		Expect(err).ToNot(HaveOccurred())
+
+		networks := inventory.calculateHostNetworks(logrus.New(), cluster)
+
+		Expect(networks).To(HaveLen(1))
+		Expect(networks[0].Cidr).To(Equal("192.168.1.0/24"))
+		Expect(networks[0].HostIds).To(ContainElements(hostID1, hostID2))
+	})
+
+	It("skips networks when not all hosts with inventory are connected", func() {
+		hostID1 := strfmt.UUID(uuid.New().String())
+		hostID2 := strfmt.UUID(uuid.New().String())
+		hostID3 := strfmt.UUID(uuid.New().String())
+
+		addHost(hostID1, models.HostRoleMaster, models.HostStatusKnown, "kind", clusterID, clusterID,
+			getInventoryStr("h1", "bios", "172.16.0.1/16"), db)
+		addHost(hostID2, models.HostRoleMaster, models.HostStatusKnown, "kind", clusterID, clusterID,
+			getInventoryStr("h2", "bios", "172.16.0.2/16"), db)
+
+		addHost(hostID3, models.HostRoleMaster, models.HostStatusKnown, "kind", clusterID, clusterID,
+			getInventoryStr("h3", "bios", "10.10.0.1/24"), db)
+
+		cfg.IPv6Support = false
+		inventory = createInventory(db, *cfg)
+		cluster, err := common.GetClusterFromDB(db, clusterID, common.UseEagerLoading)
+		Expect(err).ToNot(HaveOccurred())
+
+		networks := inventory.calculateHostNetworks(logrus.New(), cluster)
+
+		Expect(networks).To(HaveLen(0))
+	})
 })
 
 var _ = Describe("Get Cluster by Kube Key", func() {
@@ -17085,14 +20294,14 @@ var _ = Describe("Get Cluster by Kube Key", func() {
 	})
 })
 
-func createInventory(db *gorm.DB, cfg Config) *bareMetalInventory {
+func createInventoryWithImageService(db *gorm.DB, cfg Config, enableImageService bool) *bareMetalInventory {
 	ctrl = gomock.NewController(GinkgoT())
 
 	mockStream = commontesting.GetDummyNotificationStream(ctrl)
 	mockClusterApi = cluster.NewMockAPI(ctrl)
 	mockHostApi = host.NewMockAPI(ctrl)
 	mockInfraEnvApi = infraenv.NewMockAPI(ctrl)
-	mockGenerator = generator.NewMockISOInstallConfigGenerator(ctrl)
+	mockGenerator = generator.NewMockInstallConfigGenerator(ctrl)
 	mockEvents = eventsapi.NewMockHandler(ctrl)
 	mockS3Client = s3wrapper.NewMockAPI(ctrl)
 	mockMetric = metrics.NewMockAPI(ctrl)
@@ -17110,18 +20319,40 @@ func createInventory(db *gorm.DB, cfg Config) *bareMetalInventory {
 	mockInstallConfigBuilder = installcfg_builder.NewMockInstallConfigBuilder(ctrl)
 	mockHwValidator = hardware.NewMockValidator(ctrl)
 	mockStaticNetworkConfig = staticnetworkconfig.NewMockStaticNetworkConfig(ctrl)
+	mockExecuter = executer.NewMockExecuter(ctrl)
+	mockMirrorRegistriesConfigBuilder = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(ctrl)
+	mockInstallerCache = installercache.NewMockInstallerCache(ctrl)
 	dnsApi := dns.NewDNSHandler(cfg.BaseDNSDomains, common.GetTestLog())
 	gcConfig := garbagecollector.Config{DeregisterInactiveAfter: 20 * 24 * time.Hour}
+
+	disconnectedIgnitionGenerator := ignition.NewDisconnectedIgnitionGenerator(
+		mockExecuter,
+		mockMirrorRegistriesConfigBuilder,
+		mockInstallerCache,
+		mockVersions,
+		common.GetTestLog().WithField("pkg", "OVEIgnition"),
+		"/tmp",
+	)
 
 	bm := NewBareMetalInventory(db, mockStream, common.GetTestLog(), mockHostApi, mockClusterApi, mockInfraEnvApi, cfg,
 		mockGenerator, mockEvents, mockS3Client, mockMetric, mockUsage, mockOperatorManager,
 		getTestAuthHandler(), getTestAuthzHandler(), mockK8sClient, ocmClient, nil, mockSecretValidator, mockVersions,
 		mockOSImages, mockCRDUtils, mockIgnitionBuilder, mockHwValidator, dnsApi, mockInstallConfigBuilder,
-		mockStaticNetworkConfig, gcConfig, mockProviderRegistry, true)
+		mockStaticNetworkConfig, gcConfig, mockProviderRegistry, true, false, disconnectedIgnitionGenerator)
 
-	bm.ImageServiceBaseURL = imageServiceBaseURL
+	if enableImageService {
+		bm.ImageServiceBaseURL = imageServiceBaseURL
+		bm.EnableImageService = true
+	} else {
+		bm.ImageServiceBaseURL = ""
+		bm.EnableImageService = false
+	}
 	bm.ServiceBaseURL = serviceBaseURL
 	return bm
+}
+
+func createInventory(db *gorm.DB, cfg Config) *bareMetalInventory {
+	return createInventoryWithImageService(db, cfg, true)
 }
 
 var _ = Describe("IPv6 support disabled", func() {
@@ -17261,6 +20492,80 @@ var _ = Describe("IPv6 support disabled", func() {
 			verifyApiErrorString(reply, http.StatusBadRequest, errorMsg)
 		})
 	})
+	Context("Network CIDR validations", func() {
+		var (
+			clusterID strfmt.UUID
+			cluster   *common.Cluster
+		)
+		BeforeEach(func() {
+			clusterID = strfmt.UUID(uuid.New().String())
+			cluster = &common.Cluster{Cluster: models.Cluster{
+				ID:                    &clusterID,
+				Kind:                  swag.String(models.ClusterKindAddHostsCluster),
+				Status:                swag.String(models.ClusterStatusInsufficient),
+				Platform:              &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)},
+				UserManagedNetworking: swag.Bool(false),
+				CPUArchitecture:       models.ClusterCPUArchitectureX8664,
+			}}
+			err := db.Create(cluster).Error
+			Expect(err).ShouldNot(HaveOccurred())
+			bm = createInventory(db, cfg)
+			bm.Config.DefaultClusterNetworkCidr = "1.2.3.0/24"
+			bm.Config.DefaultServiceNetworkCidr = "1.2.4.0/24"
+		})
+		It("Invalid network CIDR should fail", func() {
+			By("Invalid Machine Network CIDR")
+			reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					MachineNetworks: []*models.MachineNetwork{{Cidr: "invalid"}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Could not parse Machine Network CIDR invalid (index 0): invalid CIDR address: invalid")
+			By("Invalid Cluster Network CIDR")
+			reply = bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					ClusterNetworks: []*models.ClusterNetwork{{Cidr: "invalid"}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Could not parse Cluster Network CIDR invalid (index 0): invalid CIDR address: invalid")
+			By("Invalid Service Network CIDR")
+			reply = bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					ServiceNetworks: []*models.ServiceNetwork{{Cidr: "invalid"}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Could not parse Service Network CIDR invalid (index 0): invalid CIDR address: invalid")
+		})
+		It("Empty network CIDR should fail", func() {
+			By("Empty Machine Network CIDR")
+			reply := bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					MachineNetworks: []*models.MachineNetwork{{Cidr: ""}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Machine Network CIDR cannot be empty (index 0)")
+			By("Empty Cluster Network CIDR")
+			reply = bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					ClusterNetworks: []*models.ClusterNetwork{{Cidr: ""}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Cluster Network CIDR cannot be empty (index 0)")
+			By("Empty Service Network CIDR")
+			reply = bm.V2UpdateCluster(ctx, installer.V2UpdateClusterParams{
+				ClusterID: clusterID,
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{
+					ServiceNetworks: []*models.ServiceNetwork{{Cidr: ""}},
+				},
+			})
+			verifyApiErrorString(reply, http.StatusBadRequest, "Service Network CIDR cannot be empty (index 0)")
+		})
+	})
 })
 
 var _ = Describe("Dual-stack cluster", func() {
@@ -17306,28 +20611,119 @@ var _ = Describe("Dual-stack cluster", func() {
 
 		BeforeEach(func() {
 			params = installer.V2RegisterClusterParams{
-				NewClusterParams: &models.ClusterCreateParams{},
+				NewClusterParams: &models.ClusterCreateParams{OpenshiftVersion: swag.String(common.MinimumVersionForNonStandardHAOCPControlPlane)},
 			}
 		})
 
-		Context("Cluster with wrong network order", func() {
-			It("v6-first in cluster networks rejected", func() {
-				errStr := "First cluster network has to be IPv4 subnet"
+		Context("Cluster with IPv6-primary dual-stack networks (version-aware)", func() {
+			BeforeEach(func() {
+				Expect(envconfig.Process("test", &cfg)).ShouldNot(HaveOccurred())
+				db, dbName = common.PrepareTestDB()
+				cfg.DiskEncryptionSupport = false
+				bm = createInventory(db, cfg)
+				bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog().WithField("pkg", "cluster-monitor"),
+					db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, false, nil)
+				mockUsageReports()
+			})
+			AfterEach(func() {
+				ctrl.Finish()
+				common.DeleteTestDB(db, dbName)
+			})
+			It("v6-first in cluster networks rejected (OCP < 4.12)", func() {
 				params.NewClusterParams.ClusterNetworks = TestDualStackNetworkingWrongOrder.ClusterNetworks
+				params.NewClusterParams.OpenshiftVersion = swag.String("4.11.0")
 				reply := bm.V2RegisterCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, errStr)
+				verifyApiErrorString(reply, http.StatusBadRequest, "First cluster networks has to be IPv4 subnet (IPv6-primary dual-stack requires OpenShift 4.12+), got 1003:db8::/53")
 			})
-			It("v6-first in service networks rejected", func() {
-				errStr := "First service network has to be IPv4 subnet"
+			It("v6-first in service networks rejected (OCP < 4.12)", func() {
 				params.NewClusterParams.ServiceNetworks = TestDualStackNetworkingWrongOrder.ServiceNetworks
+				params.NewClusterParams.OpenshiftVersion = swag.String("4.11.0")
 				reply := bm.V2RegisterCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, errStr)
+				verifyApiErrorString(reply, http.StatusBadRequest, "First service networks has to be IPv4 subnet (IPv6-primary dual-stack requires OpenShift 4.12+), got 1002:db8::/119")
 			})
-			It("v6-first in machine networks rejected", func() {
-				errStr := "First machine network has to be IPv4 subnet"
+			It("v6-first in machine networks rejected (OCP < 4.12)", func() {
+				params.NewClusterParams.MachineNetworks = TestDualStackNetworkingWrongOrder.MachineNetworks
+				params.NewClusterParams.OpenshiftVersion = swag.String("4.11.0")
+				reply := bm.V2RegisterCluster(ctx, params)
+				verifyApiErrorString(reply, http.StatusBadRequest, "First machine networks has to be IPv4 subnet (IPv6-primary dual-stack requires OpenShift 4.12+), got 1001:db8::/120")
+			})
+			It("v6-first in machine/service/cluster networks accepted (OCP 4.12+)", func() {
+				mockClusterRegisterSuccess(true)
+				mockAMSSubscription(ctx)
+
+				params.NewClusterParams.ClusterNetworks = TestDualStackNetworkingWrongOrder.ClusterNetworks
+				params.NewClusterParams.ServiceNetworks = TestDualStackNetworkingWrongOrder.ServiceNetworks
 				params.NewClusterParams.MachineNetworks = TestDualStackNetworkingWrongOrder.MachineNetworks
 				reply := bm.V2RegisterCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, errStr)
+				Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
+				cluster := reply.(*installer.V2RegisterClusterCreated).Payload
+				Expect(cluster.ClusterNetworks).To(HaveLen(2))
+				Expect(cluster.ServiceNetworks).To(HaveLen(2))
+				Expect(cluster.MachineNetworks).To(HaveLen(2))
+
+				// Verify that IPv6 networks come first (IPv6-primary)
+				Expect(string(cluster.ClusterNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+				Expect(string(cluster.ServiceNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+				Expect(string(cluster.MachineNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+			})
+
+			It("RegisterClusterInternal should register IPv6-first cluster and set PrimaryIPStack", func() {
+				mockClusterRegisterSuccessWithVersion(models.ClusterCPUArchitectureX8664, "4.12.0")
+				mockAMSSubscription(ctx)
+
+				params.NewClusterParams.Name = swag.String("test-ipv6-multinode")
+				params.NewClusterParams.OpenshiftVersion = swag.String("4.12.0")
+				params.NewClusterParams.PullSecret = swag.String(fakePullSecret)
+				params.NewClusterParams.BaseDNSDomain = "example.com"
+				params.NewClusterParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "2001:db8::/53", HostPrefix: 64},
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				params.NewClusterParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "2001:db9::/112"},
+					{Cidr: "172.30.0.0/16"},
+				}
+				params.NewClusterParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "2001:db9::/120"},
+					{Cidr: "192.168.126.0/24"},
+				}
+
+				cluster, err := bm.RegisterClusterInternal(ctx, nil, nil, params)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify PrimaryIPStack is set to IPv6
+				var dbCluster common.Cluster
+				err = db.First(&dbCluster, "id = ?", *cluster.ID).Error
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dbCluster.PrimaryIPStack).NotTo(BeNil())
+				Expect(*dbCluster.PrimaryIPStack).To(Equal(common.PrimaryIPStackV6))
+
+				// Verify networks are IPv6-first
+				Expect(string(cluster.ClusterNetworks[0].Cidr)).To(Equal("2001:db8::/53"))
+				Expect(string(cluster.ServiceNetworks[0].Cidr)).To(Equal("2001:db9::/112"))
+				Expect(string(cluster.MachineNetworks[0].Cidr)).To(Equal("2001:db9::/120"))
+			})
+
+			It("RegisterClusterInternal should reject inconsistent IP family order", func() {
+				params.NewClusterParams.Name = swag.String("test-inconsistent")
+				params.NewClusterParams.PullSecret = swag.String(fakePullSecret)
+				params.NewClusterParams.BaseDNSDomain = "example.com"
+				params.NewClusterParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "2001:db8::/53", HostPrefix: 64}, // IPv6 first
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				params.NewClusterParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"}, // IPv4 first - inconsistent!
+					{Cidr: "2001:db9::/112"},
+				}
+				params.NewClusterParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "2001:db9::/120"}, // IPv6 first - matches cluster networks
+					{Cidr: "192.168.126.0/24"},
+				}
+
+				_, err := bm.RegisterClusterInternal(ctx, nil, nil, params)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Inconsistent IP family order"))
 			})
 		})
 
@@ -17378,21 +20774,203 @@ var _ = Describe("Dual-stack cluster", func() {
 			}
 		})
 
-		Context("Cluster with wrong network order", func() {
-			It("v6-first in cluster networks rejected", func() {
+		Context("Cluster with IPv6-primary dual-stack networks (version-aware)", func() {
+			// Create a cluster with OCP 4.12+ for IPv6-primary tests
+			var cluster412ID strfmt.UUID
+			BeforeEach(func() {
+				mockUsageReports()
+				cluster412ID = strfmt.UUID(uuid.New().String())
+				err := db.Create(&common.Cluster{Cluster: models.Cluster{
+					ID:               &cluster412ID,
+					OpenshiftVersion: common.MinimalVersionForIPV6PrimaryWithDualStack,
+					Status:           swag.String(models.ClusterStatusReady),
+					CPUArchitecture:  models.ClusterCPUArchitectureX8664,
+				}}).Error
+				Expect(err).ShouldNot(HaveOccurred())
+
+				params = installer.V2UpdateClusterParams{ClusterID: cluster412ID,
+					ClusterUpdateParams: &models.V2ClusterUpdateParams{},
+				}
+			})
+
+			It("v6-first in machine/service/cluster networks accepted (OCP 4.12+)", func() {
+				By("setup IPv6-primary dual stack networking")
+				cluster412 := &common.Cluster{Cluster: models.Cluster{
+					ID: &cluster412ID,
+				}}
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(createClusterIdMatcher(cluster412)).Return(nil).Times(1)
+
 				params.ClusterUpdateParams.ClusterNetworks = TestDualStackNetworkingWrongOrder.ClusterNetworks
-				reply := bm.V2UpdateCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, "First cluster network has to be IPv4 subnet")
-			})
-			It("v6-first in service networks rejected", func() {
 				params.ClusterUpdateParams.ServiceNetworks = TestDualStackNetworkingWrongOrder.ServiceNetworks
-				reply := bm.V2UpdateCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, "First service network has to be IPv4 subnet")
-			})
-			It("v6-first in machine networks rejected", func() {
 				params.ClusterUpdateParams.MachineNetworks = TestDualStackNetworkingWrongOrder.MachineNetworks
-				reply := bm.V2UpdateCluster(ctx, params)
-				verifyApiErrorString(reply, http.StatusBadRequest, "First machine network has to be IPv4 subnet")
+
+				cluster, err := bm.UpdateClusterNonInteractive(ctx, params, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(cluster.ClusterNetworks).To(HaveLen(2))
+				Expect(cluster.ServiceNetworks).To(HaveLen(2))
+				Expect(cluster.MachineNetworks).To(HaveLen(2))
+
+				// Verify that IPv6 networks come first (IPv6-primary)
+				Expect(string(cluster.ClusterNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+				Expect(string(cluster.ServiceNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+				Expect(string(cluster.MachineNetworks[0].Cidr)).To(ContainSubstring(":")) // IPv6 contains ":"
+			})
+
+			It("v2UpdateClusterInternal should set PrimaryIPStack for IPv6-first networks", func() {
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(gomock.Any()).Return(nil).Times(1)
+				mockClusterUpdateSuccess(1, 0)
+
+				params.ClusterUpdateParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "2001:db8::/53", HostPrefix: 64},
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				params.ClusterUpdateParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "2001:db9::/112"},
+					{Cidr: "172.30.0.0/16"},
+				}
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "2001:db9::/120"},
+					{Cidr: "192.168.126.0/24"},
+				}
+
+				updatedCluster, err := bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify PrimaryIPStack is set to IPv6
+				var dbCluster common.Cluster
+				err = db.First(&dbCluster, "id = ?", cluster412ID).Error
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dbCluster.PrimaryIPStack).NotTo(BeNil())
+				Expect(*dbCluster.PrimaryIPStack).To(Equal(common.PrimaryIPStackV6))
+
+				// Verify networks are IPv6-first
+				Expect(string(updatedCluster.MachineNetworks[0].Cidr)).To(Equal("2001:db9::/120"))
+				Expect(string(updatedCluster.ClusterNetworks[0].Cidr)).To(Equal("2001:db8::/53"))
+			})
+
+			It("v2UpdateClusterInternal should reject inconsistent IP family order", func() {
+				params.ClusterUpdateParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "2001:db8::/53", HostPrefix: 64}, // IPv6 first
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+				}
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "192.168.126.0/24"}, // IPv4 first - inconsistent!
+					{Cidr: "2001:db9::/120"},
+				}
+
+				_, err := bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Inconsistent IP family order"))
+			})
+
+			It("v2UpdateClusterInternal should handle partial updates consistently", func() {
+				// First, create a cluster with IPv4-first dual-stack
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(gomock.Any()).Return(nil).Times(2)
+				mockClusterUpdateSuccess(2, 0)
+
+				// Full update to create IPv4-first cluster
+				params.ClusterUpdateParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23}, // IPv4 first
+					{Cidr: "2001:db8::/53", HostPrefix: 64},
+				}
+				params.ClusterUpdateParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"}, // IPv4 first
+					{Cidr: "2001:db9::/112"},
+				}
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "192.168.126.0/24"}, // IPv4 first
+					{Cidr: "2001:db9::/120"},
+				}
+				params.ClusterUpdateParams.APIVips = []*models.APIVip{
+					{IP: "192.168.126.1"}, // IPv4 first
+					{IP: "2001:db9::1"},
+				}
+				params.ClusterUpdateParams.IngressVips = []*models.IngressVip{
+					{IP: "192.168.126.2"}, // IPv4 first
+					{IP: "2001:db9::2"},
+				}
+
+				_, err := bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify PrimaryIPStack is set to IPv4
+				var dbCluster common.Cluster
+				err = db.First(&dbCluster, "id = ?", cluster412ID).Error
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dbCluster.PrimaryIPStack).NotTo(BeNil())
+				Expect(*dbCluster.PrimaryIPStack).To(Equal(common.PrimaryIPStackV4))
+
+				// Now test partial update - only update machine networks with consistent IPv4-first
+				params.ClusterUpdateParams = &models.V2ClusterUpdateParams{
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "10.0.0.0/16"}, // IPv4 first - consistent
+						{Cidr: "2001:db8::/64"},
+					},
+					APIVips: []*models.APIVip{
+						{IP: "10.0.0.1"}, // IPv4 first
+						{IP: "2001:db8::1"},
+					},
+					IngressVips: []*models.IngressVip{
+						{IP: "10.0.0.2"}, // IPv4 first
+						{IP: "2001:db8::2"},
+					},
+				}
+
+				updatedCluster, err := bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Verify PrimaryIPStack remains IPv4 (no change)
+				err = db.First(&dbCluster, "id = ?", cluster412ID).Error
+				Expect(err).NotTo(HaveOccurred())
+				Expect(dbCluster.PrimaryIPStack).NotTo(BeNil())
+				Expect(*dbCluster.PrimaryIPStack).To(Equal(common.PrimaryIPStackV4))
+
+				// Verify machine networks were updated
+				Expect(string(updatedCluster.MachineNetworks[0].Cidr)).To(Equal("10.0.0.0/16"))
+			})
+
+			It("v2UpdateClusterInternal should reject partial updates with inconsistent IP family order", func() {
+				// First, create a cluster with IPv4-first dual-stack
+				mockClusterApi.EXPECT().VerifyClusterUpdatability(gomock.Any()).Times(1)
+				mockClusterUpdateSuccess(1, 0)
+
+				// Full update to create IPv4-first cluster
+				params.ClusterUpdateParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23}, // IPv4 first
+					{Cidr: "2001:db8::/53", HostPrefix: 64},
+				}
+				params.ClusterUpdateParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"}, // IPv4 first
+					{Cidr: "2001:db9::/112"},
+				}
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "192.168.126.0/24"}, // IPv4 first
+					{Cidr: "2001:db9::/120"},
+				}
+				params.ClusterUpdateParams.APIVips = []*models.APIVip{
+					{IP: "192.168.126.1"}, // IPv4 first
+					{IP: "2001:db9::1"},
+				}
+				params.ClusterUpdateParams.IngressVips = []*models.IngressVip{
+					{IP: "192.168.126.2"}, // IPv4 first
+					{IP: "2001:db9::2"},
+				}
+
+				_, err := bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).NotTo(HaveOccurred())
+
+				// Now test partial update - update machine networks with inconsistent IPv6-first
+				params.ClusterUpdateParams = &models.V2ClusterUpdateParams{
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "2001:db8::/64"}, // IPv6 first - inconsistent!
+						{Cidr: "10.0.0.0/16"},
+					},
+				}
+
+				_, err = bm.v2UpdateClusterInternal(ctx, params, Interactive, nil)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Inconsistent IP family order"))
+				Expect(err.Error()).To(ContainSubstring("machine_networks first IP is 2001:db8::/64 but existing primary IP stack is IPv4"))
 			})
 		})
 
@@ -17427,7 +21005,7 @@ var _ = Describe("Dual-stack cluster", func() {
 			params.ClusterUpdateParams.MachineNetworks = common.TestDualStackNetworking.MachineNetworks
 			params.ClusterUpdateParams.ServiceNetworks = common.TestDualStackNetworking.ServiceNetworks
 			params.ClusterUpdateParams.ClusterNetworks = common.TestDualStackNetworking.ClusterNetworks
-			cls, err := bm.UpdateClusterNonInteractive(ctx, params)
+			cls, err := bm.UpdateClusterNonInteractive(ctx, params, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(cls.MachineNetworks).To(HaveLen(2))
 			for _, m := range common.TestDualStackNetworking.MachineNetworks {
@@ -17436,7 +21014,7 @@ var _ = Describe("Dual-stack cluster", func() {
 			By("update machine networks")
 			params.ClusterUpdateParams.MachineNetworks = append([]*models.MachineNetwork{}, common.TestDualStackNetworking.MachineNetworks...)
 			params.ClusterUpdateParams.MachineNetworks[1] = &models.MachineNetwork{ClusterID: clusterID, Cidr: "3001:db8::/120"}
-			cls, err = bm.UpdateClusterNonInteractive(ctx, params)
+			cls, err = bm.UpdateClusterNonInteractive(ctx, params, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(cls.MachineNetworks).To(HaveLen(2))
 			Expect(cls.MachineNetworks).To(ContainElement(&models.MachineNetwork{ClusterID: clusterID, Cidr: "3001:db8::/120"}))
@@ -17452,22 +21030,12 @@ var _ = Describe("GetCredentials", func() {
 		bm     *bareMetalInventory
 		db     *gorm.DB
 		dbName string
-		c      common.Cluster
+		c      *common.Cluster
 	)
 
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
 		bm = createInventory(db, cfg)
-
-		clusterID := strfmt.UUID(uuid.New().String())
-		c = common.Cluster{
-			Cluster: models.Cluster{
-				ID:            &clusterID,
-				Name:          "my-cluster",
-				BaseDNSDomain: "my-domain",
-			},
-		}
-		Expect(db.Create(&c).Error).ShouldNot(HaveOccurred())
 	})
 
 	AfterEach(func() {
@@ -17476,7 +21044,7 @@ var _ = Describe("GetCredentials", func() {
 	})
 
 	It("Console operator available", func() {
-		mockClusterApi.EXPECT().IsOperatorMonitored(gomock.Any(), operators.OperatorConsole.Name).Return(true)
+		c = createClusterWithMonitoredOperator(db, operators.OperatorConsole)
 		mockClusterApi.EXPECT().IsOperatorAvailable(gomock.Any(), operators.OperatorConsole.Name).Return(true)
 		objectName := fmt.Sprintf("%s/%s", *c.ID, "kubeadmin-password")
 		mockS3Client.EXPECT().Download(ctx, objectName).Return(io.NopCloser(strings.NewReader("my_password")), int64(0), nil)
@@ -17486,7 +21054,7 @@ var _ = Describe("GetCredentials", func() {
 	})
 
 	It("Console operator not available", func() {
-		mockClusterApi.EXPECT().IsOperatorMonitored(gomock.Any(), operators.OperatorConsole.Name).Return(true)
+		c = createClusterWithMonitoredOperator(db, operators.OperatorConsole)
 		mockClusterApi.EXPECT().IsOperatorAvailable(gomock.Any(), operators.OperatorConsole.Name).Return(false)
 
 		reply := bm.V2GetCredentials(ctx, installer.V2GetCredentialsParams{ClusterID: *c.ID})
@@ -17494,7 +21062,7 @@ var _ = Describe("GetCredentials", func() {
 	})
 
 	It("Returns credentials and no console URL if the console capability is disabled", func() {
-		mockClusterApi.EXPECT().IsOperatorMonitored(gomock.Any(), operators.OperatorConsole.Name).Return(false)
+		c = createCluster(db, models.ClusterStatusInstalled)
 		objectName := fmt.Sprintf("%s/%s", *c.ID, "kubeadmin-password")
 		mockS3Client.EXPECT().Download(ctx, objectName).Return(io.NopCloser(strings.NewReader("my_password")), int64(0), nil)
 
@@ -17509,7 +21077,7 @@ var _ = Describe("GetCredentials", func() {
 	})
 
 	It("Returns credentials and console URL if the console capability is enabled", func() {
-		mockClusterApi.EXPECT().IsOperatorMonitored(gomock.Any(), operators.OperatorConsole.Name).Return(true)
+		c = createClusterWithMonitoredOperator(db, operators.OperatorConsole)
 		mockClusterApi.EXPECT().IsOperatorAvailable(gomock.Any(), operators.OperatorConsole.Name).Return(true)
 		objectName := fmt.Sprintf("%s/%s", *c.ID, "kubeadmin-password")
 		mockS3Client.EXPECT().Download(ctx, objectName).Return(io.NopCloser(strings.NewReader("my_password")), int64(0), nil)
@@ -17547,7 +21115,8 @@ var _ = Describe("Platform tests", func() {
 		db, dbName = common.PrepareTestDB()
 		bm = createInventory(db, cfg)
 		mockOperators := operators.NewMockAPI(ctrl)
-		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false)
+		mockNoChangeInOperatorDependencies(mockOperators)
+		bm.clusterApi = cluster.NewManager(cluster.Config{}, common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, nil, nil, nil, mockOperators, nil, nil, nil, nil, nil, false, nil)
 		bm.ocmClient = nil
 		clusterParams := getDefaultClusterCreateParams()
 		clusterParams.Name = swag.String("cluster")
@@ -17700,7 +21269,7 @@ var _ = Describe("Platform tests", func() {
 			}
 
 			registerParams.NewClusterParams.OpenshiftVersion = swag.String(MinimalOpenShiftVersionForExternal)
-			registerParams.NewClusterParams.HighAvailabilityMode = swag.String(models.ClusterCreateParamsHighAvailabilityModeNone)
+			registerParams.NewClusterParams.ControlPlaneCount = swag.Int64(1)
 
 			reply := bm.V2RegisterCluster(ctx, *registerParams)
 			Expect(reply).Should(BeAssignableToTypeOf(installer.NewV2RegisterClusterCreated()))
@@ -17727,7 +21296,6 @@ var _ = Describe("Platform tests", func() {
 			payload.Username = "user1"
 			payload.Organization = "org1"
 			authCtx := context.WithValue(ctx, restapi.AuthKey, payload)
-			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.PlatformExternalCapabilityName, ocm.OrganizationCapabilityType).Return(true, nil).Times(1)
 			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.SoftTimeoutsCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
 
 			registerParams.NewClusterParams.OpenshiftVersion = swag.String("4.14")
@@ -17764,8 +21332,6 @@ var _ = Describe("Platform tests", func() {
 			payload.Username = "user1"
 			payload.Organization = "org1"
 			authCtx := context.WithValue(ctx, restapi.AuthKey, payload)
-			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.PlatformExternalCapabilityName, ocm.OrganizationCapabilityType).Return(true, nil).Times(1)
-			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.PlatformOciCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
 			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.SoftTimeoutsCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
 
 			registerParams.NewClusterParams.OpenshiftVersion = swag.String("4.14")
@@ -17802,7 +21368,6 @@ var _ = Describe("Platform tests", func() {
 			payload.Username = "user1"
 			payload.Organization = "org1"
 			authCtx := context.WithValue(ctx, restapi.AuthKey, payload)
-			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.PlatformOciCapabilityName, ocm.OrganizationCapabilityType).Return(true, nil).Times(1)
 			mockOcmAuthz.EXPECT().CapabilityReview(gomock.Any(), payload.Username, ocm.SoftTimeoutsCapabilityName, ocm.OrganizationCapabilityType).Return(false, nil).Times(1)
 
 			registerParams.NewClusterParams.OpenshiftVersion = swag.String("4.14")
@@ -18255,36 +21820,81 @@ var _ = Describe("Update cluster - feature usage flags", func() {
 	})
 
 	Context("User Managed Network With Multi Node Usage", func() {
-		It("feature usage when userManagedNetworking is true and highAvailabilityMode is Full should be on", func() {
+		It("feature usage when userManagedNetworking is true and highly available cluster should be on", func() {
 			userManagedNetwork := true
-			highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+			controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 			mockUsage.EXPECT().Add(usages, usage.UserManagedNetworkingWithMultiNode, nil).Times(1)
 			mockUsage.EXPECT().Remove(usages, usage.UserManagedNetworkingWithMultiNode).Times(0)
-			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, highAvailabilityMode, usages)
+			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, controlPlaneCount, usages)
 		})
 
-		It("feature usage when userManagedNetworking is false and highAvailabilityMode is Full should be off", func() {
+		It("feature usage when userManagedNetworking is false highly available cluster should be on", func() {
 			userManagedNetwork := false
-			highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeFull
+			controlPlaneCount := int64(common.MinMasterHostsNeededForInstallationInHaMode)
 			mockUsage.EXPECT().Add(usages, usage.UserManagedNetworkingWithMultiNode, nil).Times(0)
 			mockUsage.EXPECT().Remove(usages, usage.UserManagedNetworkingWithMultiNode).Times(1)
-			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, highAvailabilityMode, usages)
+			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, controlPlaneCount, usages)
 		})
 
-		It("feature usage when userManagedNetworking is true and highAvailabilityMode is None should be off", func() {
+		It("feature usage when userManagedNetworking is true and highly available cluster should be off", func() {
 			userManagedNetwork := true
-			highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeNone
+			controlPlaneCount := int64(1)
 			mockUsage.EXPECT().Add(usages, usage.UserManagedNetworkingWithMultiNode, nil).Times(0)
 			mockUsage.EXPECT().Remove(usages, usage.UserManagedNetworkingWithMultiNode).Times(1)
-			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, highAvailabilityMode, usages)
+			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, controlPlaneCount, usages)
 		})
 
-		It("feature usage when userManagedNetworking is false and highAvailabilityMode is None should be off", func() {
+		It("feature usage when userManagedNetworking is false and highly available cluster should be off", func() {
 			userManagedNetwork := false
-			highAvailabilityMode := models.ClusterCreateParamsHighAvailabilityModeNone
+			controlPlaneCount := int64(1)
 			mockUsage.EXPECT().Add(usages, usage.UserManagedNetworkingWithMultiNode, nil).Times(0)
 			mockUsage.EXPECT().Remove(usages, usage.UserManagedNetworkingWithMultiNode).Times(1)
-			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, highAvailabilityMode, usages)
+			bm.setUserManagedNetworkingAndMultiNodeUsage(userManagedNetwork, controlPlaneCount, usages)
+		})
+	})
+
+	Context("Network type usage", func() {
+		allNetworkUsages := []string{
+			usage.OVNNetworkTypeUsage,
+			usage.SDNNetworkTypeUsage,
+			usage.CiscoACINetworkTypeUsage,
+			usage.CiliumNetworkTypeUsage,
+			usage.CalicoNetworkTypeUsage,
+			usage.NoneNetworkTypeUsage,
+		}
+
+		DescribeTable("should enable only the matching network type usage",
+			func(networkType string, expectedUsage string) {
+				for _, u := range allNetworkUsages {
+					if u == expectedUsage {
+						mockUsage.EXPECT().Add(usages, u, nil).Times(1)
+					} else {
+						mockUsage.EXPECT().Remove(usages, u).Times(1)
+					}
+				}
+				bm.setNetworkTypeUsage(&networkType, usages)
+			},
+			Entry("OVNKubernetes", models.ClusterNetworkTypeOVNKubernetes, usage.OVNNetworkTypeUsage),
+			Entry("OpenShiftSDN", models.ClusterNetworkTypeOpenShiftSDN, usage.SDNNetworkTypeUsage),
+			Entry("CiscoACI", models.ClusterNetworkTypeCiscoACI, usage.CiscoACINetworkTypeUsage),
+			Entry("Cilium", models.ClusterNetworkTypeCilium, usage.CiliumNetworkTypeUsage),
+			Entry("Calico", models.ClusterNetworkTypeCalico, usage.CalicoNetworkTypeUsage),
+			Entry("None", models.ClusterNetworkTypeNone, usage.NoneNetworkTypeUsage),
+		)
+
+		It("should disable all network type usages for unknown network type", func() {
+			for _, u := range allNetworkUsages {
+				mockUsage.EXPECT().Remove(usages, u).Times(1)
+			}
+			unknown := "SomeUnknownCNI"
+			bm.setNetworkTypeUsage(&unknown, usages)
+		})
+
+		It("should disable all network type usages for nil network type", func() {
+			for _, u := range allNetworkUsages {
+				mockUsage.EXPECT().Remove(usages, u).Times(1)
+			}
+			bm.setNetworkTypeUsage(nil, usages)
 		})
 	})
 })
@@ -18520,7 +22130,7 @@ var _ = Describe("GetInfraEnvDownloadURL", func() {
 	})
 
 	getNewURL := func() *models.PresignedURL {
-		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+		mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 		params := installer.GetInfraEnvDownloadURLParams{InfraEnvID: infraEnvID}
 		resp := bm.GetInfraEnvDownloadURL(ctx, params)
 		Expect(resp).To(BeAssignableToTypeOf(&installer.GetInfraEnvDownloadURLOK{}))
@@ -18541,8 +22151,17 @@ var _ = Describe("GetInfraEnvDownloadURL", func() {
 				fmt.Sprintf("%s/byid/%s/%s/%s/full.iso",
 					imageServicePath,
 					infraEnvID,
-					*common.TestDefaultConfig.OsImage.OpenshiftVersion,
+					*common.TestDefaultConfig.OsImage.Version,
 					*common.TestDefaultConfig.OsImage.CPUArchitecture)))
+		})
+
+		It("uses infra-env OS stream when resolving OS image", func() {
+			Expect(db.Model(&common.InfraEnv{}).Where("id = ?", infraEnvID).Update("os_stream", "rhel-9").Error).To(Succeed())
+			mockOSImages.EXPECT().GetOsImageOrLatest(common.TestDefaultConfig.OpenShiftVersion, gomock.Any(), "rhel-9", gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+
+			params := installer.GetInfraEnvDownloadURLParams{InfraEnvID: infraEnvID}
+			resp := bm.GetInfraEnvDownloadURL(ctx, params)
+			Expect(resp).To(BeAssignableToTypeOf(&installer.GetInfraEnvDownloadURLOK{}))
 		})
 	})
 
@@ -18575,7 +22194,7 @@ var _ = Describe("GetInfraEnvDownloadURL", func() {
 			pathList := strings.Split(u.Path, "/")
 			Expect(pathList).To(HaveLen(8))
 			Expect(pathList[3]).To(Equal("byapikey"))
-			Expect(pathList[5]).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
+			Expect(pathList[5]).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 
 			tok := pathList[4]
 			_, err = bm.authHandler.AuthURLAuth(tok)
@@ -18601,7 +22220,7 @@ var _ = Describe("GetInfraEnvDownloadURL", func() {
 			pathList := strings.Split(u.Path, "/")
 			Expect(pathList).To(HaveLen(8))
 			Expect(pathList[3]).To(Equal("bytoken"))
-			Expect(pathList[5]).To(Equal(common.TestDefaultConfig.OpenShiftVersion))
+			Expect(pathList[5]).To(Equal(*common.TestDefaultConfig.OsImage.Version))
 
 			tok := pathList[4]
 			_, err = bm.authHandler.AuthImageAuth(tok)
@@ -18791,7 +22410,7 @@ var _ = Describe("GetHostByKubeKey", func() {
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
 		bm = createInventory(db, cfg)
-		cluster := createClusterWithAvailability(db, models.ClusterStatusReady, models.ClusterCreateParamsHighAvailabilityModeNone)
+		cluster := createClusterWithAvailability(db, models.ClusterStatusReady, 1)
 		clusterID = cluster.ID
 		// this doesn't need to be a VM, but any host works for this test
 		addVMToCluster(cluster, db)
@@ -18840,11 +22459,489 @@ var _ = Describe("GetHostByKubeKey", func() {
 	})
 })
 
-var _ = Describe("V2UpdateHostIgnition unbound blabla", func() {
+var _ = Describe("UpdateIgnitionEndpointIfHasMCSCert", func() {
+	var (
+		cfg     Config
+		db      *gorm.DB
+		dbName  string
+		cluster *common.Cluster
+	)
+	const (
+		expectedBase64Cert       = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURFRENDQWZpZ0F3SUJBZ0lJUk90aUgvOC82ckF3RFFZSktvWklodmNOQVFFTEJRQXdKakVTTUJBR0ExVUUKQ3hNSmIzQmxibk5vYVdaME1SQXdEZ1lEVlFRREV3ZHliMjkwTFdOaE1CNFhEVEl3TURreE9ERTVORFV3TVZvWApEVE13TURreE5qRTVORFV3TVZvd0pqRVNNQkFHQTFVRUN4TUpiM0JsYm5Ob2FXWjBNUkF3RGdZRFZRUURFd2R5CmIyOTBMV05oTUlJQklqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUE1c1orVWtaaGsxUWQKeFU3cWI3YXArNFczaS9ZWTFzZktURC8ybDVJTjFJeVhPajlSL1N2VG5SOGYvajNJa1JHMWN5ZXR4bnNlNm1aZwpaOW1IRDJMV0srSEFlTTJSYXpuRkEwVmFwOWxVbVRrd3Vza2Z3QzhnMWJUZUVHUlEyQmFId09KekpvdjF4a0ZICmU2TUZCMlcxek1rTWxLTkwycnlzMzRTeVYwczJpNTFmTTJvTEM2SXRvWU91RVVVa2o0dnVUbThPYm5rV0t4ZnAKR1VGMThmNzVYeHJId0tVUEd0U0lYMGxpVGJNM0tiTDY2V2lzWkFIeStoN1g1dnVaaFYzYXhwTVFMdlczQ2xvcQpTaG9zSXY4SWNZbUJxc210d2t1QkN3cWxibEo2T2gzblFrelorVHhQdGhkdWsrZytzaVBUNi9va0JKU2M2cURjClBaNUNyN3FrR3dJREFRQUJvMEl3UURBT0JnTlZIUThCQWY4RUJBTUNBcVF3RHdZRFZSMFRBUUgvQkFVd0F3RUIKL3pBZEJnTlZIUTRFRmdRVWNSbHFHT1g3MWZUUnNmQ0tXSGFuV3NwMFdmRXdEUVlKS29aSWh2Y05BUUVMQlFBRApnZ0VCQU5Xc0pZMDY2RnNYdzFOdXluMEkwNUtuVVdOMFY4NVJVV2drQk9Wd0J5bHluTVRneGYyM3RaY1FsS0U4CjVHMlp4Vzl5NmpBNkwzMHdSNWhOcnBzM2ZFcUhobjg3UEM3L2tWQWlBOWx6NjBwV2ovTE5GU1hobDkyejBGMEIKcGNUQllFc1JNYU0zTFZOK0tZb3Q2cnJiamlXdmxFMU9hS0Q4dnNBdkk5YXVJREtOdTM0R2pTaUJGWXMrelRjSwphUUlTK3UzRHVYMGpVY001aUgrMmwzNGxNR0hlY2tjS1hnUWNXMGJiT28xNXY1Q2ExenJtQ2hIUHUwQ2NhMU1MCjJaM2MxMHVXZnR2OVZnbC9LcEpzSjM3b0phbTN1Mmp6MXN0K3hHby9iTmVSdHpOMjdXQSttaDZ6bXFwRldYKzUKdWFjZUY1SFRWc0FkbmtJWHpwWXBuek5qb0lFPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+		httpIgnitionEndpointUrl  = "http://:22624/config/worker"
+		httpsIgnitionEndpointUrl = "https://:22623/config/worker"
+		masterIgn                = `{
+		  "ignition": {
+		    "config": {
+		      "merge": [
+			{
+			  "source": "https://192.168.126.199:22623/config/master"
+			}
+		      ]
+		    },
+		    "security": {
+		      "tls": {
+			"certificateAuthorities": [
+			  {
+			    "source": "data:text/plain;charset=utf-8;base64,LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURFRENDQWZpZ0F3SUJBZ0lJUk90aUgvOC82ckF3RFFZSktvWklodmNOQVFFTEJRQXdKakVTTUJBR0ExVUUKQ3hNSmIzQmxibk5vYVdaME1SQXdEZ1lEVlFRREV3ZHliMjkwTFdOaE1CNFhEVEl3TURreE9ERTVORFV3TVZvWApEVE13TURreE5qRTVORFV3TVZvd0pqRVNNQkFHQTFVRUN4TUpiM0JsYm5Ob2FXWjBNUkF3RGdZRFZRUURFd2R5CmIyOTBMV05oTUlJQklqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FROEFNSUlCQ2dLQ0FRRUE1c1orVWtaaGsxUWQKeFU3cWI3YXArNFczaS9ZWTFzZktURC8ybDVJTjFJeVhPajlSL1N2VG5SOGYvajNJa1JHMWN5ZXR4bnNlNm1aZwpaOW1IRDJMV0srSEFlTTJSYXpuRkEwVmFwOWxVbVRrd3Vza2Z3QzhnMWJUZUVHUlEyQmFId09KekpvdjF4a0ZICmU2TUZCMlcxek1rTWxLTkwycnlzMzRTeVYwczJpNTFmTTJvTEM2SXRvWU91RVVVa2o0dnVUbThPYm5rV0t4ZnAKR1VGMThmNzVYeHJId0tVUEd0U0lYMGxpVGJNM0tiTDY2V2lzWkFIeStoN1g1dnVaaFYzYXhwTVFMdlczQ2xvcQpTaG9zSXY4SWNZbUJxc210d2t1QkN3cWxibEo2T2gzblFrelorVHhQdGhkdWsrZytzaVBUNi9va0JKU2M2cURjClBaNUNyN3FrR3dJREFRQUJvMEl3UURBT0JnTlZIUThCQWY4RUJBTUNBcVF3RHdZRFZSMFRBUUgvQkFVd0F3RUIKL3pBZEJnTlZIUTRFRmdRVWNSbHFHT1g3MWZUUnNmQ0tXSGFuV3NwMFdmRXdEUVlKS29aSWh2Y05BUUVMQlFBRApnZ0VCQU5Xc0pZMDY2RnNYdzFOdXluMEkwNUtuVVdOMFY4NVJVV2drQk9Wd0J5bHluTVRneGYyM3RaY1FsS0U4CjVHMlp4Vzl5NmpBNkwzMHdSNWhOcnBzM2ZFcUhobjg3UEM3L2tWQWlBOWx6NjBwV2ovTE5GU1hobDkyejBGMEIKcGNUQllFc1JNYU0zTFZOK0tZb3Q2cnJiamlXdmxFMU9hS0Q4dnNBdkk5YXVJREtOdTM0R2pTaUJGWXMrelRjSwphUUlTK3UzRHVYMGpVY001aUgrMmwzNGxNR0hlY2tjS1hnUWNXMGJiT28xNXY1Q2ExenJtQ2hIUHUwQ2NhMU1MCjJaM2MxMHVXZnR2OVZnbC9LcEpzSjM3b0phbTN1Mmp6MXN0K3hHby9iTmVSdHpOMjdXQSttaDZ6bXFwRldYKzUKdWFjZUY1SFRWc0FkbmtJWHpwWXBuek5qb0lFPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+			  }
+			]
+		      }
+		    },
+		    "version": "3.2.0"
+		  },
+		  "storage": {}
+		}`
+
+		masterIgnNoCert = `{
+		  "ignition": {
+		    "config": {
+		      "merge": [
+			{
+			  "source": "https://192.168.126.199:22623/config/master"
+			}
+		      ]
+		    },
+		    "version": "3.2.0"
+		  },
+		  "storage": {}
+		}`
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+		createInventory(db, cfg)
+		cluster = createClusterWithAvailability(db, models.ClusterStatusReady, 1)
+		cluster.Name = "foo"
+		cluster.BaseDNSDomain = "bar.com"
+		// this doesn't need to be a VM, but any host works for this test
+		addVMToCluster(cluster, db)
+	})
+
+	AfterEach(func() {
+		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
+	})
+
+	It("no ignition overrides for host set", func() {
+		h := cluster.Hosts[0]
+		ignitionEndpointUrl, cert, err := hostutil.GetIgnitionEndpointAndCert(cluster, h, logrus.New())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cert).To(BeNil())
+		Expect(ignitionEndpointUrl).To(Equal(httpIgnitionEndpointUrl))
+	})
+
+	It("ignition override has no CA set", func() {
+		h := cluster.Hosts[0]
+		h.IgnitionConfigOverrides = masterIgnNoCert
+		ignitionEndpointUrl, cert, err := hostutil.GetIgnitionEndpointAndCert(cluster, h, logrus.New())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cert).To(BeNil())
+		Expect(ignitionEndpointUrl).To(Equal(httpIgnitionEndpointUrl))
+	})
+
+	It("should use https", func() {
+		h := cluster.Hosts[0]
+		h.IgnitionConfigOverrides = masterIgn
+		ignitionEndpointUrl, cert, err := hostutil.GetIgnitionEndpointAndCert(cluster, h, logrus.New())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cert).To(Not(BeNil()))
+		Expect(ignitionEndpointUrl).To(Equal(httpsIgnitionEndpointUrl))
+	})
+
+	It("should use custom ignition endpoint", func() {
+		h := cluster.Hosts[0]
+		h.IgnitionConfigOverrides = masterIgn
+
+		urlStr := "https://custom-ignition.example.com/"
+		cluster.IgnitionEndpoint = &models.IgnitionEndpoint{
+			URL: &urlStr,
+		}
+		ignitionEndpointUrl, cert, err := hostutil.GetIgnitionEndpointAndCert(cluster, h, logrus.New())
+		Expect(err).NotTo(HaveOccurred())
+		Expect(*cert).To(Equal(expectedBase64Cert))
+		Expect(ignitionEndpointUrl).To(Equal("https://custom-ignition.example.com/worker"))
+	})
+
+})
+
+func getDummyCluster() common.Cluster {
+	clusterID := strfmt.UUID(uuid.New().String())
+	c := common.Cluster{
+		Cluster: models.Cluster{
+			ID:            &clusterID,
+			Name:          "my-cluster",
+			BaseDNSDomain: "my-domain",
+		},
+	}
+	return c
+}
+
+func createClusterWithMonitoredOperator(db *gorm.DB, operator models.MonitoredOperator) *common.Cluster {
+	c := getDummyCluster()
+	c.MonitoredOperators = append(c.MonitoredOperators, &operator)
+	Expect(db.Create(&c).Error).ShouldNot(HaveOccurred())
+	return &c
+}
+
+func getSecureRegistryToml(src, mirror string) string {
+	return fmt.Sprintf(`
+[[registry]]
+location = "%s"
+
+[[registry.mirror]]
+location = "%s"
+`,
+		src,
+		mirror,
+	)
+}
+
+func getMirrorRegistryConfigurations(registriesToml, certificate string) (*common.MirrorRegistryConfiguration, []configv1.ImageDigestMirrors) {
+	imageDigestMirrors, imageTagMirrors, insecure, err := mirrorregistries.GetImageRegistries(registriesToml)
+	Expect(err).To(Not(HaveOccurred()))
+
+	mirrors := &common.MirrorRegistryConfiguration{
+		ImageDigestMirrors: imageDigestMirrors,
+		ImageTagMirrors:    imageTagMirrors,
+		Insecure:           insecure,
+		CaBundleCrt:        certificate,
+		RegistriesConf:     registriesToml,
+	}
+
+	return mirrors, imageDigestMirrors
+}
+
+var _ = Describe("Primary IP Stack Functionality", func() {
+	var (
+		bm        *bareMetalInventory
+		cfg       Config
+		db        *gorm.DB
+		dbName    string
+		clusterID strfmt.UUID
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+
+		cfg = Config{
+			DefaultClusterNetworkCidr:       "10.128.0.0/14",
+			DefaultServiceNetworkCidr:       "172.30.0.0/16",
+			DefaultClusterNetworkHostPrefix: 23,
+		}
+
+		bm = createInventory(db, cfg)
+
+		clusterID = strfmt.UUID(uuid.New().String())
+	})
+
+	AfterEach(func() {
+		common.DeleteTestDB(db, dbName)
+	})
+
+	Describe("getPrimaryIPStack", func() {
+		Context("Single stack clusters", func() {
+			It("should compute PrimaryIPStack as nil for IPv4-only cluster", func() {
+				cluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:              &clusterID,
+						MachineNetworks: []*models.MachineNetwork{{Cidr: "10.0.0.0/16"}},
+						APIVips:         []*models.APIVip{{IP: "10.0.1.1"}},
+						IngressVips:     []*models.IngressVip{{IP: "10.0.1.2"}},
+						ServiceNetworks: []*models.ServiceNetwork{{Cidr: "172.30.0.0/16"}},
+						ClusterNetworks: []*models.ClusterNetwork{{Cidr: "10.128.0.0/14"}},
+					},
+				}
+
+				primaryIPStack, err := bm.getPrimaryIPStack(cluster.MachineNetworks, cluster.APIVips, cluster.IngressVips, cluster.ServiceNetworks, cluster.ClusterNetworks)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(primaryIPStack).To(BeNil())
+			})
+
+			It("should compute PrimaryIPStack as nil for IPv6-only cluster", func() {
+				cluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:              &clusterID,
+						MachineNetworks: []*models.MachineNetwork{{Cidr: "2001:db8::/64"}},
+						APIVips:         []*models.APIVip{{IP: "2001:db8::1"}},
+						IngressVips:     []*models.IngressVip{{IP: "2001:db8::2"}},
+						ServiceNetworks: []*models.ServiceNetwork{{Cidr: "2001:db8:1::/64"}},
+						ClusterNetworks: []*models.ClusterNetwork{{Cidr: "2001:db8:2::/64"}},
+					},
+				}
+
+				primaryIPStack, err := bm.getPrimaryIPStack(cluster.MachineNetworks, cluster.APIVips, cluster.IngressVips, cluster.ServiceNetworks, cluster.ClusterNetworks)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(primaryIPStack).To(BeNil())
+			})
+		})
+
+		Context("Dual stack clusters", func() {
+			It("should compute PrimaryIPStack as IPv4 for IPv4-first dual stack", func() {
+				cluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:               &clusterID,
+						OpenshiftVersion: "4.12.0", // Required for dual-stack support
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "10.0.0.0/16"},
+							{Cidr: "2001:db8::/64"},
+						},
+						APIVips: []*models.APIVip{
+							{IP: "10.0.1.1"},
+							{IP: "2001:db8::1"},
+						},
+						IngressVips: []*models.IngressVip{
+							{IP: "10.0.1.2"},
+							{IP: "2001:db8::2"},
+						},
+						ServiceNetworks: []*models.ServiceNetwork{
+							{Cidr: "172.30.0.0/16"},
+							{Cidr: "2001:db8:1::/64"},
+						},
+						ClusterNetworks: []*models.ClusterNetwork{
+							{Cidr: "10.128.0.0/14"},
+							{Cidr: "2001:db8:2::/64"},
+						},
+					},
+				}
+				primaryIPStack, err := bm.getPrimaryIPStack(cluster.MachineNetworks, cluster.APIVips, cluster.IngressVips, cluster.ServiceNetworks, cluster.ClusterNetworks)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(primaryIPStack).ToNot(BeNil())
+				Expect(*primaryIPStack).To(Equal(common.PrimaryIPStackV4))
+			})
+
+			It("should compute PrimaryIPStack as IPv6 for IPv6-first dual stack", func() {
+				cluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:               &clusterID,
+						OpenshiftVersion: "4.12.0", // Required for IPv6-primary support
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "2001:db8::/64"},
+							{Cidr: "10.0.0.0/16"},
+						},
+						APIVips: []*models.APIVip{
+							{IP: "2001:db8::1"},
+							{IP: "10.0.1.1"},
+						},
+						IngressVips: []*models.IngressVip{
+							{IP: "2001:db8::2"},
+							{IP: "10.0.1.2"},
+						},
+						ServiceNetworks: []*models.ServiceNetwork{
+							{Cidr: "2001:db8:1::/64"},
+							{Cidr: "172.30.0.0/16"},
+						},
+						ClusterNetworks: []*models.ClusterNetwork{
+							{Cidr: "2001:db8:2::/64"},
+							{Cidr: "10.128.0.0/14"},
+						},
+					},
+				}
+
+				primaryIPStack, err := bm.getPrimaryIPStack(cluster.MachineNetworks, cluster.APIVips, cluster.IngressVips, cluster.ServiceNetworks, cluster.ClusterNetworks)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(primaryIPStack).ToNot(BeNil())
+				Expect(*primaryIPStack).To(Equal(common.PrimaryIPStackV6))
+			})
+
+			It("should return error for inconsistent IP family order", func() {
+				cluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:               &clusterID,
+						OpenshiftVersion: "4.12.0",
+						MachineNetworks: []*models.MachineNetwork{
+							{Cidr: "10.0.0.0/16"}, // IPv4 first
+							{Cidr: "2001:db8::/64"},
+						},
+						APIVips: []*models.APIVip{
+							{IP: "2001:db8::1"}, // IPv6 first - inconsistent!
+							{IP: "10.0.1.1"},
+						},
+						ServiceNetworks: []*models.ServiceNetwork{
+							{Cidr: "172.30.0.0/16"}, // IPv4 first
+							{Cidr: "2001:db8:1::/64"},
+						},
+						ClusterNetworks: []*models.ClusterNetwork{
+							{Cidr: "10.128.0.0/14"}, // IPv4 first
+							{Cidr: "2001:db8:2::/64"},
+						},
+					},
+				}
+
+				_, err := bm.getPrimaryIPStack(cluster.MachineNetworks, cluster.APIVips, cluster.IngressVips, cluster.ServiceNetworks, cluster.ClusterNetworks)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("Inconsistent IP family order"))
+			})
+		})
+	})
+
+	Describe("updatePrimaryIPStack", func() {
+		var (
+			cluster *common.Cluster
+			params  installer.V2UpdateClusterParams
+		)
+
+		BeforeEach(func() {
+			clusterID := strfmt.UUID(uuid.New().String())
+			cluster = &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &clusterID,
+					OpenshiftVersion: "4.12.0",
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "10.0.0.0/16"}, // IPv4 first
+						{Cidr: "2001:db8::/64"},
+					},
+					APIVips: []*models.APIVip{
+						{IP: "10.0.1.1"}, // IPv4 first
+						{IP: "2001:db8::1"},
+					},
+					ServiceNetworks: []*models.ServiceNetwork{
+						{Cidr: "172.30.0.0/16"}, // IPv4 first
+						{Cidr: "2001:db8:1::/64"},
+					},
+					ClusterNetworks: []*models.ClusterNetwork{
+						{Cidr: "10.128.0.0/14"}, // IPv4 first
+						{Cidr: "2001:db8:2::/64"},
+					},
+				},
+				PrimaryIPStack: &[]common.PrimaryIPStack{common.PrimaryIPStackV4}[0],
+			}
+
+			params = installer.V2UpdateClusterParams{
+				ClusterUpdateParams: &models.V2ClusterUpdateParams{},
+			}
+		})
+
+		Context("No network updates", func() {
+			It("should return false when no networks are updated", func() {
+				updated, primaryIPStack, err := bm.updatePrimaryIPStack(params, cluster)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated).To(BeFalse())
+				Expect(primaryIPStack).To(Equal(cluster.PrimaryIPStack))
+			})
+		})
+
+		Context("Full network updates", func() {
+			BeforeEach(func() {
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "2001:db9::/64"}, // IPv6 first
+					{Cidr: "192.168.1.0/24"},
+				}
+				params.ClusterUpdateParams.APIVips = []*models.APIVip{
+					{IP: "2001:db9::1"}, // IPv6 first
+					{IP: "192.168.1.1"},
+				}
+				params.ClusterUpdateParams.IngressVips = []*models.IngressVip{
+					{IP: "2001:db9::2"}, // IPv6 first
+					{IP: "192.168.1.2"},
+				}
+				params.ClusterUpdateParams.ServiceNetworks = []*models.ServiceNetwork{
+					{Cidr: "2001:db9:1::/64"}, // IPv6 first
+					{Cidr: "172.30.1.0/16"},
+				}
+				params.ClusterUpdateParams.ClusterNetworks = []*models.ClusterNetwork{
+					{Cidr: "2001:db9:2::/64"}, // IPv6 first
+					{Cidr: "10.128.1.0/14"},
+				}
+
+				// Update cluster networks to match the params (simulating what updateNetworks would do)
+				cluster.MachineNetworks = params.ClusterUpdateParams.MachineNetworks
+				cluster.APIVips = params.ClusterUpdateParams.APIVips
+				cluster.IngressVips = params.ClusterUpdateParams.IngressVips
+				cluster.ServiceNetworks = params.ClusterUpdateParams.ServiceNetworks
+				cluster.ClusterNetworks = params.ClusterUpdateParams.ClusterNetworks
+			})
+
+			It("should recalculate PrimaryIPStack for full updates", func() {
+				updated, primaryIPStack, err := bm.updatePrimaryIPStack(params, cluster)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated).To(BeTrue())
+				Expect(primaryIPStack).ToNot(BeNil())
+				Expect(*primaryIPStack).To(Equal(common.PrimaryIPStackV6))
+			})
+		})
+
+		Context("Partial network updates", func() {
+			Context("Consistent updates", func() {
+				BeforeEach(func() {
+					params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+						{Cidr: "192.168.1.0/24"}, // IPv4 first - consistent
+						{Cidr: "2001:db9::/64"},
+					}
+				})
+
+				It("should validate and keep existing PrimaryIPStack", func() {
+					updated, primaryIPStack, err := bm.updatePrimaryIPStack(params, cluster)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(updated).To(BeFalse()) // No update needed
+					Expect(primaryIPStack).ToNot(BeNil())
+					Expect(primaryIPStack).To(Equal(cluster.PrimaryIPStack)) // Unchanged
+				})
+			})
+
+			Context("Inconsistent updates", func() {
+				BeforeEach(func() {
+					params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+						{Cidr: "2001:db9::/64"}, // IPv6 first - inconsistent!
+						{Cidr: "192.168.1.0/24"},
+					}
+				})
+
+				It("should return error for inconsistent partial update", func() {
+					updated, primaryIPStack, err := bm.updatePrimaryIPStack(params, cluster)
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("Inconsistent IP family order"))
+					Expect(err.Error()).To(ContainSubstring("machine_networks first IP is 2001:db9::/64 but existing primary IP stack is IPv4"))
+					Expect(updated).To(BeFalse())
+					Expect(primaryIPStack).To(Equal(cluster.PrimaryIPStack))
+				})
+			})
+		})
+
+		Context("New cluster without PrimaryIPStack", func() {
+			BeforeEach(func() {
+				// Create a truly new cluster with no existing networks
+				clusterID := strfmt.UUID(uuid.New().String())
+				cluster = &common.Cluster{
+					Cluster: models.Cluster{
+						ID:               &clusterID,
+						OpenshiftVersion: "4.12.0",
+						// No existing networks - truly new cluster
+						MachineNetworks: []*models.MachineNetwork{},
+						APIVips:         []*models.APIVip{},
+						IngressVips:     []*models.IngressVip{},
+						ServiceNetworks: []*models.ServiceNetwork{},
+						ClusterNetworks: []*models.ClusterNetwork{},
+					},
+					PrimaryIPStack: nil, // No existing primary IP stack
+				}
+
+				params.ClusterUpdateParams.MachineNetworks = []*models.MachineNetwork{
+					{Cidr: "2001:db9::/64"}, // IPv6 first
+					{Cidr: "192.168.1.0/24"},
+				}
+
+				// Update cluster networks to match the params (simulating what updateNetworks would do)
+				cluster.MachineNetworks = params.ClusterUpdateParams.MachineNetworks
+			})
+
+			It("should recalculate PrimaryIPStack for new cluster", func() {
+				updated, primaryIPStack, err := bm.updatePrimaryIPStack(params, cluster)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(updated).To(BeTrue())
+				Expect(primaryIPStack).ToNot(BeNil())
+				Expect(*primaryIPStack).To(Equal(common.PrimaryIPStackV6))
+			})
+		})
+	})
+})
+
+var _ = Describe("GetCommonHostInternal", func() {
 	var (
 		bm     *bareMetalInventory
 		cfg    Config
 		db     *gorm.DB
+		ctx    = context.Background()
 		dbName string
 	)
 
@@ -18855,11 +22952,13 @@ var _ = Describe("V2UpdateHostIgnition unbound blabla", func() {
 
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
-		ctrl.Finish()
 	})
 
-	It("unbound host ignition update", func() {
+	It("should find existing host by composite key", func() {
 		infraEnvID := strfmt.UUID(uuid.New().String())
+		hostID := strfmt.UUID(uuid.New().String())
+
+		// Create infra env
 		infraEnv := &common.InfraEnv{
 			InfraEnv: models.InfraEnv{
 				ID: &infraEnvID,
@@ -18867,29 +22966,304 @@ var _ = Describe("V2UpdateHostIgnition unbound blabla", func() {
 		}
 		Expect(db.Create(infraEnv).Error).ToNot(HaveOccurred())
 
+		// Create host
+		host := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+		}
+		Expect(db.Create(host).Error).ToNot(HaveOccurred())
+
+		// Test GetCommonHostInternal
+		foundHost, err := bm.GetCommonHostInternal(ctx, infraEnvID.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost).ToNot(BeNil())
+		Expect(foundHost.ID.String()).To(Equal(hostID.String()))
+		Expect(foundHost.InfraEnvID.String()).To(Equal(infraEnvID.String()))
+	})
+
+	It("should return error when host not found", func() {
+		infraEnvID := strfmt.UUID(uuid.New().String())
 		hostID := strfmt.UUID(uuid.New().String())
-		host := models.Host{
+
+		// Test GetCommonHostInternal with non-existent host
+		foundHost, err := bm.GetCommonHostInternal(ctx, infraEnvID.String(), hostID.String())
+		Expect(err).To(HaveOccurred())
+		Expect(errors.Is(err, gorm.ErrRecordNotFound)).To(BeTrue())
+		Expect(foundHost).To(BeNil())
+	})
+
+	It("should not find soft-deleted host", func() {
+		infraEnvID := strfmt.UUID(uuid.New().String())
+		hostID := strfmt.UUID(uuid.New().String())
+
+		// Create infra env
+		infraEnv := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID,
+			},
+		}
+		Expect(db.Create(infraEnv).Error).ToNot(HaveOccurred())
+
+		// Create and soft-delete host
+		host := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+		}
+		Expect(db.Create(host).Error).ToNot(HaveOccurred())
+		Expect(db.Delete(host).Error).ToNot(HaveOccurred())
+
+		// Test GetCommonHostInternal should not find soft-deleted host
+		foundHost, err := bm.GetCommonHostInternal(ctx, infraEnvID.String(), hostID.String())
+		Expect(err).To(HaveOccurred())
+		Expect(errors.Is(err, gorm.ErrRecordNotFound)).To(BeTrue())
+		Expect(foundHost).To(BeNil())
+	})
+
+	It("should find correct host when same ID exists in different infra envs", func() {
+		hostID := strfmt.UUID(uuid.New().String())
+		infraEnvID1 := strfmt.UUID(uuid.New().String())
+		infraEnvID2 := strfmt.UUID(uuid.New().String())
+
+		// Create two infra envs
+		infraEnv1 := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID1,
+			},
+		}
+		Expect(db.Create(infraEnv1).Error).ToNot(HaveOccurred())
+
+		infraEnv2 := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID2,
+			},
+		}
+		Expect(db.Create(infraEnv2).Error).ToNot(HaveOccurred())
+
+		// Create same host ID in both infra envs
+		host1 := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID1,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+		}
+		Expect(db.Create(host1).Error).ToNot(HaveOccurred())
+
+		host2 := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID2,
+				Status:     swag.String(models.HostStatusDiscovering),
+			},
+		}
+		Expect(db.Create(host2).Error).ToNot(HaveOccurred())
+
+		// Test GetCommonHostInternal finds correct host for each infra env
+		foundHost1, err := bm.GetCommonHostInternal(ctx, infraEnvID1.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost1).ToNot(BeNil())
+		Expect(foundHost1.InfraEnvID.String()).To(Equal(infraEnvID1.String()))
+		Expect(*foundHost1.Status).To(Equal(models.HostStatusKnown))
+
+		foundHost2, err := bm.GetCommonHostInternal(ctx, infraEnvID2.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost2).ToNot(BeNil())
+		Expect(foundHost2.InfraEnvID.String()).To(Equal(infraEnvID2.String()))
+		Expect(*foundHost2.Status).To(Equal(models.HostStatusDiscovering))
+	})
+})
+
+var _ = Describe("CreateHostInKubeKeyNamespace", func() {
+	var (
+		bm     *bareMetalInventory
+		cfg    Config
+		db     *gorm.DB
+		ctx    = context.Background()
+		dbName string
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+		bm = createInventory(db, cfg)
+	})
+
+	AfterEach(func() {
+		common.DeleteTestDB(db, dbName)
+	})
+
+	It("should create host when no previous record exists", func() {
+		infraEnvID := strfmt.UUID(uuid.New().String())
+		hostID := strfmt.UUID(uuid.New().String())
+		kubeKey := types.NamespacedName{
+			Name:      hostID.String(),
+			Namespace: "test-namespace",
+		}
+
+		// Create infra env
+		infraEnv := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID,
+			},
+		}
+		Expect(db.Create(infraEnv).Error).ToNot(HaveOccurred())
+
+		// Create host model
+		host := &models.Host{
 			ID:         &hostID,
 			InfraEnvID: infraEnvID,
-			Kind:       swag.String(models.HostKindHost),
-			Status:     swag.String(models.HostStatusKnownUnbound),
-			Role:       models.HostRoleAutoAssign,
-		}
-		Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
-
-		override := `{"ignition": {"version": "3.1.0"}, "storage": {"files": [{"path": "/tmp/example", "contents": {"source": "data:text/plain;base64,aGVscGltdHJhcHBlZGluYXN3YWdnZXJzcGVj"}}]}}`
-		params := installer.V2UpdateHostIgnitionParams{
-			InfraEnvID:         infraEnvID,
-			HostID:             hostID,
-			HostIgnitionParams: &models.HostIgnitionParams{Config: override},
+			Status:     swag.String(models.HostStatusDiscovering),
 		}
 
-		mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
-			eventstest.WithNameMatcher(eventgen.HostDiscoveryIgnitionConfigAppliedEventName),
-			eventstest.WithHostIdMatcher(params.HostID.String()),
-			eventstest.WithInfraEnvIdMatcher(params.InfraEnvID.String())))
+		// Test CreateHostInKubeKeyNamespace
+		err := bm.CreateHostInKubeKeyNamespace(ctx, kubeKey, host)
+		Expect(err).ToNot(HaveOccurred())
 
-		response := bm.V2UpdateHostIgnition(context.TODO(), params)
-		Expect(response).To(BeAssignableToTypeOf(&installer.V2UpdateHostIgnitionCreated{}))
+		// Verify host was created
+		foundHost, err := common.GetHostFromDB(db, infraEnvID.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost).ToNot(BeNil())
+		Expect(foundHost.ID.String()).To(Equal(hostID.String()))
+		Expect(foundHost.InfraEnvID.String()).To(Equal(infraEnvID.String()))
+		Expect(foundHost.KubeKeyNamespace).To(Equal(kubeKey.Namespace))
+	})
+
+	It("should hard-delete soft-deleted host and create new one", func() {
+		infraEnvID := strfmt.UUID(uuid.New().String())
+		hostID := strfmt.UUID(uuid.New().String())
+		kubeKey := types.NamespacedName{
+			Name:      hostID.String(),
+			Namespace: "test-namespace",
+		}
+
+		// Create infra env
+		infraEnv := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID,
+			},
+		}
+		Expect(db.Create(infraEnv).Error).ToNot(HaveOccurred())
+
+		// Create and soft-delete a host
+		oldHost := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+			KubeKeyNamespace: "old-namespace",
+		}
+		Expect(db.Create(oldHost).Error).ToNot(HaveOccurred())
+		Expect(db.Delete(oldHost).Error).ToNot(HaveOccurred())
+
+		// Verify host is soft-deleted
+		var count int64
+		Expect(db.Model(&common.Host{}).Where("id = ? AND infra_env_id = ?", hostID.String(), infraEnvID.String()).Count(&count).Error).ToNot(HaveOccurred())
+		Expect(count).To(Equal(int64(0)))
+
+		// Verify soft-deleted host exists with Unscoped
+		Expect(db.Unscoped().Model(&common.Host{}).Where("id = ? AND infra_env_id = ?", hostID.String(), infraEnvID.String()).Count(&count).Error).ToNot(HaveOccurred())
+		Expect(count).To(Equal(int64(1)))
+
+		// Create new host with same ID
+		newHost := &models.Host{
+			ID:         &hostID,
+			InfraEnvID: infraEnvID,
+			Status:     swag.String(models.HostStatusDiscovering),
+		}
+
+		// Test CreateHostInKubeKeyNamespace
+		err := bm.CreateHostInKubeKeyNamespace(ctx, kubeKey, newHost)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Verify new host was created (not soft-deleted)
+		foundHost, err := common.GetHostFromDB(db, infraEnvID.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost).ToNot(BeNil())
+		Expect(foundHost.ID.String()).To(Equal(hostID.String()))
+		Expect(foundHost.InfraEnvID.String()).To(Equal(infraEnvID.String()))
+		Expect(*foundHost.Status).To(Equal(models.HostStatusDiscovering))
+		Expect(foundHost.KubeKeyNamespace).To(Equal(kubeKey.Namespace))
+
+		// Verify only one record exists (old soft-deleted record was hard-deleted)
+		Expect(db.Unscoped().Model(&common.Host{}).Where("id = ? AND infra_env_id = ?", hostID.String(), infraEnvID.String()).Count(&count).Error).ToNot(HaveOccurred())
+		Expect(count).To(Equal(int64(1)))
+	})
+
+	It("should only delete soft-deleted host with matching composite key", func() {
+		hostID := strfmt.UUID(uuid.New().String())
+		infraEnvID1 := strfmt.UUID(uuid.New().String())
+		infraEnvID2 := strfmt.UUID(uuid.New().String())
+		kubeKey := types.NamespacedName{
+			Name:      hostID.String(),
+			Namespace: "test-namespace",
+		}
+
+		// Create two infra envs
+		infraEnv1 := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID1,
+			},
+		}
+		Expect(db.Create(infraEnv1).Error).ToNot(HaveOccurred())
+
+		infraEnv2 := &common.InfraEnv{
+			InfraEnv: models.InfraEnv{
+				ID: &infraEnvID2,
+			},
+		}
+		Expect(db.Create(infraEnv2).Error).ToNot(HaveOccurred())
+
+		// Create and soft-delete host in infraEnv1
+		host1 := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID1,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+		}
+		Expect(db.Create(host1).Error).ToNot(HaveOccurred())
+		Expect(db.Delete(host1).Error).ToNot(HaveOccurred())
+
+		// Create and soft-delete host in infraEnv2
+		host2 := &common.Host{
+			Host: models.Host{
+				ID:         &hostID,
+				InfraEnvID: infraEnvID2,
+				Status:     swag.String(models.HostStatusKnown),
+			},
+		}
+		Expect(db.Create(host2).Error).ToNot(HaveOccurred())
+		Expect(db.Delete(host2).Error).ToNot(HaveOccurred())
+
+		// Create new host in infraEnv1 only
+		newHost := &models.Host{
+			ID:         &hostID,
+			InfraEnvID: infraEnvID1,
+			Status:     swag.String(models.HostStatusDiscovering),
+		}
+
+		// Test CreateHostInKubeKeyNamespace
+		err := bm.CreateHostInKubeKeyNamespace(ctx, kubeKey, newHost)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Verify new host exists in infraEnv1
+		foundHost, err := common.GetHostFromDB(db, infraEnvID1.String(), hostID.String())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(foundHost).ToNot(BeNil())
+
+		// Verify soft-deleted host in infraEnv2 still exists (was not deleted)
+		var count int64
+		Expect(db.Unscoped().Model(&common.Host{}).Where("id = ? AND infra_env_id = ?", hostID.String(), infraEnvID2.String()).Count(&count).Error).ToNot(HaveOccurred())
+		Expect(count).To(Equal(int64(1)))
+
+		// Verify the record is actually soft-deleted (not active)
+		Expect(db.Model(&common.Host{}).Where("id = ? AND infra_env_id = ?", hostID.String(), infraEnvID2.String()).Count(&count).Error).ToNot(HaveOccurred())
+		Expect(count).To(Equal(int64(0)))
 	})
 })

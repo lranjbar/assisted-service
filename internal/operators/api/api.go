@@ -34,17 +34,19 @@ type Operator interface {
 	// GetFullName reports the full name of the specified Operator
 	GetFullName() string
 	// GetDependencies provides a list of dependencies of the Operator
-	GetDependencies(cluster *common.Cluster) ([]string, error)
+	GetDependencies(cluster *common.Cluster) []string
+	// GetDependenciesFeatureSupportID provides a list of all feature ids that are potential dependencies
+	GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID
 	// ValidateCluster verifies whether this operator is valid for given cluster
-	ValidateCluster(ctx context.Context, cluster *common.Cluster) (ValidationResult, error)
+	ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]ValidationResult, error)
 	// ValidateHost verifies whether this operator is valid for given host
-	ValidateHost(ctx context.Context, cluster *common.Cluster, hosts *models.Host) (ValidationResult, error)
+	ValidateHost(ctx context.Context, cluster *common.Cluster, hosts *models.Host, additionalOperatorRequirements *models.ClusterHostRequirementsDetails) (ValidationResult, error)
 	// GenerateManifests generates manifests for the operator
 	GenerateManifests(*common.Cluster) (map[string][]byte, []byte, error)
 	// GetHostRequirements provides operator's requirements towards the host
 	GetHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error)
-	// GetClusterValidationID returns cluster validation ID for the Operator
-	GetClusterValidationID() string
+	// GetClusterValidationIDs returns cluster validation IDs for the Operator
+	GetClusterValidationIDs() []string
 	// GetHostValidationID returns host validation ID for the Operator
 	GetHostValidationID() string
 	// GetProperties provides description of operator properties
@@ -52,7 +54,23 @@ type Operator interface {
 	// GetMonitoredOperator returns MonitoredOperator corresponding to the Operator implementation
 	GetMonitoredOperator() *models.MonitoredOperator
 	// GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-	GetPreflightRequirements(ctx context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error)
+	GetPreflightRequirements(ctx context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements
 	// GetFeatureSupportID returns the operator unique feature-support ID
 	GetFeatureSupportID() models.FeatureSupportLevelID
+	// GetBundleLabels returns the list of bundles names associated with the operator based on the given feature IDs
+	GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string
+}
+
+// OptionalBundleOperator is implemented by operators that are optional members of a bundle.
+// The manager uses a type assertion to check for this interface — only operators that
+// can be optionally selected by the user (e.g., GPU vendors in the OpenShift AI bundle)
+// need to implement it.
+type OptionalBundleOperator interface {
+	GetOptionalBundleLabels(featureIDs []models.FeatureSupportLevelID) []string
+}
+
+// Storage Operator provide a generic API for storage operators
+type StorageOperator interface {
+	Operator
+	StorageClassName() string
 }

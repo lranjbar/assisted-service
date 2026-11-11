@@ -13,13 +13,13 @@ import (
 	"github.com/filanov/stateswitch"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
 	commontesting "github.com/openshift/assisted-service/internal/common/testing"
+	"github.com/openshift/assisted-service/internal/constants"
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/events/eventstest"
 	"github.com/openshift/assisted-service/internal/feature"
@@ -36,9 +36,21 @@ import (
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 	"k8s.io/utils/ptr"
 )
+
+func toVersionedRoleRequirements(d models.ClusterHostRequirementsDetails) *models.VersionedClusterHostRequirementsDetails {
+	return &models.VersionedClusterHostRequirementsDetails{
+		CPUCores:                         ptr.To(d.CPUCores),
+		RAMMib:                           ptr.To(d.RAMMib),
+		DiskSizeGb:                       ptr.To(d.DiskSizeGb),
+		InstallationDiskSpeedThresholdMs: ptr.To(d.InstallationDiskSpeedThresholdMs),
+		NetworkLatencyThresholdMs:        d.NetworkLatencyThresholdMs,
+		PacketLossPercentage:             d.PacketLossPercentage,
+	}
+}
 
 var (
 	defaultMasterRequirements = models.ClusterHostRequirementsDetails{
@@ -75,15 +87,16 @@ func createValidatorCfg() *hardware.ValidatorCfg {
 		Flags: feature.Flags{
 			EnableUpgradeAgent: true,
 		},
-		VersionedRequirements: hardware.VersionedRequirementsDecoder{
+		VersionedRequirements: hardware.NewVersionedRequirementsDecoderFromMap(map[string]models.VersionedHostRequirements{
 			"default": {
 				Version:                "default",
-				MasterRequirements:     &defaultMasterRequirements,
-				WorkerRequirements:     &defaultWorkerRequirements,
-				SNORequirements:        &defaultSnoRequirements,
-				EdgeWorkerRequirements: &defaultWorkerRequirements,
+				MasterRequirements:     toVersionedRoleRequirements(defaultMasterRequirements),
+				ArbiterRequirements:    toVersionedRoleRequirements(defaultWorkerRequirements),
+				WorkerRequirements:     toVersionedRoleRequirements(defaultWorkerRequirements),
+				SNORequirements:        toVersionedRoleRequirements(defaultSnoRequirements),
+				EdgeWorkerRequirements: toVersionedRoleRequirements(defaultWorkerRequirements),
 			},
-		},
+		}),
 		MaximumAllowedTimeDiffMinutes: 4,
 		MaxHostDisconnectionTime:      MaxHostDisconnectionTime,
 		AgentDockerImage:              "quay.io/edge-infrastructure/assisted-installer-agent:latest",
@@ -106,7 +119,7 @@ var _ = Describe("RegisterHost", func() {
 		db, dbName = common.PrepareTestDB()
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHwValidator := hardware.NewMockValidator(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		hapi = NewManager(common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, mockHwValidator, nil, createValidatorCfg(), nil, defaultConfig, nil, operatorsManager, nil, false, nil, nil, false)
 		hostId = strfmt.UUID(uuid.New().String())
 		clusterId = strfmt.UUID(uuid.New().String())
@@ -169,7 +182,7 @@ var _ = Describe("RegisterHost", func() {
 				progressStage:         models.HostStageDone,
 				srcState:              models.HostStatusInstalled,
 				dstState:              models.HostStatusInstalled,
-				errorCode:             http.StatusForbidden,
+				errorCode:             http.StatusConflict,
 				expectedEventInfo:     "",
 				expectedNilStatusInfo: true,
 			},
@@ -305,6 +318,7 @@ var _ = Describe("RegisterHost", func() {
 			Expect(h.Progress.ProgressInfo).To(BeEmpty())
 			Expect(h.NtpSources).To(BeEmpty())
 			Expect(h.ImagesStatus).To(BeEmpty())
+			Expect(h.ValidationsInfo).To(BeEmpty())
 		})
 
 		for i := range tests {
@@ -325,7 +339,8 @@ var _ = Describe("RegisterHost", func() {
 						CurrentStage: common.TestDefaultConfig.HostProgressStage,
 						ProgressInfo: "some info",
 					},
-					NtpSources: "some ntp sources",
+					NtpSources:      "some ntp sources",
+					ValidationsInfo: "some validations info",
 				}).Error).ShouldNot(HaveOccurred())
 				if t.srcState != models.HostStatusDiscovering {
 					mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
@@ -349,6 +364,213 @@ var _ = Describe("RegisterHost", func() {
 				Expect(swag.StringValue(h.Kind)).To(Equal(t.kind))
 			})
 		}
+	})
+
+	Context("host re-registration during cluster preparation", func() {
+		It("should reset LastInstallationPreparation and host to known when host re-registers during preparing-for-installation", func() {
+			// Create a cluster in preparing-for-installation state with LastInstallationPreparation.Status = Success
+			cluster := hostutil.GenerateTestCluster(clusterId)
+			cluster.Status = swag.String(models.ClusterStatusPreparingForInstallation)
+			cluster.LastInstallationPreparation = models.LastInstallationPreparation{
+				Status: models.LastInstallationPreparationStatusSuccess,
+				Reason: constants.InstallationPreparationReasonSuccess,
+			}
+			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+			// Create a host that belongs to the cluster (with bootstrap flag set for SNO)
+			Expect(db.Create(&models.Host{
+				ID:         &hostId,
+				InfraEnvID: infraEnvId,
+				ClusterID:  &clusterId,
+				Role:       models.HostRoleMaster,
+				Inventory:  defaultHwInfo,
+				Bootstrap:  true,
+				Status:     swag.String(models.HostStatusPreparingForInstallation),
+			}).Error).ShouldNot(HaveOccurred())
+
+			// Re-register the host
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(infraEnvId.String()),
+				eventstest.WithClusterIdMatcher(clusterId.String()),
+				eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+
+			Expect(hapi.RegisterHost(ctx, &models.Host{
+				ID:                    &hostId,
+				InfraEnvID:            infraEnvId,
+				ClusterID:             &clusterId,
+				Status:                swag.String(models.HostStatusPreparingForInstallation),
+				DiscoveryAgentVersion: "v2.0.5",
+			},
+				db)).ShouldNot(HaveOccurred())
+
+			// Verify the host was reset to 'known' instead of 'discovering'
+			h := hostutil.GetHostFromDB(hostId, infraEnvId, db)
+			Expect(swag.StringValue(h.Status)).Should(Equal(models.HostStatusKnown))
+			Expect(swag.StringValue(h.StatusInfo)).Should(Equal(statusInfoKnown))
+			// Verify inventory was preserved so the host can continue with preparation
+			Expect(h.Inventory).Should(Equal(defaultHwInfo))
+			// Verify bootstrap flag was preserved (critical for SNO clusters)
+			Expect(h.Bootstrap).Should(BeTrue())
+
+			// Verify the cluster's LastInstallationPreparation was reset
+			var updatedCluster common.Cluster
+			Expect(db.Take(&updatedCluster, "id = ?", clusterId.String()).Error).ShouldNot(HaveOccurred())
+			Expect(updatedCluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusNotStarted))
+			Expect(updatedCluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonNotPerformed))
+
+			// Verify the cluster is still in preparing-for-installation (not insufficient)
+			Expect(swag.StringValue(updatedCluster.Status)).Should(Equal(models.ClusterStatusPreparingForInstallation))
+		})
+
+		It("should reset LastInstallationPreparation and host to known when host re-registers from preparing-successful state", func() {
+			// Create a cluster in preparing-for-installation state with LastInstallationPreparation.Status = Success
+			cluster := hostutil.GenerateTestCluster(clusterId)
+			cluster.Status = swag.String(models.ClusterStatusPreparingForInstallation)
+			cluster.LastInstallationPreparation = models.LastInstallationPreparation{
+				Status: models.LastInstallationPreparationStatusSuccess,
+				Reason: constants.InstallationPreparationReasonSuccess,
+			}
+			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+			// Create a host that belongs to the cluster (with bootstrap flag set for SNO)
+			Expect(db.Create(&models.Host{
+				ID:         &hostId,
+				InfraEnvID: infraEnvId,
+				ClusterID:  &clusterId,
+				Role:       models.HostRoleMaster,
+				Inventory:  defaultHwInfo,
+				Bootstrap:  true,
+				Status:     swag.String(models.HostStatusPreparingSuccessful),
+			}).Error).ShouldNot(HaveOccurred())
+
+			// Re-register the host
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(infraEnvId.String()),
+				eventstest.WithClusterIdMatcher(clusterId.String()),
+				eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+
+			Expect(hapi.RegisterHost(ctx, &models.Host{
+				ID:                    &hostId,
+				InfraEnvID:            infraEnvId,
+				ClusterID:             &clusterId,
+				Status:                swag.String(models.HostStatusPreparingSuccessful),
+				DiscoveryAgentVersion: "v2.0.5",
+			},
+				db)).ShouldNot(HaveOccurred())
+
+			// Verify the host was reset to 'known' instead of 'discovering'
+			h := hostutil.GetHostFromDB(hostId, infraEnvId, db)
+			Expect(swag.StringValue(h.Status)).Should(Equal(models.HostStatusKnown))
+			Expect(swag.StringValue(h.StatusInfo)).Should(Equal(statusInfoKnown))
+			// Verify inventory was preserved so the host can continue with preparation
+			Expect(h.Inventory).Should(Equal(defaultHwInfo))
+			// Verify bootstrap flag was preserved (critical for SNO clusters)
+			Expect(h.Bootstrap).Should(BeTrue())
+
+			// Verify the cluster's LastInstallationPreparation was reset
+			var updatedCluster common.Cluster
+			Expect(db.Take(&updatedCluster, "id = ?", clusterId.String()).Error).ShouldNot(HaveOccurred())
+			Expect(updatedCluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusNotStarted))
+			Expect(updatedCluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonNotPerformed))
+
+			// Verify the cluster is still in preparing-for-installation (not insufficient)
+			Expect(swag.StringValue(updatedCluster.Status)).Should(Equal(models.ClusterStatusPreparingForInstallation))
+		})
+
+		It("should not reset LastInstallationPreparation and reset host to discovering when cluster is not in preparing-for-installation", func() {
+			// Create a cluster in ready state with LastInstallationPreparation.Status = Success
+			cluster := hostutil.GenerateTestCluster(clusterId)
+			cluster.Status = swag.String(models.ClusterStatusReady)
+			cluster.LastInstallationPreparation = models.LastInstallationPreparation{
+				Status: models.LastInstallationPreparationStatusSuccess,
+				Reason: constants.InstallationPreparationReasonSuccess,
+			}
+			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+			// Create a host that belongs to the cluster
+			Expect(db.Create(&models.Host{
+				ID:         &hostId,
+				InfraEnvID: infraEnvId,
+				ClusterID:  &clusterId,
+				Role:       models.HostRoleMaster,
+				Inventory:  defaultHwInfo,
+				Status:     swag.String(models.HostStatusKnown),
+			}).Error).ShouldNot(HaveOccurred())
+
+			// Re-register the host
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(infraEnvId.String()),
+				eventstest.WithClusterIdMatcher(clusterId.String()),
+				eventstest.WithSeverityMatcher(models.EventSeverityInfo)))
+
+			Expect(hapi.RegisterHost(ctx, &models.Host{
+				ID:                    &hostId,
+				InfraEnvID:            infraEnvId,
+				ClusterID:             &clusterId,
+				Status:                swag.String(models.HostStatusKnown),
+				DiscoveryAgentVersion: "v2.0.5",
+			},
+				db)).ShouldNot(HaveOccurred())
+
+			// Verify the host was reset to 'discovering' (default behavior)
+			h := hostutil.GetHostFromDB(hostId, infraEnvId, db)
+			Expect(swag.StringValue(h.Status)).Should(Equal(models.HostStatusDiscovering))
+			Expect(swag.StringValue(h.StatusInfo)).Should(Equal(statusInfoDiscovering))
+
+			// Verify the cluster's LastInstallationPreparation was NOT reset
+			var updatedCluster common.Cluster
+			Expect(db.Take(&updatedCluster, "id = ?", clusterId.String()).Error).ShouldNot(HaveOccurred())
+			Expect(updatedCluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusSuccess))
+			Expect(updatedCluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonSuccess))
+		})
+
+		It("should not reset LastInstallationPreparation when host has no cluster ID", func() {
+			// Create a cluster in preparing-for-installation state
+			cluster := hostutil.GenerateTestCluster(clusterId)
+			cluster.Status = swag.String(models.ClusterStatusPreparingForInstallation)
+			cluster.LastInstallationPreparation = models.LastInstallationPreparation{
+				Status: models.LastInstallationPreparationStatusSuccess,
+				Reason: constants.InstallationPreparationReasonSuccess,
+			}
+			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+			// Create a host without cluster ID
+			Expect(db.Create(&models.Host{
+				ID:         &hostId,
+				InfraEnvID: infraEnvId,
+				ClusterID:  nil,
+				Role:       models.HostRoleMaster,
+				Inventory:  defaultHwInfo,
+				Status:     swag.String(models.HostStatusDiscovering),
+			}).Error).ShouldNot(HaveOccurred())
+
+			// Re-register the host
+			// Note: No event is expected because the host is already in 'discovering' state
+			// and re-registration to the same state doesn't trigger a status update event.
+			// If an event were sent (which it shouldn't be), it would have no cluster_id since
+			// the host has no cluster ID. This test verifies that no event is sent and that
+			// LastInstallationPreparation is not reset for hosts without cluster IDs.
+			Expect(hapi.RegisterHost(ctx, &models.Host{
+				ID:                    &hostId,
+				InfraEnvID:            infraEnvId,
+				ClusterID:             nil,
+				Status:                swag.String(models.HostStatusDiscovering),
+				DiscoveryAgentVersion: "v2.0.5",
+			},
+				db)).ShouldNot(HaveOccurred())
+
+			// Verify the cluster's LastInstallationPreparation was NOT reset
+			var updatedCluster common.Cluster
+			Expect(db.Take(&updatedCluster, "id = ?", clusterId.String()).Error).ShouldNot(HaveOccurred())
+			Expect(updatedCluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusSuccess))
+			Expect(updatedCluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonSuccess))
+		})
 	})
 
 	Context("host already exist registration fail", func() {
@@ -640,7 +862,7 @@ var _ = Describe("HostInstallationFailed", func() {
 		mockMetric = metrics.NewMockAPI(ctrl)
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHwValidator := hardware.NewMockValidator(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		hapi = NewManager(common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, mockHwValidator, nil, createValidatorCfg(), mockMetric, defaultConfig, nil, operatorsManager, nil, false, nil, nil, false)
 		hostId = strfmt.UUID(uuid.New().String())
 		clusterId = strfmt.UUID(uuid.New().String())
@@ -686,7 +908,7 @@ var _ = Describe("Cancel host installation", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockEventsHandler = eventsapi.NewMockHandler(ctrl)
 		mockHwValidator := hardware.NewMockValidator(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		hapi = NewManager(common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEventsHandler, mockHwValidator, nil, createValidatorCfg(), nil, defaultConfig, nil, operatorsManager, nil, false, nil, nil, false)
 	})
 
@@ -724,7 +946,6 @@ var _ = Describe("Cancel host installation", func() {
 	}
 
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("cancel from state %s", t.state), func() {
 			hostId = strfmt.UUID(uuid.New().String())
 			clusterId = strfmt.UUID(uuid.New().String())
@@ -779,7 +1000,7 @@ var _ = Describe("Install", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHwValidator = hardware.NewMockValidator(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		pr := registry.NewMockProviderRegistry(ctrl)
 		pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeBaremetal), gomock.Any()).Return(true, nil).AnyTimes()
 		pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
@@ -932,7 +1153,7 @@ var _ = Describe("Unbind", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHwValidator := hardware.NewMockValidator(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		hapi = NewManager(common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, mockHwValidator, nil, createValidatorCfg(), nil, defaultConfig, nil, operatorsManager, nil, false, nil, nil, false)
 		hostId = strfmt.UUID(uuid.New().String())
 		clusterId = strfmt.UUID(uuid.New().String())
@@ -962,6 +1183,7 @@ var _ = Describe("Unbind", func() {
 		Expect(h.InstallationDiskID).Should(BeEmpty())
 		Expect(h.InstallationDiskPath).Should(BeEmpty())
 		Expect(h.MachineConfigPoolName).Should(BeEmpty())
+		Expect(h.ValidationsInfo).Should(BeEmpty())
 		Expect(h.Role).Should(Equal(models.HostRoleAutoAssign))
 		Expect(h.SuggestedRole).Should(BeEmpty())
 		bytes, err := json.Marshal(defaultNTPSources)
@@ -1099,11 +1321,11 @@ var _ = Describe("Unbind", func() {
 			reclaim:   true,
 		},
 		{
-			name:      "installing noop",
+			name:      "installing",
 			srcState:  models.HostStatusInstalling,
-			dstState:  models.HostStatusInstalling,
-			success:   false,
-			sendEvent: false,
+			dstState:  models.HostStatusUnbindingPendingUserAction,
+			success:   true,
+			sendEvent: true,
 			reclaim:   false,
 		},
 		{
@@ -1320,7 +1542,7 @@ var _ = Describe("Refresh Host", func() {
 				fmt.Sprintf("%s:%s", supportedGPU.VendorID, supportedGPU.DeviceID): true,
 			}},
 		}
-		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operatorsOptions, nil, nil)
+		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operatorsOptions, nil)
 		mockHwValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return("/dev/sda").AnyTimes()
 		pr = registry.NewMockProviderRegistry(ctrl)
 		pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeBaremetal), gomock.Any()).Return(true, nil).AnyTimes()
@@ -1328,6 +1550,8 @@ var _ = Describe("Refresh Host", func() {
 		mockVersions := versions.NewMockHandler(ctrl)
 		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(&models.ReleaseImage{URL: swag.String("quay.io/openshift/some-image::latest")}, nil).AnyTimes()
+		mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(versions.MustGatherVersion{"ocp": "quay.io/openshift/must-gather-image:latest"}, nil).AnyTimes()
 		defaultConfig.PrepareConfig.PrepareForInstallationTimeout = 8 * time.Minute
 		hapi = NewManager(common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEvents, mockHwValidator, nil, validatorCfg, nil, defaultConfig, nil, operatorsManager, pr, false, nil, mockVersions, false)
 		hostId = strfmt.UUID(uuid.New().String())
@@ -1479,6 +1703,7 @@ var _ = Describe("Refresh Host", func() {
 			{models.HostStageStartingInstallation, true},
 			{models.HostStageInstalling, true},
 			{models.HostStageWritingImageToDisk, true},
+			{models.HostStageCopyingRegistryDataToDisk, true},
 			{models.HostStageConfiguring, true},
 			{models.HostStageDone, true},
 			{models.HostStageJoined, true},
@@ -1489,7 +1714,6 @@ var _ = Describe("Refresh Host", func() {
 		passedTime := 90 * time.Minute
 
 		for _, t := range tests {
-			t := t
 			It(fmt.Sprintf("checking timeout from stage %s", t.stage), func() {
 				pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
 				hostCheckInAt := strfmt.DateTime(time.Now())
@@ -1578,7 +1802,7 @@ var _ = Describe("Refresh Host", func() {
 				)).AnyTimes()
 
 				mockDefaultClusterHostRequirements(mockHwValidator)
-				mockHwValidator.EXPECT().IsValidStorageDeviceType(gomock.Any(), gomock.Any(), "", false).Return(true).AnyTimes()
+				mockHwValidator.EXPECT().IsValidStorageDeviceType(gomock.Any(), gomock.Any(), "").Return(true).AnyTimes()
 				mockHwValidator.EXPECT().ListEligibleDisks(gomock.Any()).Return([]*models.Disk{}).AnyTimes()
 				mockHwValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return("/dev/sda").AnyTimes()
 			}
@@ -1613,6 +1837,7 @@ var _ = Describe("Refresh Host", func() {
 		installationStages := []models.HostStage{
 			models.HostStageStartingInstallation,
 			models.HostStageWritingImageToDisk,
+			models.HostStageCopyingRegistryDataToDisk,
 			models.HostStageWaitingForBootkube,
 			models.HostStageWaitingForController,
 		}
@@ -1823,8 +2048,6 @@ var _ = Describe("Refresh Host", func() {
 
 		for passedTimeKey, passedTimeValue := range timePassedTypes {
 			name := fmt.Sprintf("installing %s", passedTimeKey)
-			passedTimeKey := passedTimeKey
-			passedTimeValue := passedTimeValue
 			It(name, func() {
 				passedTimeKind := passedTimeKey
 				passedTime := passedTimeValue
@@ -1876,6 +2099,7 @@ var _ = Describe("Refresh Host", func() {
 		installationStages := []models.HostStage{
 			models.HostStageStartingInstallation,
 			models.HostStageWritingImageToDisk,
+			models.HostStageCopyingRegistryDataToDisk,
 			models.HostStageRebooting,
 			models.HostStageConfiguring,
 			models.HostStageInstalling,
@@ -1886,9 +2110,9 @@ var _ = Describe("Refresh Host", func() {
 			"over_timeout":  90 * time.Minute,
 		}
 
-		ClusterHighAvailabilityModes := []string{models.ClusterHighAvailabilityModeNone, models.ClusterHighAvailabilityModeFull}
-		for i := range ClusterHighAvailabilityModes {
-			highAvailabilityMode := ClusterHighAvailabilityModes[i]
+		ClusterControlPlaneCounts := []int64{1, 3, 4, 5}
+		for i := range ClusterControlPlaneCounts {
+			controlPlaneCount := ClusterControlPlaneCounts[i]
 			for j := range installationStages {
 				stage := installationStages[j]
 				for passedTimeKey, passedTimeValue := range timePassedTypes {
@@ -1911,7 +2135,7 @@ var _ = Describe("Refresh Host", func() {
 						host.Progress = &progress
 						Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
 						cluster = hostutil.GenerateTestCluster(clusterId)
-						cluster.HighAvailabilityMode = &highAvailabilityMode
+						cluster.ControlPlaneCount = controlPlaneCount
 						cluster.OrgSoftTimeoutsEnabled = true
 						Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
 
@@ -2024,6 +2248,7 @@ var _ = Describe("Refresh Host", func() {
 		installationStages := []models.HostStage{
 			models.HostStageStartingInstallation,
 			models.HostStageWritingImageToDisk,
+			models.HostStageCopyingRegistryDataToDisk,
 			models.HostStageRebooting,
 			models.HostStageConfiguring,
 			models.HostStageInstalling,
@@ -2034,9 +2259,9 @@ var _ = Describe("Refresh Host", func() {
 			"over_timeout":  90 * time.Minute,
 		}
 
-		ClusterHighAvailabilityModes := []string{models.ClusterHighAvailabilityModeNone, models.ClusterHighAvailabilityModeFull}
-		for i := range ClusterHighAvailabilityModes {
-			highAvailabilityMode := ClusterHighAvailabilityModes[i]
+		ClusterControlPlaneCounts := []int64{1, 3, 4, 5}
+		for i := range ClusterControlPlaneCounts {
+			controlPlaneCount := ClusterControlPlaneCounts[i]
 			for j := range installationStages {
 				stage := installationStages[j]
 				for passedTimeKey, passedTimeValue := range timePassedTypes {
@@ -2062,7 +2287,7 @@ var _ = Describe("Refresh Host", func() {
 							host.Progress = &progress
 							Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
 							cluster = hostutil.GenerateTestCluster(clusterId)
-							cluster.HighAvailabilityMode = &highAvailabilityMode
+							cluster.ControlPlaneCount = controlPlaneCount
 							cluster.OrgSoftTimeoutsEnabled = true
 							Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
 
@@ -2164,6 +2389,216 @@ var _ = Describe("Refresh Host", func() {
 
 	})
 
+	Context("host installing-pending-user-action timeout", func() {
+		BeforeEach(func() {
+			pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
+			mockDefaultClusterHostRequirements(mockHwValidator)
+
+			host = hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, models.HostStatusInstallingPendingUserAction)
+			cluster = hostutil.GenerateTestCluster(clusterId)
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+		})
+
+		It("times out when host is in state for more than the timeout value and is not required for success", func() {
+			// Create 3 master hosts in installed status so the cluster can succeed without the timed-out worker
+			for range 3 {
+				masterId := strfmt.UUID(uuid.New().String())
+				master := hostutil.GenerateTestHostByKind(masterId, infraEnvId, &clusterId, models.HostStatusInstalled, models.HostKindHost, models.HostRoleMaster)
+				Expect(db.Create(&master).Error).ShouldNot(HaveOccurred())
+			}
+
+			host.StatusUpdatedAt = strfmt.DateTime(time.Now().Add(-90 * time.Minute))
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(host.InfraEnvID.String()),
+				eventstest.WithClusterIdMatcher(host.ClusterID.String()),
+				eventstest.WithSeverityMatcher(hostutil.GetEventSeverityFromHostStatus(models.HostStatusError))))
+
+			Expect(hapi.RefreshStatus(ctx, &host, db)).To(Succeed())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusError))
+			Expect(swag.StringValue(resultHost.StatusInfo)).To(Equal(statusInfoPendingUserActionTimeout))
+		})
+
+		It("remains when host is required for success", func() {
+			// Create 2 master hosts in installed status
+			for range 2 {
+				masterId := strfmt.UUID(uuid.New().String())
+				master := hostutil.GenerateTestHostByKind(masterId, infraEnvId, &clusterId, models.HostStatusInstalled, models.HostKindHost, models.HostRoleMaster)
+				Expect(db.Create(&master).Error).ShouldNot(HaveOccurred())
+			}
+
+			// third master in pending-user-action should remain there even after 90 minutes
+			host.StatusUpdatedAt = strfmt.DateTime(time.Now().Add(-90 * time.Minute))
+			host.Role = models.HostRoleMaster
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			Expect(hapi.RefreshStatus(ctx, &host, db)).To(Succeed())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+		})
+
+		It("remains when host is in state for less than the timeout value", func() {
+			host.StatusUpdatedAt = strfmt.DateTime(time.Now().Add(-30 * time.Minute))
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			Expect(hapi.RefreshStatus(ctx, &host, db)).To(Succeed())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+		})
+
+		It("remains when cluster is already installed (post-installation host addition)", func() {
+			// Create 3 master hosts in installed status so cluster is viable
+			for range 3 {
+				masterId := strfmt.UUID(uuid.New().String())
+				master := hostutil.GenerateTestHostByKind(masterId, infraEnvId, &clusterId, models.HostStatusInstalled, models.HostKindHost, models.HostRoleMaster)
+				Expect(db.Create(&master).Error).ShouldNot(HaveOccurred())
+			}
+
+			// Set cluster status to installed (post-installation state)
+			Expect(db.Model(&cluster).Update("status", models.ClusterStatusInstalled).Error).ShouldNot(HaveOccurred())
+
+			// Host has been stuck for > timeout but should NOT timeout because cluster is post-installation
+			host.StatusUpdatedAt = strfmt.DateTime(time.Now().Add(-90 * time.Minute))
+			host.Role = models.HostRoleWorker
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			Expect(hapi.RefreshStatus(ctx, &host, db)).To(Succeed())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+		})
+
+		It("remains when cluster is adding hosts (imported cluster)", func() {
+			// Create 3 master hosts in installed status so cluster is viable
+			for range 3 {
+				masterId := strfmt.UUID(uuid.New().String())
+				master := hostutil.GenerateTestHostByKind(masterId, infraEnvId, &clusterId, models.HostStatusInstalled, models.HostKindHost, models.HostRoleMaster)
+				Expect(db.Create(&master).Error).ShouldNot(HaveOccurred())
+			}
+
+			// Set cluster status to adding-hosts (imported cluster state)
+			Expect(db.Model(&cluster).Updates(map[string]interface{}{
+				"status": models.ClusterStatusAddingHosts,
+				"kind":   models.ClusterKindAddHostsCluster,
+			}).Error).ShouldNot(HaveOccurred())
+
+			// Host has been stuck for > timeout but should NOT timeout because cluster is post-installation
+			host.StatusUpdatedAt = strfmt.DateTime(time.Now().Add(-90 * time.Minute))
+			host.Role = models.HostRoleWorker
+			host.Kind = swag.String(models.HostKindAddToExistingClusterHost)
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			Expect(hapi.RefreshStatus(ctx, &host, db)).To(Succeed())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+		})
+	})
+
+	Context("Installation disk error handling in status info", func() {
+		BeforeEach(func() {
+			pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
+			mockDefaultClusterHostRequirements(mockHwValidator)
+			mockHwValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return("").AnyTimes() // Empty installation path
+		})
+
+		It("should handle missing installation disk gracefully during reboot timeout without panicking", func() {
+			hostCheckInAt := strfmt.DateTime(time.Now())
+			srcState := models.HostStatusInstallingInProgress
+			host = hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, srcState)
+
+			host.Inventory = hostutil.GenerateMasterInventory()
+
+			host.InstallationDiskID = ""
+			host.InstallationDiskPath = ""
+			host.Role = models.HostRoleMaster
+			host.CheckedInAt = hostCheckInAt
+
+			progress := models.HostProgressInfo{
+				CurrentStage:   models.HostStageRebooting,
+				StageStartedAt: strfmt.DateTime(time.Now().Add(-90 * time.Minute)),
+				StageUpdatedAt: strfmt.DateTime(time.Now().Add(-90 * time.Minute)),
+			}
+			host.Progress = &progress
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			cluster = hostutil.GenerateTestCluster(clusterId)
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(host.InfraEnvID.String()),
+				eventstest.WithClusterIdMatcher(host.ClusterID.String()),
+				eventstest.WithSeverityMatcher(hostutil.GetEventSeverityFromHostStatus(models.HostStatusInstallingPendingUserAction))))
+
+			err := hapi.RefreshStatus(ctx, &host, db)
+			Expect(err).ToNot(HaveOccurred())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+
+			expectedStatusInfo := strings.Replace(statusRebootTimeout, "$INSTALLATION_DISK", "", 1)
+			Expect(swag.StringValue(resultHost.StatusInfo)).To(Equal(expectedStatusInfo))
+		})
+
+		It("should handle missing installation disk with non-matching disk ID gracefully", func() {
+			hostCheckInAt := strfmt.DateTime(time.Now())
+			srcState := models.HostStatusInstallingInProgress
+			host = hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, srcState)
+
+			host.Inventory = hostutil.GenerateMasterInventory()
+			host.InstallationDiskID = "/dev/disk/by-id/non-existent-disk"
+			host.InstallationDiskPath = ""
+			host.Role = models.HostRoleMaster
+			host.CheckedInAt = hostCheckInAt
+
+			progress := models.HostProgressInfo{
+				CurrentStage:   models.HostStageRebooting,
+				StageStartedAt: strfmt.DateTime(time.Now().Add(-90 * time.Minute)),
+				StageUpdatedAt: strfmt.DateTime(time.Now().Add(-90 * time.Minute)),
+			}
+			host.Progress = &progress
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+
+			cluster = hostutil.GenerateTestCluster(clusterId)
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+
+			mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
+				eventstest.WithNameMatcher(eventgen.HostStatusUpdatedEventName),
+				eventstest.WithHostIdMatcher(hostId.String()),
+				eventstest.WithInfraEnvIdMatcher(host.InfraEnvID.String()),
+				eventstest.WithClusterIdMatcher(host.ClusterID.String()),
+				eventstest.WithSeverityMatcher(hostutil.GetEventSeverityFromHostStatus(models.HostStatusInstallingPendingUserAction))))
+
+			err := hapi.RefreshStatus(ctx, &host, db)
+			Expect(err).ToNot(HaveOccurred())
+
+			var resultHost models.Host
+			Expect(db.Take(&resultHost, "id = ? and cluster_id = ?", hostId.String(), clusterId.String()).Error).ToNot(HaveOccurred())
+
+			Expect(swag.StringValue(resultHost.Status)).To(Equal(models.HostStatusInstallingPendingUserAction))
+
+			expectedStatusInfo := strings.Replace(statusRebootTimeout, "$INSTALLATION_DISK", "", 1)
+			Expect(swag.StringValue(resultHost.StatusInfo)).To(Equal(expectedStatusInfo))
+		})
+
+	})
+
 	Context("Validate host", func() {
 		BeforeEach(func() {
 			pr.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
@@ -2193,7 +2628,7 @@ var _ = Describe("Refresh Host", func() {
 				role:          models.HostRoleWorker,
 				srcState:      models.HostStatusDiscovering,
 				dstState:      models.HostStatusInsufficient,
-				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 360 MiB but found 150 MiB",
+				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization on the worker role, requires an additional 360 MiB (included in the total required for the worker role) but found 150 MiB",
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
 					IsConnected:                    {status: ValidationSuccess, messagePattern: "Host is connected"},
 					IsHostnameValid:                {status: ValidationSuccess, messagePattern: ""},
@@ -2212,7 +2647,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					AreLsoRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: ""},
 					AreOdfRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: "odf is disabled"},
-					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 360 MiB but found 150 MiB"},
+					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: `^Insufficient memory to deploy OpenShift Virtualization on the worker role, requires an additional 360 MiB \(included in the total required for the worker role\) but found 150 MiB\.$`},
 					CompatibleWithClusterPlatform:                  {status: ValidationSuccess, messagePattern: "Host is compatible with cluster platform baremetal"},
 				}),
 				hostRequirements: &models.ClusterHostRequirementsDetails{CPUCores: 4, RAMMib: 8550},
@@ -2224,7 +2659,7 @@ var _ = Describe("Refresh Host", func() {
 				role:          models.HostRoleMaster,
 				srcState:      models.HostStatusDiscovering,
 				dstState:      models.HostStatusInsufficient,
-				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 150 MiB but found 100 MiB",
+				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization on the master role, requires an additional 150 MiB (included in the total required for the master role) but found 100 MiB",
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
 					IsConnected:                    {status: ValidationSuccess, messagePattern: "Host is connected"},
 					IsHostnameValid:                {status: ValidationSuccess, messagePattern: ""},
@@ -2243,7 +2678,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					AreLsoRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: ""},
 					AreOdfRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: "odf is disabled"},
-					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 150 MiB but found 100 MiB"},
+					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: `^Insufficient memory to deploy OpenShift Virtualization on the master role, requires an additional 150 MiB \(included in the total required for the master role\) but found 100 MiB\.$`},
 					CompatibleWithClusterPlatform:                  {status: ValidationSuccess, messagePattern: "Host is compatible with cluster platform baremetal"},
 				}),
 				hostRequirements: &models.ClusterHostRequirementsDetails{CPUCores: 8, RAMMib: 16537},
@@ -2255,7 +2690,7 @@ var _ = Describe("Refresh Host", func() {
 				role:          models.HostRoleWorker,
 				srcState:      models.HostStatusDiscovering,
 				dstState:      models.HostStatusInsufficient,
-				statusInfoMsg: "Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is 2 but found 1",
+				statusInfoMsg: "Insufficient CPU to deploy OpenShift Virtualization on the worker role, requires an additional 2 CPU cores (included in the total required for the worker role) but found 1",
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
 					IsConnected:                    {status: ValidationSuccess, messagePattern: "Host is connected"},
 					IsHostnameValid:                {status: ValidationSuccess, messagePattern: ""},
@@ -2274,7 +2709,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					AreLsoRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: ""},
 					AreOdfRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: "odf is disabled"},
-					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: "Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is 2 but found 1"},
+					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: `^Insufficient CPU to deploy OpenShift Virtualization on the worker role, requires an additional 2 CPU cores \(included in the total required for the worker role\) but found 1\.$`},
 					CompatibleWithClusterPlatform:                  {status: ValidationSuccess, messagePattern: "Host is compatible with cluster platform baremetal"},
 				}),
 				hostRequirements: &models.ClusterHostRequirementsDetails{CPUCores: 4},
@@ -2286,7 +2721,7 @@ var _ = Describe("Refresh Host", func() {
 				role:          models.HostRoleMaster,
 				srcState:      models.HostStatusDiscovering,
 				dstState:      models.HostStatusInsufficient,
-				statusInfoMsg: "Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is 4 but found 1",
+				statusInfoMsg: "Insufficient CPU to deploy OpenShift Virtualization on the master role, requires an additional 4 CPU cores (included in the total required for the master role) but found 1",
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
 					IsConnected:                    {status: ValidationSuccess, messagePattern: "Host is connected"},
 					IsHostnameValid:                {status: ValidationSuccess, messagePattern: ""},
@@ -2305,7 +2740,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					AreLsoRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: ""},
 					AreOdfRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: "odf is disabled"},
-					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: "Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is 4 but found 1"},
+					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: `^Insufficient CPU to deploy OpenShift Virtualization on the master role, requires an additional 4 CPU cores \(included in the total required for the master role\) but found 1\.$`},
 					CompatibleWithClusterPlatform:                  {status: ValidationSuccess, messagePattern: "Host is compatible with cluster platform baremetal"},
 				}),
 				hostRequirements: &models.ClusterHostRequirementsDetails{CPUCores: 8},
@@ -2346,7 +2781,7 @@ var _ = Describe("Refresh Host", func() {
 				role:          models.HostRoleWorker,
 				srcState:      models.HostStatusDiscovering,
 				dstState:      models.HostStatusInsufficient,
-				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 1384 MiB but found 1024 MiB",
+				statusInfoMsg: "Insufficient memory to deploy OpenShift Virtualization on the worker role, requires an additional 1384 MiB (included in the total required for the worker role) but found 1024 MiB",
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
 					IsConnected:                    {status: ValidationSuccess, messagePattern: "Host is connected"},
 					IsHostnameValid:                {status: ValidationSuccess, messagePattern: ""},
@@ -2365,7 +2800,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					AreLsoRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: ""},
 					AreOdfRequirementsSatisfied:                    {status: ValidationSuccess, messagePattern: "odf is disabled"},
-					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: "Insufficient memory to deploy OpenShift Virtualization. Required memory is 1384 MiB but found 1024 MiB"},
+					AreCnvRequirementsSatisfied:                    {status: ValidationFailure, messagePattern: `^Insufficient memory to deploy OpenShift Virtualization on the worker role, requires an additional 1384 MiB \(included in the total required for the worker role\) but found 1024 MiB\.$`},
 					CompatibleWithClusterPlatform:                  {status: ValidationSuccess, messagePattern: "Host is compatible with cluster platform baremetal"},
 				}),
 				hostRequirements: &models.ClusterHostRequirementsDetails{CPUCores: 4, RAMMib: 9576},
@@ -3670,7 +4105,7 @@ var _ = Describe("Refresh Host", func() {
 				domainResolutions:     common.TestDomainNameResolutionsSuccess,
 				errorExpected:         false,
 				userManagedNetworking: true,
-				connectivity:          fmt.Sprintf("{\"%s\":[]}", network.IPv4.String()),
+				connectivity:          "{}",
 			},
 			{
 				name:              "discovering to insufficient user managed networking - 3 hosts",
@@ -3701,7 +4136,7 @@ var _ = Describe("Refresh Host", func() {
 				domainResolutions:     common.TestDomainNameResolutionsSuccess,
 				errorExpected:         false,
 				userManagedNetworking: true,
-				connectivity:          fmt.Sprintf("{\"%s\":[]}", network.IPv4.String()),
+				connectivity:          "{}",
 				numAdditionalHosts:    2,
 			},
 			{
@@ -3723,7 +4158,7 @@ var _ = Describe("Refresh Host", func() {
 					HasCPUCoresForRole:   {status: ValidationSuccess, messagePattern: "Sufficient CPU cores for role master"},
 					HasMemoryForRole:     {status: ValidationSuccess, messagePattern: "Sufficient RAM for role master"},
 					IsHostnameUnique:     {status: ValidationSuccess, messagePattern: " is unique in cluster"},
-					BelongsToMachineCidr: {status: ValidationFailure, messagePattern: "Host does not belong to machine network CIDRs."},
+					BelongsToMachineCidr: {status: ValidationFailure, messagePattern: "Host does not belong to any machine network CIDR"},
 					IsHostnameValid:      {status: ValidationSuccess, messagePattern: "Hostname .* is allowed"},
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 					SufficientOrUnknownInstallationDiskSpeed:       {status: ValidationSuccess, messagePattern: "Speed of installation disk has not yet been measured"},
@@ -3732,7 +4167,7 @@ var _ = Describe("Refresh Host", func() {
 				domainResolutions:     common.TestDomainNameResolutionsSuccess,
 				errorExpected:         false,
 				userManagedNetworking: true,
-				connectivity:          fmt.Sprintf("{\"%s\":[]}", network.IPv4.String()),
+				connectivity:          "{}",
 				numAdditionalHosts:    2,
 			},
 			{
@@ -3763,7 +4198,7 @@ var _ = Describe("Refresh Host", func() {
 				domainResolutions:     common.TestDomainNameResolutionsSuccess,
 				errorExpected:         false,
 				userManagedNetworking: true,
-				connectivity:          fmt.Sprintf("{\"%s\":[]}", network.IPv4.String()),
+				connectivity:          "{}",
 				numAdditionalHosts:    2,
 			},
 			{
@@ -4102,7 +4537,7 @@ var _ = Describe("Refresh Host", func() {
 				inventory:         hostutil.GenerateMasterInventoryV6(),
 				domainResolutions: common.TestDomainNameResolutionsSuccess,
 				errorExpected:     false,
-				connectivity:      fmt.Sprintf("{\"%s\":[]}", network.IPv4.String()),
+				connectivity:      "{}",
 			},
 			{
 				name:              "known to known",
@@ -4161,7 +4596,7 @@ var _ = Describe("Refresh Host", func() {
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 				}),
 				inventory:         hostutil.GenerateMasterInventory(),
-				connectivity:      fmt.Sprintf("{\"%s\":[]}", common.TestIPv4Networking.MachineNetworks[0].Cidr),
+				connectivity:      "{}",
 				domainResolutions: common.TestDomainNameResolutionsSuccess,
 				errorExpected:     false,
 			},
@@ -4191,7 +4626,7 @@ var _ = Describe("Refresh Host", func() {
 					IsNTPSynced:            {status: ValidationSuccess, messagePattern: "Host NTP is synced"},
 				}),
 				inventory:          hostutil.GenerateMasterInventory(),
-				connectivity:       fmt.Sprintf("{\"%s\":[]}", common.TestIPv4Networking.MachineNetworks[0].Cidr),
+				connectivity:       "{}",
 				domainResolutions:  common.TestDomainNameResolutionsSuccess,
 				errorExpected:      false,
 				numAdditionalHosts: 2,
@@ -4319,7 +4754,7 @@ var _ = Describe("Refresh Host", func() {
 				imageStatuses:    map[string]*models.ContainerImageAvailability{common.TestDefaultConfig.ImageName: common.TestImageStatusesSuccess},
 				role:             models.HostRoleMaster,
 				statusInfoChecker: makeValueChecker(formatStatusInfoFailedValidation(statusInfoInsufficientHardware,
-					"Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is 4 but found 1 ",
+					"Insufficient CPU to deploy OpenShift Virtualization on the master role, requires an additional 4 CPU cores (included in the total required for the master role) but found 1.",
 					"Require at least 16.15 GiB RAM for role master, found only 2.00 GiB",
 					"Require at least 8 CPU cores for master role, found only 1",
 					"The host is not eligible to participate in Openshift Cluster because the minimum required CPU cores for any role is 2, found only 1",
@@ -4414,23 +4849,23 @@ var _ = Describe("Refresh Host", func() {
 				ntpSources:       defaultNTPSources,
 				imageStatuses:    map[string]*models.ContainerImageAvailability{common.TestDefaultConfig.ImageName: common.TestImageStatusesSuccess},
 				role:             models.HostRoleWorker,
-				statusInfoChecker: makeValueChecker(formatStatusInfoFailedValidation(statusInfoNotReadyForInstall,
+				statusInfoChecker: makeValueChecker(formatStatusInfoFailedValidation(
+					statusInfoNotReadyForInstall,
 					"Require at least 8.35 GiB RAM for role worker, found only 8.00 GiB",
-					"ODF unsupported Host Role for Compact Mode.")),
+				)),
 				inventory: hostutil.GenerateInventoryWithResourcesAndMultipleDisk(11, 8, "worker-1"),
 				validationsChecker: makeJsonChecker(map[validationID]validationCheckResult{
-					IsConnected:                 {status: ValidationSuccess, messagePattern: "Host is connected"},
-					HasInventory:                {status: ValidationSuccess, messagePattern: "Valid inventory exists for the host"},
-					HasMinCPUCores:              {status: ValidationSuccess, messagePattern: "Sufficient CPU cores"},
-					HasMinMemory:                {status: ValidationSuccess, messagePattern: "Sufficient minimum RAM"},
-					HasMinValidDisks:            {status: ValidationSuccess, messagePattern: "Sufficient disk capacity"},
-					IsMachineCidrDefined:        {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
-					HasCPUCoresForRole:          {status: ValidationSuccess, messagePattern: "Sufficient CPU cores for role worker"},
-					HasMemoryForRole:            {status: ValidationFailure, messagePattern: "Require at least 8.35 GiB RAM for role worker, found only 8.00 GiB"},
-					IsHostnameUnique:            {status: ValidationSuccess, messagePattern: "Hostname worker-1 is unique in cluster"},
-					BelongsToMachineCidr:        {status: ValidationSuccess, messagePattern: "Host belongs to all machine network CIDRs"},
-					IsNTPSynced:                 {status: ValidationSuccess, messagePattern: "Host NTP is synced"},
-					AreOdfRequirementsSatisfied: {status: ValidationFailure, messagePattern: "ODF unsupported Host Role for Compact Mode."},
+					IsConnected:          {status: ValidationSuccess, messagePattern: "Host is connected"},
+					HasInventory:         {status: ValidationSuccess, messagePattern: "Valid inventory exists for the host"},
+					HasMinCPUCores:       {status: ValidationSuccess, messagePattern: "Sufficient CPU cores"},
+					HasMinMemory:         {status: ValidationSuccess, messagePattern: "Sufficient minimum RAM"},
+					HasMinValidDisks:     {status: ValidationSuccess, messagePattern: "Sufficient disk capacity"},
+					IsMachineCidrDefined: {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					HasCPUCoresForRole:   {status: ValidationSuccess, messagePattern: "Sufficient CPU cores for role worker"},
+					HasMemoryForRole:     {status: ValidationFailure, messagePattern: "Require at least 8.35 GiB RAM for role worker, found only 8.00 GiB"},
+					IsHostnameUnique:     {status: ValidationSuccess, messagePattern: "Hostname worker-1 is unique in cluster"},
+					BelongsToMachineCidr: {status: ValidationSuccess, messagePattern: "Host belongs to all machine network CIDRs"},
+					IsNTPSynced:          {status: ValidationSuccess, messagePattern: "Host NTP is synced"},
 					SucessfullOrUnknownContainerImagesAvailability: {status: ValidationSuccess, messagePattern: "All required container images were either pulled successfully or no attempt was made to pull them"},
 				}),
 				domainResolutions:  common.TestDomainNameResolutionsSuccess,
@@ -4672,7 +5107,7 @@ var _ = Describe("Refresh Host", func() {
 				cluster.BaseDNSDomain = common.TestDefaultConfig.BaseDNSDomain
 				if t.connectivity == "" {
 					if t.userManagedNetworking {
-						cluster.ConnectivityMajorityGroups = fmt.Sprintf("{\"%s\":[\"%s\"]}", network.IPv4.String(), hostId.String())
+						cluster.ConnectivityMajorityGroups = generateL3Counts(true, false, hostId)
 					} else {
 						machineNetworks := t.machineNetworks
 						if t.machineNetworksForGroups != nil {
@@ -5263,6 +5698,7 @@ var _ = Describe("Refresh Host", func() {
 				models.HostStageWaitingForController,
 				models.HostStageInstalling,
 				models.HostStageWritingImageToDisk,
+				models.HostStageCopyingRegistryDataToDisk,
 				models.HostStageRebooting,
 				models.HostStageWaitingForIgnition,
 				models.HostStageConfiguring,
@@ -5270,7 +5706,6 @@ var _ = Describe("Refresh Host", func() {
 				models.HostStageDone,
 				models.HostStageFailed,
 			} {
-				installationStage := installationStage
 				srcState := srcState
 
 				It(fmt.Sprintf("host src: %s cluster error: false", srcState), func() {
@@ -5439,7 +5874,7 @@ var _ = Describe("Refresh Host", func() {
 				cluster.UserManagedNetworking = swag.Bool(t.userManagedNetworking)
 				cluster.Name = common.TestDefaultConfig.ClusterName
 				cluster.BaseDNSDomain = common.TestDefaultConfig.BaseDNSDomain
-				cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+				cluster.ControlPlaneCount = 1
 				Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
 
 				Expect(hapi.RefreshStatus(ctx, &host, db)).NotTo(HaveOccurred())
@@ -5629,22 +6064,14 @@ var _ = Describe("Refresh Host", func() {
 				cluster.UserManagedNetworking = swag.Bool(true)
 				cluster.Name = common.TestDefaultConfig.ClusterName
 				cluster.BaseDNSDomain = common.TestDefaultConfig.BaseDNSDomain
-				connectivityGroups := make(map[string][]strfmt.UUID)
 				domainNameResolutions := common.TestDomainNameResolutionsSuccess
 				for _, h := range hosts {
-
-					if network.IsIPV4CIDR(string(t.machineNetworks[0].Cidr)) {
-						connectivityGroups[network.IPv4.String()] = append(connectivityGroups[network.IPv4.String()], *h.ID)
-					} else {
-						connectivityGroups[network.IPv6.String()] = append(connectivityGroups[network.IPv6.String()], *h.ID)
-					}
 					b, err := json.Marshal(domainNameResolutions)
 					Expect(err).ShouldNot(HaveOccurred())
 					h.DomainNameResolutions = string(b)
 				}
-				b, err := json.Marshal(&connectivityGroups)
-				Expect(err).ToNot(HaveOccurred())
-				cluster.ConnectivityMajorityGroups = string(b)
+				isIpv4 := network.IsIPV4CIDR(string(t.machineNetworks[0].Cidr))
+				cluster.ConnectivityMajorityGroups = generateL3Counts(isIpv4, !isIpv4, funk.Map(hosts, func(h *models.Host) strfmt.UUID { return *h.ID }).([]strfmt.UUID)...)
 				Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
 				for n, h := range hosts {
 					tmpHosts := []*models.Host{}
@@ -5676,25 +6103,25 @@ var _ = Describe("Refresh Host", func() {
 	Context("Default route", func() {
 
 		ipv4Routes := []*models.Route{
-			{Family: common.FamilyIPv4, Destination: "0.0.0.0", Gateway: "10.254.0.1"},
-			{Family: common.FamilyIPv4, Destination: "192.168.122.0", Gateway: "0.0.0.0"}}
+			{Family: int32(common.IPv4), Destination: "0.0.0.0", Gateway: "10.254.0.1"},
+			{Family: int32(common.IPv4), Destination: "192.168.122.0", Gateway: "0.0.0.0"}}
 		ipv6Routes := []*models.Route{
-			{Family: common.FamilyIPv6, Destination: net.IPv6zero.String(), Gateway: "2001:1::1"},
-			{Family: common.FamilyIPv6, Destination: "2001:1::1", Gateway: net.IPv6zero.String()},
-			{Family: common.FamilyIPv6, Destination: net.IPv6zero.String(), Gateway: net.IPv6zero.String()}}
+			{Family: int32(common.IPv6), Destination: net.IPv6zero.String(), Gateway: "2001:1::1"},
+			{Family: int32(common.IPv6), Destination: "2001:1::1", Gateway: net.IPv6zero.String()},
+			{Family: int32(common.IPv6), Destination: net.IPv6zero.String(), Gateway: net.IPv6zero.String()}}
 
 		noDefaultRoute := []*models.Route{
-			{Family: common.FamilyIPv4, Destination: "10.254.2.2", Gateway: "10.254.2.1"},
-			{Family: common.FamilyIPv4, Destination: "172.17.0.15", Gateway: "172.17.0.1"},
-			{Family: common.FamilyIPv6, Destination: "2001:1::10", Gateway: "2001:1::1"},
+			{Family: int32(common.IPv4), Destination: "10.254.2.2", Gateway: "10.254.2.1"},
+			{Family: int32(common.IPv4), Destination: "172.17.0.15", Gateway: "172.17.0.1"},
+			{Family: int32(common.IPv6), Destination: "2001:1::10", Gateway: "2001:1::1"},
 		}
 
 		invalidDestination := []*models.Route{
-			{Family: common.FamilyIPv4, Destination: "invalid", Gateway: "10.254.2.1"},
+			{Family: int32(common.IPv4), Destination: "invalid", Gateway: "10.254.2.1"},
 		}
 
 		invalidGateway := []*models.Route{
-			{Family: common.FamilyIPv4, Destination: "0.0.0.0", Gateway: "invalid"},
+			{Family: int32(common.IPv4), Destination: "0.0.0.0", Gateway: "invalid"},
 		}
 		defaultNTPSourcesInBytes, err := json.Marshal(defaultNTPSources)
 		domainNameResolutions := common.TestDomainNameResolutionsSuccess
@@ -5710,7 +6137,7 @@ var _ = Describe("Refresh Host", func() {
 			mockDefaultClusterHostRequirements(mockHwValidator)
 			cluster = hostutil.GenerateTestCluster(clusterId)
 			cluster.UserManagedNetworking = swag.Bool(true)
-			cluster.ConnectivityMajorityGroups = fmt.Sprintf("{\"%s\":[\"%s\"]}", network.IPv4.String(), hostId.String())
+			cluster.ConnectivityMajorityGroups = generateL3Counts(true, false, hostId)
 			cluster.Name = common.TestDefaultConfig.ClusterName
 			cluster.BaseDNSDomain = common.TestDefaultConfig.BaseDNSDomain
 			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
@@ -6250,7 +6677,6 @@ var _ = Describe("Upgrade agent feature", func() {
 			nil,
 			operators.Options{},
 			nil,
-			nil,
 		)
 		pr = registry.NewMockProviderRegistry(ctrl)
 		mockVersions := versions.NewMockHandler(ctrl)
@@ -6420,11 +6846,15 @@ func formatProgressTimedOutInfoWithSoftTimeoutsValue(config *Config, stage model
 		statusInfo = statusInfoInstallationInProgressSoftTimedOut
 		if stage == models.HostStageWritingImageToDisk {
 			statusInfo = statusInfoInstallationInProgressWritingImageToDiskSoftTimedOut
+		} else if stage == models.HostStageCopyingRegistryDataToDisk {
+			statusInfo = statusInfoInstallationInProgressCopyingRegistryDataToDiskSoftTimedOut
 		}
 	} else {
 		statusInfo = statusInfoInstallationInProgressTimedOut
 		if stage == models.HostStageWritingImageToDisk {
 			statusInfo = statusInfoInstallationInProgressWritingImageToDiskTimedOut
+		} else if stage == models.HostStageCopyingRegistryDataToDisk {
+			statusInfo = statusInfoInstallationInProgressCopyingRegistryDataToDiskTimedOut
 		}
 
 	}
@@ -6447,24 +6877,47 @@ func formatStatusInfoFailedValidation(statusInfo string, validationMessages ...s
 }
 
 func generateMajorityGroup(machineNetworks []*models.MachineNetwork, hostId strfmt.UUID) string {
-	majorityGroups := map[string][]string{}
-	for _, net := range machineNetworks {
-		majorityGroups[string(net.Cidr)] = append(majorityGroups[string(net.Cidr)], hostId.String())
+	connectivity := &network.Connectivity{
+		MajorityGroups: make(map[string][]strfmt.UUID),
 	}
-	tmp, err := json.Marshal(majorityGroups)
+	for _, mnet := range machineNetworks {
+		connectivity.MajorityGroups[string(mnet.Cidr)] = append(connectivity.MajorityGroups[string(mnet.Cidr)], hostId)
+	}
+	tmp, err := json.Marshal(connectivity)
 	if err != nil {
 		return ""
 	}
 	return string(tmp)
 }
 
-func addL3Connectivity(majorityGroupsStr string, hostId strfmt.UUID) string {
-	majorityGroups := make(map[string][]string)
-	if majorityGroupsStr != "" {
-		Expect(json.Unmarshal([]byte(majorityGroupsStr), &majorityGroups)).ToNot(HaveOccurred())
+func generateL3Counts(isIpv4, isIpv6 bool, hostIds ...strfmt.UUID) string {
+	connectivity := &network.Connectivity{
+		L3ConnectedAddresses: make(map[strfmt.UUID][]string),
 	}
-	majorityGroups[network.IPv4.String()] = []string{hostId.String()}
-	tmp, err := json.Marshal(majorityGroups)
+	for i, hostId := range hostIds {
+		var addresses []string
+		if isIpv4 {
+			addresses = append(addresses, fmt.Sprintf("1.2.3.%d", i+4))
+		}
+		if isIpv6 {
+			addresses = append(addresses, fmt.Sprintf("1:2:3::%d", i+4))
+		}
+		connectivity.L3ConnectedAddresses[hostId] = addresses
+	}
+	tmp, err := json.Marshal(connectivity)
+	Expect(err).ToNot(HaveOccurred())
+	return string(tmp)
+}
+
+func addL3Connectivity(connectivityStr string, hostId strfmt.UUID) string {
+	connectivity := &network.Connectivity{
+		MajorityGroups: make(map[string][]strfmt.UUID),
+	}
+	if connectivityStr != "" {
+		Expect(json.Unmarshal([]byte(connectivityStr), &connectivity)).ToNot(HaveOccurred())
+	}
+	connectivity.MajorityGroups[network.IPv4.String()] = []strfmt.UUID{hostId}
+	tmp, err := json.Marshal(connectivity)
 	Expect(err).ToNot(HaveOccurred())
 	return string(tmp)
 }
@@ -6504,6 +6957,8 @@ var allValidationIDs = []validationID{
 	IsMediaConnected,
 	IsConnected,
 	HasInventory,
+	InventoryNotPartiallyTruncated,
+	InventoryNotFullyTruncated,
 	IsMachineCidrDefined,
 	BelongsToMachineCidr,
 	HasMinCPUCores,
@@ -6524,6 +6979,8 @@ var allValidationIDs = []validationID{
 	AreCnvRequirementsSatisfied,
 	AreLvmRequirementsSatisfied,
 	AreMceRequirementsSatisfied,
+	AreMtvRequirementsSatisfied,
+	AreOscRequirementsSatisfied,
 	SufficientOrUnknownInstallationDiskSpeed,
 	HasSufficientNetworkLatencyRequirementForRole,
 	HasSufficientPacketLossRequirementForRole,
@@ -6541,6 +6998,28 @@ var allValidationIDs = []validationID{
 	NoSkipMissingDisk,
 	NoIPCollisionsInNetwork,
 	IsReleaseDomainNameResolvedCorrectly,
+	NoIscsiNicBelongsToMachineCidr,
+	AreNodeFeatureDiscoveryRequirementsSatisfied,
+	AreNvidiaGPURequirementsSatisfied,
+	ArePipelinesRequirementsSatisfied,
+	AreServiceMeshRequirementsSatisfied,
+	AreServerLessRequirementsSatisfied,
+	AreOpenShiftAIRequirementsSatisfied,
+	AreAuthorinoRequirementsSatisfied,
+	AreNmstateRequirementsSatisfied,
+	AreAMDGPURequirementsSatisfied,
+	AreKMMRequirementsSatisfied,
+	AreNodeHealthcheckRequirementsSatisfied,
+	AreSelfNodeRemediationRequirementsSatisfied,
+	AreFenceAgentsRemediationRequirementsSatisfied,
+	AreNodeMaintenanceRequirementsSatisfied,
+	AreKubeDeschedulerRequirementsSatisfied,
+	AreClusterObservabilityRequirementsSatisfied,
+	AreNUMAResourcesRequirementsSatisfied,
+	AreOADPRequirementsSatisfied,
+	AreMetalLBRequirementsSatisfied,
+	AreLokiRequirementsSatisfied,
+	AreOpenShiftLoggingRequirementsSatisfied,
 }
 
 var allConditions = []conditionId{
@@ -6689,6 +7168,35 @@ var _ = Describe("State machine test - refresh transition", func() {
 			Expect(string(testState.State())).To(Equal(models.HostStatusInsufficient))
 
 			refreshHostArgs.conditions[string(NoIPCollisionsInNetwork)] = true
+
+			Expect(stateMachine.Run(TransitionTypeRefresh, testState, &refreshHostArgs)).To(Succeed())
+			Expect(string(testState.State())).To(Equal(models.HostStatusKnown))
+		})
+
+		It("Moves from known to insufficient when  validation fails", func() {
+
+			refreshHostArgs.conditions[string(NoIscsiNicBelongsToMachineCidr)] = false
+
+			Expect(stateMachine.Run(TransitionTypeRefresh, testState, &refreshHostArgs)).To(Succeed())
+			Expect(string(testState.State())).To(Equal(models.HostStatusInsufficient))
+
+			refreshHostArgs.conditions[string(NoIscsiNicBelongsToMachineCidr)] = true
+
+			Expect(stateMachine.Run(TransitionTypeRefresh, testState, &refreshHostArgs)).To(Succeed())
+			Expect(string(testState.State())).To(Equal(models.HostStatusKnown))
+		})
+
+		It("Moves from known to insufficient when inventory is fully truncated", func() {
+			refreshHostArgs.conditions[string(InventoryNotFullyTruncated)] = false
+			// The "Host not ready" transition also requires its second Or to be true; with all other
+			// validations passing, Not(VSphereHostUUIDEnabled) satisfies that disjunct.
+			refreshHostArgs.conditions[string(VSphereHostUUIDEnabled)] = false
+
+			Expect(stateMachine.Run(TransitionTypeRefresh, testState, &refreshHostArgs)).To(Succeed())
+			Expect(string(testState.State())).To(Equal(models.HostStatusInsufficient))
+
+			refreshHostArgs.conditions[string(InventoryNotFullyTruncated)] = true
+			refreshHostArgs.conditions[string(VSphereHostUUIDEnabled)] = true
 
 			Expect(stateMachine.Run(TransitionTypeRefresh, testState, &refreshHostArgs)).To(Succeed())
 			Expect(string(testState.State())).To(Equal(models.HostStatusKnown))

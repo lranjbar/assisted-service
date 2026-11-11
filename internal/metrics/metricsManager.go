@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/alecthomas/units"
@@ -37,8 +38,17 @@ const (
 	counterClusterValidationFailed                = "assisted_installer_cluster_validation_is_in_failed_status_on_cluster_deletion"
 	counterClusterValidationChanged               = "assisted_installer_cluster_validation_failed_after_success_before_installation"
 	counterFilesystemUsagePercentage              = "assisted_installer_filesystem_usage_percentage"
-	counterMonitoredHosts                         = "assisted_installer_monitored_hosts"
-	counterMonitoredClusters                      = "assisted_installer_monitored_clusters"
+	histogramMonitoredHostsDurationMs             = "assisted_installer_monitored_hosts_duration_ms"
+	histogramMonitoredClustersDurationMs          = "assisted_installer_monitored_clusters_duration_ms"
+	histogramMonitoredClustersCycleDurationMs     = "assisted_installer_monitored_clusters_cycle_duration_ms"
+	histogramMonitoredHostsCycleDurationMs        = "assisted_installer_monitored_hosts_cycle_duration_ms"
+	counterInstallerReleaseCache                  = "assisted_installer_release_cache"
+	counterInstallerReleaseCacheEviction          = "assisted_installer_release_cache_eviction"
+	// blacklist metrics
+	counterClusterBlacklistedEvents = "assisted_installer_cluster_blacklisted_events_total"
+	gaugeBlacklistedClustersCurrent = "assisted_installer_blacklisted_clusters_current"
+	// url auth scope metrics
+	counterURLAuthScopeCheck = "assisted_installer_urlauth_scope_checks_total"
 )
 
 const (
@@ -59,8 +69,17 @@ const (
 	counterDescriptionClusterValidationFailed                = "Number of cluster validation errors"
 	counterDescriptionClusterValidationChanged               = "Number of cluster validations that already succeed but start to fail again"
 	counterDescriptionFilesystemUsagePercentage              = "The percentage of the filesystem usage by the service"
-	counterDescriptionMonitoredHosts                         = "Number of hosts monitored by host monitor"
-	counterDescriptionMonitoredClusters                      = "Number of clusters monitored by cluster monitor"
+	histogramDescriptionMonitoredHostsDurationMs             = "Histogram/sum/count of monitored hosts duration (ms)"
+	histogramDescriptionMonitoredClustersDurationMs          = "Histogram/sum/count of monitored clusters duration (ms)"
+	histogramDescriptionMonitoredClustersCycleDurationMs     = "Histogram/sum/count of full monitoring cycle duration (ms) with fullscan label"
+	histogramDescriptionMonitoredHostsCycleDurationMs        = "Histogram/sum/count of full monitoring cycle duration (ms) with fullscan label"
+	counterDescriptionInstallerReleaseCache                  = "Counts the cache hit status for the labelled release"
+	counterDescriptionInstallerReleaseCacheEviction          = "Counts the number of times that at least one release was evicted"
+	// blacklist metric descriptions
+	counterDescriptionClusterBlacklistedEvents = "Counts cluster blacklisting events (no cluster labels to avoid high cardinality)"
+	gaugeDescriptionBlacklistedClustersCurrent = "Current number of clusters that are blacklisted"
+	// url auth scope metric descriptions
+	counterDescriptionURLAuthScopeCheck = "Number of URL auth resource scope checks, by resource_type, scope (path or query), and result (allowed or denied)"
 )
 
 const (
@@ -77,6 +96,10 @@ const (
 	imageLabel                 = "imageName"
 	hosts                      = "hosts"
 	clusters                   = "clusters"
+	labelCacheHit              = "hit"
+	labelReleaseID             = "releaseId"
+	labelSuccess               = "success"
+	labelFullScan              = "fullscan"
 )
 
 type API interface {
@@ -92,13 +115,23 @@ type API interface {
 	DiskSyncDuration(syncDuration int64)
 	ImagePullStatus(imageName, resultStatus string, downloadRate float64)
 	FileSystemUsage(usageInPercentage float64)
-	MonitoredHostsCount(monitoredHosts int64)
-	MonitoredClusterCount(monitoredClusters int64)
+	MonitoredHostsDurationMs(ctx context.Context, hostID strfmt.UUID, clusterID *strfmt.UUID, duration time.Duration)
+	MonitoredClustersDurationMs(ctx context.Context, clusterID strfmt.UUID, duration time.Duration)
+	MonitoredClustersCycleDurationMs(ctx context.Context, duration time.Duration, fullScan bool)
+	MonitoredHostsCycleDurationMs(ctx context.Context, duration time.Duration, fullScan bool)
+	InstallerCacheGetReleaseCached(releaseId string, cacheHit bool)
+	InstallerCacheReleaseEvicted(success bool)
+	// blacklist metrics
+	BlacklistedClusterInc()
+	BlacklistedClustersCurrent(count int)
+	// url auth scope metrics
+	URLAuthScopeCheck(resourceType, scope, result string)
 }
 
 type MetricsManager struct {
 	registry prometheus.Registerer
 	handler  eventsapi.Handler
+	config   MetricsManagerConfig
 
 	serviceLogicClusterCreation                        *prometheus.CounterVec
 	serviceLogicClusterInstallationStarted             *prometheus.CounterVec
@@ -117,18 +150,39 @@ type MetricsManager struct {
 	serviceLogicClusterValidationFailed                *prometheus.CounterVec
 	serviceLogicClusterValidationChanged               *prometheus.CounterVec
 	serviceLogicFilesystemUsagePercentage              *prometheus.GaugeVec
-	serviceLogicMonitoredHosts                         *prometheus.GaugeVec
-	serviceLogicMonitoredClusters                      *prometheus.GaugeVec
+	serviceLogicMonitoredHostsDurationMs               *prometheus.HistogramVec
+	serviceLogicMonitoredClustersDurationMs            *prometheus.HistogramVec
+	serviceLogicMonitoredClustersCycleDurationMs       *prometheus.HistogramVec
+	serviceLogicMonitoredHostsCycleDurationMs          *prometheus.HistogramVec
+	serviceLogicInstallerReleaseCache                  *prometheus.CounterVec
+	serviceLogicInstallerReleaseEvicted                *prometheus.CounterVec
+	// blacklist metrics
+	serviceLogicClusterBlacklistedEvents   *prometheus.CounterVec
+	serviceLogicBlacklistedClustersCurrent *prometheus.GaugeVec
+	// url auth scope metrics
+	serviceLogicURLAuthScopeCheck *prometheus.CounterVec
+
+	collectors []prometheus.Collector
 }
 
 var _ API = &MetricsManager{}
 
-func NewMetricsManager(registry prometheus.Registerer, eventsHandler eventsapi.Handler) *MetricsManager {
+type DirectoryUsageMonitorConfig struct {
+	Directories []string
+}
+
+type MetricsManagerConfig struct {
+	DirectoryUsageMonitorConfig    DirectoryUsageMonitorConfig
+	ClusterMonitorSlowLogThreshold time.Duration
+	HostMonitorSlowLogThreshold    time.Duration
+}
+
+func NewMetricsManager(registry prometheus.Registerer, eventsHandler eventsapi.Handler, diskStatsHelper DiskStatsHelper, metricsManagerConfig *MetricsManagerConfig, log *logrus.Logger) *MetricsManager {
 
 	m := &MetricsManager{
 		registry: registry,
 		handler:  eventsHandler,
-
+		config:   *metricsManagerConfig,
 		serviceLogicClusterCreation: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
@@ -267,20 +321,82 @@ func NewMetricsManager(registry prometheus.Registerer, eventsHandler eventsapi.H
 			}, []string{},
 		),
 
-		serviceLogicMonitoredHosts: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		serviceLogicMonitoredHostsDurationMs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
-			Name:      counterMonitoredHosts,
-			Help:      counterDescriptionMonitoredHosts,
-		}, []string{hosts}),
+			Name:      histogramMonitoredHostsDurationMs,
+			Help:      histogramDescriptionMonitoredHostsDurationMs,
+			Buckets:   []float64{10, 100, 200, 500, 1000, 10000, 30000},
+		}, []string{}),
 
-		serviceLogicMonitoredClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		serviceLogicMonitoredClustersDurationMs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
-			Name:      counterMonitoredClusters,
-			Help:      counterDescriptionMonitoredClusters,
-		}, []string{hosts}),
+			Name:      histogramMonitoredClustersDurationMs,
+			Help:      histogramDescriptionMonitoredClustersDurationMs,
+			Buckets:   []float64{10, 100, 200, 500, 1000, 10000, 30000},
+		}, []string{}),
+
+		serviceLogicMonitoredClustersCycleDurationMs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      histogramMonitoredClustersCycleDurationMs,
+			Help:      histogramDescriptionMonitoredClustersCycleDurationMs,
+			Buckets: []float64{1000, 10000, 30000, 60000, 120000, 180000,
+				240000, 300000, 360000, 420000, 480000, 540000, 600000},
+		}, []string{labelFullScan}),
+
+		serviceLogicMonitoredHostsCycleDurationMs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      histogramMonitoredHostsCycleDurationMs,
+			Help:      histogramDescriptionMonitoredHostsCycleDurationMs,
+			Buckets: []float64{1000, 10000, 30000, 60000, 120000, 180000,
+				240000, 300000, 360000, 420000, 480000, 540000, 600000},
+		}, []string{labelFullScan}),
+
+		serviceLogicInstallerReleaseCache: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      counterInstallerReleaseCache,
+				Help:      counterDescriptionInstallerReleaseCache,
+			}, []string{labelReleaseID, labelCacheHit}),
+
+		serviceLogicInstallerReleaseEvicted: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      counterInstallerReleaseCacheEviction,
+				Help:      counterDescriptionInstallerReleaseCacheEviction,
+			}, []string{labelSuccess}),
+
+		// blacklist metrics
+		serviceLogicClusterBlacklistedEvents: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      counterClusterBlacklistedEvents,
+				Help:      counterDescriptionClusterBlacklistedEvents,
+			}, []string{}),
+		serviceLogicBlacklistedClustersCurrent: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      gaugeBlacklistedClustersCurrent,
+				Help:      gaugeDescriptionBlacklistedClustersCurrent,
+			}, []string{}),
+
+		serviceLogicURLAuthScopeCheck: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      counterURLAuthScopeCheck,
+				Help:      counterDescriptionURLAuthScopeCheck,
+			}, []string{"resource_type", "scope", "result"}),
 	}
+
+	m.collectors = append(m.collectors, newDirectoryUsageCollector(metricsManagerConfig.DirectoryUsageMonitorConfig.Directories, diskStatsHelper, log))
 
 	registry.MustRegister(
 		m.serviceLogicClusterCreation,
@@ -300,9 +416,23 @@ func NewMetricsManager(registry prometheus.Registerer, eventsHandler eventsapi.H
 		m.serviceLogicClusterValidationChanged,
 		m.serviceLogicClusterImagePullStatus,
 		m.serviceLogicFilesystemUsagePercentage,
-		m.serviceLogicMonitoredHosts,
-		m.serviceLogicMonitoredClusters,
+		m.serviceLogicMonitoredHostsDurationMs,
+		m.serviceLogicMonitoredClustersDurationMs,
+		m.serviceLogicMonitoredClustersCycleDurationMs,
+		m.serviceLogicMonitoredHostsCycleDurationMs,
+		m.serviceLogicInstallerReleaseCache,
+		m.serviceLogicInstallerReleaseEvicted,
+		// blacklist metrics
+		m.serviceLogicClusterBlacklistedEvents,
+		m.serviceLogicBlacklistedClustersCurrent,
+		// url auth scope metrics
+		m.serviceLogicURLAuthScopeCheck,
 	)
+
+	for _, collector := range m.collectors {
+		registry.MustRegister(collector)
+	}
+
 	return m
 }
 
@@ -460,14 +590,52 @@ func (m *MetricsManager) FileSystemUsage(usageInPercentage float64) {
 	m.serviceLogicFilesystemUsagePercentage.WithLabelValues().Set(usageInPercentage)
 }
 
-func (m *MetricsManager) MonitoredHostsCount(monitoredHosts int64) {
-	m.serviceLogicMonitoredHosts.WithLabelValues(hosts).Set(float64(monitoredHosts))
+func (m *MetricsManager) MonitoredHostsDurationMs(ctx context.Context, hostID strfmt.UUID, clusterID *strfmt.UUID, duration time.Duration) {
+	m.serviceLogicMonitoredHostsDurationMs.WithLabelValues().Observe(float64(duration.Milliseconds()))
+	if duration > m.config.HostMonitorSlowLogThreshold {
+		m.handler.V2AddMetricsEvent(ctx, clusterID, &hostID, nil, "", models.EventSeverityInfo, "host_monitor.slow_host", time.Now(),
+			"duration", duration.Milliseconds())
+	}
 }
 
-func (m *MetricsManager) MonitoredClusterCount(monitoredClusters int64) {
-	m.serviceLogicMonitoredClusters.WithLabelValues(clusters).Set(float64(monitoredClusters))
+func (m *MetricsManager) MonitoredClustersDurationMs(ctx context.Context, clusterID strfmt.UUID, duration time.Duration) {
+	m.serviceLogicMonitoredClustersDurationMs.WithLabelValues().Observe(float64(duration.Milliseconds()))
+	if duration > m.config.ClusterMonitorSlowLogThreshold {
+		m.handler.V2AddMetricsEvent(ctx, &clusterID, nil, nil, "", models.EventSeverityInfo, "cluster_monitor.slow_cluster", time.Now(),
+			"duration", duration.Milliseconds())
+	}
+}
+
+func (m *MetricsManager) MonitoredClustersCycleDurationMs(ctx context.Context, duration time.Duration, fullScan bool) {
+	m.serviceLogicMonitoredClustersCycleDurationMs.WithLabelValues(fmt.Sprintf("%t", fullScan)).Observe(float64(duration.Milliseconds()))
+}
+
+func (m *MetricsManager) MonitoredHostsCycleDurationMs(ctx context.Context, duration time.Duration, fullScan bool) {
+	m.serviceLogicMonitoredHostsCycleDurationMs.WithLabelValues(fmt.Sprintf("%t", fullScan)).Observe(float64(duration.Milliseconds()))
+}
+
+// BlacklistedClusterInc increments the total number of cluster blacklist events.
+func (m *MetricsManager) BlacklistedClusterInc() {
+	m.serviceLogicClusterBlacklistedEvents.WithLabelValues().Inc()
+}
+
+// BlacklistedClustersCurrent sets the current number of blacklisted clusters.
+func (m *MetricsManager) BlacklistedClustersCurrent(count int) {
+	m.serviceLogicBlacklistedClustersCurrent.WithLabelValues().Set(float64(count))
 }
 
 func bytesToGib(bytes int64) int64 {
 	return bytes / int64(units.GiB)
+}
+
+func (m *MetricsManager) InstallerCacheGetReleaseCached(releaseId string, cacheHit bool) {
+	m.serviceLogicInstallerReleaseCache.WithLabelValues(releaseId, fmt.Sprintf("%t", cacheHit)).Inc()
+}
+
+func (m *MetricsManager) InstallerCacheReleaseEvicted(success bool) {
+	m.serviceLogicInstallerReleaseEvicted.WithLabelValues(fmt.Sprintf("%t", success)).Inc()
+}
+
+func (m *MetricsManager) URLAuthScopeCheck(resourceType, scope, result string) {
+	m.serviceLogicURLAuthScopeCheck.WithLabelValues(resourceType, scope, result).Inc()
 }

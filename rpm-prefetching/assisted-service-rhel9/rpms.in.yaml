@@ -1,0 +1,19 @@
+contentOrigin:
+  repofiles: ["./redhat.repo"]
+packages:
+  - nmstate
+  - nmstate-devel
+  - nmstate-libs
+  - skopeo
+  - openshift-clients
+  - gcc
+  - git
+  - openssl-devel
+  - libseccomp  
+arches:
+  - aarch64
+  - x86_64
+  - ppc64le
+  - s390x
+context:
+  containerfile: ../../Dockerfile.assisted-service-rhel9-mce

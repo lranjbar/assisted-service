@@ -2,8 +2,10 @@ package subsystem
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -16,7 +18,10 @@ import (
 	"github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/client"
 	"github.com/openshift/assisted-service/client/versions"
+	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
+	"github.com/openshift/assisted-service/subsystem/utils_test"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	"github.com/sirupsen/logrus"
 	"gorm.io/driver/postgres"
@@ -26,26 +31,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-var db *gorm.DB
 var log *logrus.Logger
-var wiremock *WireMock
+var wiremock *utils_test.WireMock
 var kubeClient k8sclient.Client
-var openshiftVersion string = "4.9.0-0.0"
-var snoVersion string = "4.9"
-var multiarchOpenshiftVersion string = "4.11.0-multi"
-var dualstackVipsOpenShiftVersion string = "4.12.0"
-var pullSecret = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}}}" // #nosec
+var openshiftVersion = common.TestVersion().Version()
 
-var (
-	agentBMClient             *client.AssistedInstall
-	agent2BMClient            *client.AssistedInstall
-	badAgentBMClient          *client.AssistedInstall
-	userBMClient              *client.AssistedInstall
-	user2BMClient             *client.AssistedInstall
-	readOnlyAdminUserBMClient *client.AssistedInstall
-	unallowedUserBMClient     *client.AssistedInstall
-	editclusterUserBMClient   *client.AssistedInstall
-)
+// s390x is used to detect multi version availability since it has no standalone release images.
+var multiarchOpenshiftVersion = common.TestVersion().ForArch("s390x").MultiVersion()
+var pullSecret = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}}}" // #nosec
 
 const (
 	pollDefaultInterval = 1 * time.Millisecond
@@ -70,6 +63,7 @@ var Options struct {
 	Namespace               string        `envconfig:"NAMESPACE" default:"assisted-installer"`
 	EnableKubeAPI           bool          `envconfig:"ENABLE_KUBE_API" default:"false"`
 	DeregisterInactiveAfter time.Duration `envconfig:"DELETED_INACTIVE_AFTER" default:"480h"` // 20d
+	ReleaseSources          string        `envconfig:"RELEASE_SOURCES" default:""`
 }
 
 func clientcfg(authInfo runtime.ClientAuthInfoWriter) client.Config {
@@ -116,24 +110,8 @@ func init() {
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	userClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestToken))
-	userClientCfg2 := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestToken2))
-	adminUserClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenAdmin))
-	unallowedUserClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenUnallowed))
-	editclusterClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenClusterEditor))
-	agentClientCfg := clientcfg(auth.AgentAuthHeaderWriter(FakePS))
-	agent2ClientCfg := clientcfg(auth.AgentAuthHeaderWriter(FakePS2))
-	badAgentClientCfg := clientcfg(auth.AgentAuthHeaderWriter(WrongPullSecret))
-	userBMClient = client.New(userClientCfg)
-	user2BMClient = client.New(userClientCfg2)
-	readOnlyAdminUserBMClient = client.New(adminUserClientCfg)
-	unallowedUserBMClient = client.New(unallowedUserClientCfg)
-	editclusterUserBMClient = client.New(editclusterClientCfg)
-	agentBMClient = client.New(agentClientCfg)
-	agent2BMClient = client.New(agent2ClientCfg)
-	badAgentBMClient = client.New(badAgentClientCfg)
 
-	db, err = gorm.Open(postgres.Open(fmt.Sprintf("host=%s port=%s user=admin database=installer password=admin sslmode=disable",
+	db, err := gorm.Open(postgres.Open(fmt.Sprintf("host=%s port=%s user=admin database=installer password=admin sslmode=disable",
 		Options.DBHost, Options.DBPort)), &gorm.Config{})
 	if err != nil {
 		logrus.Fatal("Fail to connect to DB, ", err)
@@ -143,12 +121,44 @@ func init() {
 		setupKubeClient()
 	}
 
+	userClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestToken))
+	userClientCfg2 := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestToken2))
+	adminUserClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenAdmin))
+	unallowedUserClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenUnallowed))
+	editclusterClientCfg := clientcfg(auth.UserAuthHeaderWriter("bearer " + Options.TestTokenClusterEditor))
+	agentClientCfg := clientcfg(auth.AgentAuthHeaderWriter(utils_test.FakePS))
+	agent2ClientCfg := clientcfg(auth.AgentAuthHeaderWriter(utils_test.FakePS2))
+	badAgentClientCfg := clientcfg(auth.AgentAuthHeaderWriter(utils_test.WrongPullSecret))
+
+	utils_test.TestContext = utils_test.NewSubsystemTestContext(
+		log,
+		db,
+		client.New(agentClientCfg),
+		client.New(userClientCfg),
+		client.New(agent2ClientCfg),
+		client.New(userClientCfg2),
+		client.New(adminUserClientCfg),
+		client.New(unallowedUserClientCfg),
+		client.New(editclusterClientCfg),
+		client.New(badAgentClientCfg),
+		pollDefaultInterval,
+		pollDefaultTimeout,
+	)
+
 	if Options.AuthType == auth.TypeRHSSO {
-		wiremock = &WireMock{
-			OCMHost:   Options.OCMHost,
-			TestToken: Options.TestToken,
+		releaseSourcesString := os.Getenv("RELEASE_SOURCES")
+		var releaseSources = models.ReleaseSources{}
+		if err := json.Unmarshal([]byte(releaseSourcesString), &releaseSources); err != nil {
+			logrus.Fatal("Fail to parse release sources, ", err)
 		}
-		err = wiremock.DeleteAllWiremockStubs()
+
+		wiremock = &utils_test.WireMock{
+			OCMHost:        Options.OCMHost,
+			TestToken:      Options.TestToken,
+			ReleaseSources: releaseSources,
+		}
+
+		err := wiremock.DeleteAllWiremockStubs()
 		if err != nil {
 			logrus.Fatal("Fail to delete all wiremock stubs, ", err)
 		}
@@ -159,7 +169,7 @@ func init() {
 	}
 
 	// Use the default openshift version
-	if reply, err := userBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(),
+	if reply, err := utils_test.TestContext.UserBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(),
 		&versions.V2ListSupportedOpenshiftVersionsParams{}); err == nil {
 		for openshiftVersionString, openshiftVersionStruct := range reply.GetPayload() {
 			if openshiftVersionStruct.Default {
@@ -172,10 +182,15 @@ func init() {
 
 func TestSubsystem(t *testing.T) {
 	AfterEach(func() {
-		subsystemAfterEach()
+		subsystemAfterEach(utils_test.TestContext)
 	})
 
 	RegisterFailHandler(Fail)
-	subsystemAfterEach() // make sure we start tests from scratch
+	subsystemAfterEach(utils_test.TestContext) // make sure we start tests from scratch
 	RunSpecs(t, "Subsystem Suite")
+}
+
+func subsystemAfterEach(testContext *utils_test.SubsystemTestContext) {
+	testContext.DeregisterResources()
+	testContext.ClearDB()
 }

@@ -30,6 +30,13 @@ func NewDiskPerfCheckCmd(log logrus.FieldLogger, diskPerfCheckImage string, hwVa
 }
 
 func (c *diskPerfCheckCmd) GetSteps(_ context.Context, host *models.Host) ([]*models.Step, error) {
+	inv, err := common.UnmarshalInventory(host.Inventory)
+	if err != nil {
+		return nil, err
+	}
+	if inv.Boot != nil && inv.Boot.DeviceType == models.BootDeviceTypePersistent {
+		return nil, nil
+	}
 	bootDevice, err := hardware.GetBootDevice(c.hwValidator, host)
 	if err != nil {
 		return nil, err

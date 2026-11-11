@@ -10,13 +10,13 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
-	"github.com/openshift/assisted-service/internal/common/testing"
+	commontesting "github.com/openshift/assisted-service/internal/common/testing"
 	"github.com/openshift/assisted-service/internal/constants"
 	"github.com/openshift/assisted-service/internal/dns"
 	"github.com/openshift/assisted-service/internal/events"
@@ -25,6 +25,7 @@ import (
 	"github.com/openshift/assisted-service/internal/host"
 	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/operators"
+	"github.com/openshift/assisted-service/internal/testing"
 	"github.com/openshift/assisted-service/internal/uploader"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/ocm"
@@ -32,6 +33,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -54,7 +56,7 @@ var _ = Describe("Transition tests", func() {
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
 		ctrl = gomock.NewController(GinkgoT())
-		eventsHandler = events.New(db, nil, testing.GetDummyNotificationStream(ctrl), logrus.New())
+		eventsHandler = events.New(db, nil, commontesting.GetDummyNotificationStream(ctrl), logrus.New())
 		uploadClient = uploader.NewClient(&uploader.Config{EnableDataCollection: false}, nil, logrus.New(), nil)
 		mockMetric = metrics.NewMockAPI(ctrl)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
@@ -69,7 +71,7 @@ var _ = Describe("Transition tests", func() {
 
 	Context("cancel_installation", func() {
 		BeforeEach(func() {
-			capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, testing.GetDummyNotificationStream(ctrl), eventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+			capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), eventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 		})
 
 		It("cancel_installation", func() {
@@ -331,7 +333,7 @@ var _ = Describe("Transition tests", func() {
 				}
 				Expect(common.LoadTableFromDB(db, common.MonitoredOperatorsTable).Create(&c).Error).ShouldNot(HaveOccurred())
 				if t.withWorkers {
-					for i := 0; i < MinMastersNeededForInstallation; i++ {
+					for i := 0; i < common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder; i++ {
 						createHost(clusterId, models.HostStatusInstalled, db)
 					}
 					for i := 0; i < 2; i++ {
@@ -366,7 +368,7 @@ var _ = Describe("Transition tests", func() {
 					mockMetric.EXPECT().ClusterInstallationFinished(gomock.Any(), models.ClusterStatusInstalled, models.ClusterStatusFinalizing, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 				}
 
-				capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, testing.GetDummyNotificationStream(ctrl), eventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, ocmClient, mockS3Api, nil, nil, nil, false)
+				capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), eventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, ocmClient, mockS3Api, nil, nil, nil, false, nil)
 
 				// Test
 				clusterAfterRefresh, err := capi.RefreshStatus(ctx, &c, db)
@@ -412,9 +414,9 @@ var _ = Describe("Cancel cluster installation", func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockEventsHandler = eventsapi.NewMockHandler(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		uploadClient = uploader.NewClient(&uploader.Config{EnableDataCollection: false}, nil, logrus.New(), nil)
-		capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, testing.GetDummyNotificationStream(ctrl), mockEventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+		capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEventsHandler, uploadClient, nil, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 	})
 
 	AfterEach(func() {
@@ -450,7 +452,6 @@ var _ = Describe("Cancel cluster installation", func() {
 	}
 
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("cancel from state %s", t.state), func() {
 			clusterId := strfmt.UUID(uuid.New().String())
 			cluster := common.Cluster{
@@ -474,6 +475,9 @@ var _ = Describe("Cancel cluster installation", func() {
 })
 
 var _ = Describe("Reset cluster", func() {
+	timeZero := time.Time{}
+	timeZeroLocal := timeZero.Local()
+
 	var (
 		ctx               = context.Background()
 		dbName            string
@@ -487,8 +491,8 @@ var _ = Describe("Reset cluster", func() {
 		db, dbName = common.PrepareTestDB()
 		ctrl = gomock.NewController(GinkgoT())
 		mockEventsHandler = eventsapi.NewMockHandler(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
-		capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, testing.GetDummyNotificationStream(ctrl), mockEventsHandler, nil, nil, nil, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		capi = NewManager(getDefaultConfig(), common.GetTestLog(), db, commontesting.GetDummyNotificationStream(ctrl), mockEventsHandler, nil, nil, nil, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 	})
 
 	AfterEach(func() {
@@ -517,32 +521,50 @@ var _ = Describe("Reset cluster", func() {
 	}
 
 	for _, t := range tests {
-		t := t
 		clusterId := strfmt.UUID(uuid.New().String())
 		cluster := common.Cluster{
-			Cluster: models.Cluster{ID: &clusterId, Status: swag.String(t.state)},
+			Cluster: models.Cluster{
+				ID:     &clusterId,
+				Status: swag.String(t.state),
+			},
 		}
+		if t.state == models.ClusterStatusFinalizing {
+			cluster.Progress = &models.ClusterProgressInfo{
+				FinalizingStage:                         models.FinalizingStageWaitingForClusterOperators,
+				FinalizingStagePercentage:               42,
+				FinalizingStageStartedAt:                strfmt.DateTime(time.Now()),
+				FinalizingStageTimedOut:                 true,
+				InstallingStagePercentage:               100,
+				PreparingForInstallationStagePercentage: 80,
+				TotalPercentage:                         90,
+			}
+		}
+
 		It(fmt.Sprintf("resets cluster from state %s", t.state), func() {
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 			acceptNewEvents(t.eventsNum)
 			err := capi.ResetCluster(ctx, &cluster, "reason", db)
 			if t.success {
 				Expect(err).ShouldNot(HaveOccurred())
+
+				updatedCluster := getClusterFromDB(clusterId, db)
+				if updatedCluster.Progress != nil {
+					Expect(*updatedCluster.Progress).To(Equal(models.ClusterProgressInfo{FinalizingStageStartedAt: strfmt.DateTime(timeZeroLocal)}))
+				}
 			} else {
 				Expect(err).Should(HaveOccurred())
 				Expect(err.StatusCode()).Should(Equal(t.statusCode))
 			}
 		})
 		It(fmt.Sprintf("resets API VIP and Ingress VIP in case of single node cluster from state %s", t.state), func() {
-			haMode := models.ClusterHighAvailabilityModeNone
 			hostIP := "1.2.3.4"
 			cluster = common.Cluster{
 				Cluster: models.Cluster{
-					ID:                   &clusterId,
-					Status:               swag.String(t.state),
-					HighAvailabilityMode: &haMode,
-					APIVips:              []*models.APIVip{{IP: models.IP(hostIP)}},
-					IngressVips:          []*models.IngressVip{{IP: models.IP(hostIP)}},
+					ID:                &clusterId,
+					Status:            swag.String(t.state),
+					ControlPlaneCount: 1,
+					APIVips:           []*models.APIVip{{IP: models.IP(hostIP)}},
+					IngressVips:       []*models.IngressVip{{IP: models.IP(hostIP)}},
 				},
 			}
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
@@ -553,11 +575,43 @@ var _ = Describe("Reset cluster", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(len(cluster.Cluster.APIVips)).Should(Equal(0))
 				Expect(len(cluster.Cluster.IngressVips)).Should(Equal(0))
+
+				updatedCluster := getClusterFromDB(clusterId, db)
+				if updatedCluster.Progress != nil {
+					Expect(*updatedCluster.Progress).To(Equal(models.ClusterProgressInfo{FinalizingStageStartedAt: strfmt.DateTime(timeZeroLocal)}))
+				}
 			} else {
 				Expect(err).Should(HaveOccurred())
 				Expect(err.StatusCode()).Should(Equal(t.statusCode))
 				Expect(len(cluster.Cluster.APIVips)).ShouldNot(Equal(0))
 				Expect(len(cluster.Cluster.IngressVips)).ShouldNot(Equal(0))
+			}
+		})
+
+		It(fmt.Sprintf("resets LastInstallationPreparation in case of cluster reset from state %s", t.state), func() {
+			cluster = common.Cluster{
+				Cluster: models.Cluster{
+					ID:     &clusterId,
+					Status: swag.String(t.state),
+					LastInstallationPreparation: models.LastInstallationPreparation{
+						Status: models.LastInstallationPreparationStatusSuccess,
+						Reason: constants.InstallationPreparationReasonSuccess,
+					},
+				},
+			}
+			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+			acceptNewEvents(t.eventsNum)
+			err := capi.ResetCluster(ctx, &cluster, "reason", db)
+			cluster = getClusterFromDB(clusterId, db)
+			if t.success {
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(cluster.Cluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusNotStarted))
+				Expect(cluster.Cluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonNotPerformed))
+			} else {
+				Expect(err).Should(HaveOccurred())
+				Expect(err.StatusCode()).Should(Equal(t.statusCode))
+				Expect(cluster.Cluster.LastInstallationPreparation.Status).Should(Equal(models.LastInstallationPreparationStatusSuccess))
+				Expect(cluster.Cluster.LastInstallationPreparation.Reason).Should(Equal(constants.InstallationPreparationReasonSuccess))
 			}
 		})
 	}
@@ -619,17 +673,17 @@ func makeJsonChecker(expected map[ValidationID]validationCheckResult) *validatio
 
 var _ = Describe("Refresh Cluster - No DHCP", func() {
 	var (
-		ctx                                     = context.Background()
-		db                                      *gorm.DB
-		clusterId, hid1, hid2, hid3, hid4, hid5 strfmt.UUID
-		cluster                                 common.Cluster
-		clusterApi                              *Manager
-		mockEvents                              *eventsapi.MockHandler
-		mockHostAPI                             *host.MockAPI
-		mockMetric                              *metrics.MockAPI
-		ctrl                                    *gomock.Controller
-		dbName                                  string
-		mockS3Api                               *s3wrapper.MockAPI
+		ctx                                           = context.Background()
+		db                                            *gorm.DB
+		clusterId, hid1, hid2, hid3, hid4, hid5, hid6 strfmt.UUID
+		cluster                                       common.Cluster
+		clusterApi                                    *Manager
+		mockEvents                                    *eventsapi.MockHandler
+		mockHostAPI                                   *host.MockAPI
+		mockMetric                                    *metrics.MockAPI
+		ctrl                                          *gomock.Controller
+		dbName                                        string
+		mockS3Api                                     *s3wrapper.MockAPI
 	)
 
 	type candidateChecker func()
@@ -638,9 +692,9 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 		mockHostAPI.EXPECT().IsRequireUserActionReset(gomock.Any()).Return(false).AnyTimes()
 	}
 
-	checkMasterCandidates := func(times int) candidateChecker {
+	checkCandidates := func(times int) candidateChecker {
 		return func() {
-			mockHostAPI.EXPECT().IsValidMasterCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(times)
+			mockHostAPI.EXPECT().IsValidCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).Times(times)
 		}
 	}
 
@@ -650,11 +704,11 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
 		mockS3Api.EXPECT().DoesObjectExist(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -686,6 +740,8 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 			validationsChecker *validationsChecker
 			candidateChecker   candidateChecker
 			errorExpected      bool
+			openshiftVersion   string
+			controlPlaneCount  int64
 		}{
 			{
 				name:          "pending-for-input to pending-for-input",
@@ -698,8 +754,6 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -714,8 +768,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
@@ -730,8 +786,6 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -746,8 +800,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
@@ -763,8 +819,6 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -779,8 +833,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
@@ -796,8 +852,6 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -812,8 +866,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
@@ -828,8 +884,6 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster, Inventory: common.GenerateTestDefaultInventory()},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -844,8 +898,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
@@ -882,7 +938,7 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				errorExpected: false,
 			},
 			{
-				name:          "pending-for-input to pending-for-input with 3 master 2 workers candidates in auto-assign mode",
+				name:          "pending-for-input to pending-for-input with 5 hosts in auto-assign mode",
 				srcState:      models.ClusterStatusPendingForInput,
 				dstState:      models.ClusterStatusPendingForInput,
 				apiVips:       nil,
@@ -896,7 +952,7 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
 					{ID: &hid5, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
 				},
-				candidateChecker:  checkMasterCandidates(3),
+				candidateChecker:  checkCandidates(3),
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
 					IsMachineCidrDefined:                {status: ValidationFailure, messagePattern: "The Machine Network CIDR is undefined"},
@@ -915,7 +971,71 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				errorExpected: false,
 			},
 			{
-				name:            "pending-for-input to insufficient - masters > 3",
+				name:          "pending-for-input to pending-for-input - TNA cluster with 3 hosts in auto-assign mode",
+				srcState:      models.ClusterStatusPendingForInput,
+				dstState:      models.ClusterStatusPendingForInput,
+				apiVips:       nil,
+				ingressVips:   nil,
+				dnsDomain:     "test.com",
+				pullSecretSet: true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
+				},
+				candidateChecker:  checkCandidates(3),
+				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationFailure, messagePattern: "The Machine Network CIDR is undefined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationPending, messagePattern: "The Machine Network CIDR, API virtual IPs, or Ingress virtual IPs are undefined."},
+					AreApiVipsDefined:                   {status: ValidationFailure, messagePattern: "API virtual IPs are undefined and must be provided"},
+					AreApiVipsValid:                     {status: ValidationPending, messagePattern: "API virtual IPs are undefined"},
+					AreIngressVipsDefined:               {status: ValidationFailure, messagePattern: "Ingress virtual IPs are undefined and must be provided"},
+					AreIngressVipsValid:                 {status: ValidationPending, messagePattern: "Ingress virtual IPs are undefined"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount: {status: ValidationSuccess,
+						messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "pending-for-input to pending-for-input - TNF cluster",
+				srcState:      models.ClusterStatusPendingForInput,
+				dstState:      models.ClusterStatusPendingForInput,
+				apiVips:       nil,
+				ingressVips:   nil,
+				dnsDomain:     "test.com",
+				pullSecretSet: true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationFailure, messagePattern: "The Machine Network CIDR is undefined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationPending, messagePattern: "The Machine Network CIDR, API virtual IPs, or Ingress virtual IPs are undefined."},
+					AreApiVipsDefined:                   {status: ValidationFailure, messagePattern: "API virtual IPs are undefined and must be provided"},
+					AreApiVipsValid:                     {status: ValidationPending, messagePattern: "API virtual IPs are undefined"},
+					AreIngressVipsDefined:               {status: ValidationFailure, messagePattern: "Ingress virtual IPs are undefined and must be provided"},
+					AreIngressVipsValid:                 {status: ValidationPending, messagePattern: "Ingress virtual IPs are undefined"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount: {status: ValidationSuccess,
+						messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to insufficient, too much masters - non-standard HA OCP Control Plane not available",
 				srcState:        models.ClusterStatusPendingForInput,
 				dstState:        models.ClusterStatusInsufficient,
 				machineNetworks: common.TestIPv4Networking.MachineNetworks,
@@ -942,13 +1062,114 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
 			{
-				name:            "pending-for-input to insufficient - worker = 1 with auto-assign",
+				name:            "pending-for-input to insufficient, not enough masters - non-standard HA OCP Control Plane not available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount: {status: ValidationFailure,
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
+				}),
+				errorExpected: false,
+			},
+			{
+				name:            "pending-for-input to insufficient, too much masters - non-standard HA OCP Control Plane available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid5, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid6, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster}},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 5 dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+				controlPlaneCount: 5,
+			},
+			{
+				name:            "pending-for-input to insufficient, not enough masters - non-standard HA OCP Control Plane available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 4 dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+				controlPlaneCount: 4,
+			},
+			{
+				name:            "pending-for-input to ready, sufficient amount of potential masters - non-standard HA OCP Control Plane not available",
 				srcState:        models.ClusterStatusPendingForInput,
 				dstState:        models.ClusterStatusReady,
 				machineNetworks: common.TestIPv4Networking.MachineNetworks,
@@ -957,12 +1178,10 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				dnsDomain:       "test.com",
 				pullSecretSet:   true,
 				hosts: []models.Host{
-					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
-					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleAutoAssign},
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
 				},
-				candidateChecker:  checkMasterCandidates(3),
 				statusInfoChecker: makeValueChecker(StatusInfoReady),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
 					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
@@ -980,7 +1199,166 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				errorExpected: false,
 			},
 			{
-				name:            "pending-for-input to insufficient - worker = 1",
+				name:            "pending-for-input to ready, sufficient amount of potential masters - non-standard HA OCP Control Plane available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusReady,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid5, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoReady),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+				controlPlaneCount: 5,
+			},
+			{
+				name:            "pending-for-input to ready, TNA Cluster - sufficient amount of potential masters with arbiter",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusReady,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoReady),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to insufficient, TNA Cluster - sufficient amount of potential masters without arbiter",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to ready, TNF Cluster - valid TNF",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusReady,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoReady),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to insufficient, TNF Cluster - invalid TNF because masters don't have fencing credentials",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to ready, sufficient amount of masters - 1 worker",
 				srcState:        models.ClusterStatusPendingForInput,
 				dstState:        models.ClusterStatusReady,
 				machineNetworks: common.TestIPv4Networking.MachineNetworks,
@@ -1253,6 +1631,47 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				errorExpected:      false,
 			},
 			{
+				name:            "finalizing to finalizing - TNA Cluster",
+				srcState:        models.ClusterStatusFinalizing,
+				srcStatusInfo:   statusInfoFinalizing,
+				dstState:        models.ClusterStatusFinalizing,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoFinalizing),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForArbiterClusters,
+				controlPlaneCount:  2,
+			},
+			{
+				name:            "finalizing to finalizing - TNF Cluster",
+				srcState:        models.ClusterStatusFinalizing,
+				srcStatusInfo:   statusInfoFinalizing,
+				dstState:        models.ClusterStatusFinalizing,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoFinalizing),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount:  2,
+			},
+			{
 				name:            "error to error",
 				srcState:        models.ClusterStatusError,
 				dstState:        models.ClusterStatusError,
@@ -1314,6 +1733,47 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 				validationsChecker: nil,
 				errorExpected:      false,
 			},
+			{
+				name:            "Installing to Installing - TNA Cluster",
+				srcState:        models.ClusterStatusInstalling,
+				srcStatusInfo:   statusInfoInstalling,
+				dstState:        models.ClusterStatusInstalling,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoInstalling),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForArbiterClusters,
+				controlPlaneCount:  2,
+			},
+			{
+				name:            "Installing to Installing - TNF Cluster",
+				srcState:        models.ClusterStatusInstalling,
+				srcStatusInfo:   statusInfoInstalling,
+				dstState:        models.ClusterStatusInstalling,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoInstalling),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount:  2,
+			},
 		}
 
 		for i := range tests {
@@ -1321,20 +1781,31 @@ var _ = Describe("Refresh Cluster - No DHCP", func() {
 			It(t.name, func() {
 				cluster = common.Cluster{
 					Cluster: models.Cluster{
-						APIVips:         t.apiVips,
-						ID:              &clusterId,
-						IngressVips:     t.ingressVips,
-						MachineNetworks: t.machineNetworks,
-						Status:          &t.srcState,
-						StatusInfo:      &t.srcStatusInfo,
-						BaseDNSDomain:   t.dnsDomain,
-						PullSecretSet:   t.pullSecretSet,
-						ClusterNetworks: common.TestIPv4Networking.ClusterNetworks,
-						ServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
-						NetworkType:     swag.String(models.ClusterNetworkTypeOVNKubernetes),
-						StatusUpdatedAt: strfmt.DateTime(time.Now()),
+						APIVips:           t.apiVips,
+						ID:                &clusterId,
+						IngressVips:       t.ingressVips,
+						MachineNetworks:   t.machineNetworks,
+						Status:            &t.srcState,
+						StatusInfo:        &t.srcStatusInfo,
+						BaseDNSDomain:     t.dnsDomain,
+						PullSecretSet:     t.pullSecretSet,
+						ClusterNetworks:   common.TestIPv4Networking.ClusterNetworks,
+						ServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+						NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+						StatusUpdatedAt:   strfmt.DateTime(time.Now()),
+						OpenshiftVersion:  t.openshiftVersion,
+						ControlPlaneCount: t.controlPlaneCount,
 					},
 				}
+
+				if cluster.Cluster.OpenshiftVersion == "" {
+					cluster.Cluster.OpenshiftVersion = testing.ValidOCPVersionForNonStandardHAOCPControlPlane
+				}
+
+				if cluster.ControlPlaneCount == 0 {
+					cluster.ControlPlaneCount = 3
+				}
+
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 				for i := range t.hosts {
 					t.hosts[i].InfraEnvID = clusterId
@@ -1400,12 +1871,12 @@ var _ = Describe("Refresh Cluster - Same networks", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
 		mockS3Api.EXPECT().DoesObjectExist(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
 
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -1591,18 +2062,20 @@ var _ = Describe("Refresh Cluster - Same networks", func() {
 			It(t.name, func() {
 				cluster = common.Cluster{
 					Cluster: models.Cluster{
-						APIVips:         t.apiVips,
-						ID:              &clusterId,
-						IngressVips:     t.ingressVips,
-						MachineNetworks: t.machineNetworks,
-						Status:          &t.srcState,
-						StatusInfo:      &t.srcStatusInfo,
-						BaseDNSDomain:   t.dnsDomain,
-						PullSecretSet:   t.pullSecretSet,
-						ClusterNetworks: t.clusterNetworks,
-						ServiceNetworks: t.serviceNetworks,
-						NetworkType:     swag.String(models.ClusterNetworkTypeOVNKubernetes),
-						StatusUpdatedAt: strfmt.DateTime(time.Now()),
+						APIVips:           t.apiVips,
+						ID:                &clusterId,
+						IngressVips:       t.ingressVips,
+						MachineNetworks:   t.machineNetworks,
+						Status:            &t.srcState,
+						StatusInfo:        &t.srcStatusInfo,
+						BaseDNSDomain:     t.dnsDomain,
+						PullSecretSet:     t.pullSecretSet,
+						ClusterNetworks:   t.clusterNetworks,
+						ServiceNetworks:   t.serviceNetworks,
+						NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+						StatusUpdatedAt:   strfmt.DateTime(time.Now()),
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 3,
 					},
 				}
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
@@ -1667,12 +2140,12 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		dnsApi := dns.NewDNSHandler(nil, common.GetTestLog())
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, dnsApi, nil, nil, false)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, dnsApi, nil, nil, false, nil)
 
-		mockHostAPI.EXPECT().IsValidMasterCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
+		mockHostAPI.EXPECT().IsValidCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
 		hid3 = strfmt.UUID(uuid.New().String())
@@ -1685,23 +2158,25 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 	})
 
 	tests := []struct {
-		name               string
-		apiVip             string
-		apiVips            []*models.APIVip
-		ingressVip         string
-		ingressVips        []*models.IngressVip
-		dstState           string
-		installationStatus string
-		hosts              []models.Host
-		statusInfoChecker  statusInfoChecker
-		validationsChecker *validationsChecker
+		name                              string
+		apiVip                            string
+		apiVips                           []*models.APIVip
+		ingressVip                        string
+		ingressVips                       []*models.IngressVip
+		dstState                          string
+		lastInstallationPreparationStatus string
+		lastInstallationPreparationReason string
+		hosts                             []models.Host
+		statusInfoChecker                 statusInfoChecker
+		validationsChecker                *validationsChecker
 	}{
 		{
-			name:               "no change",
-			apiVips:            common.TestIPv4Networking.APIVips,
-			ingressVips:        common.TestIPv4Networking.IngressVips,
-			dstState:           models.ClusterStatusPreparingForInstallation,
-			installationStatus: models.LastInstallationPreparationStatusNotStarted,
+			name:                              "no change",
+			apiVips:                           common.TestIPv4Networking.APIVips,
+			ingressVips:                       common.TestIPv4Networking.IngressVips,
+			dstState:                          models.ClusterStatusPreparingForInstallation,
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusNotStarted,
+			lastInstallationPreparationReason: constants.InstallationPreparationReasonNotPerformed,
 			hosts: []models.Host{
 				{
 					ID:     &hid1,
@@ -1719,11 +2194,12 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 			statusInfoChecker: makeValueChecker(statusInfoPreparingForInstallation),
 		},
 		{
-			name:               "one insufficient host",
-			apiVips:            common.TestIPv4Networking.APIVips,
-			ingressVips:        common.TestIPv4Networking.IngressVips,
-			dstState:           models.ClusterStatusInsufficient,
-			installationStatus: models.LastInstallationPreparationStatusNotStarted,
+			name:                              "one insufficient host",
+			apiVips:                           common.TestIPv4Networking.APIVips,
+			ingressVips:                       common.TestIPv4Networking.IngressVips,
+			dstState:                          models.ClusterStatusInsufficient,
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusNotStarted,
+			lastInstallationPreparationReason: constants.InstallationPreparationReasonNotPerformed,
 			hosts: []models.Host{
 				{
 					ID:     &hid1,
@@ -1759,8 +2235,9 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 					Status: swag.String(models.HostStatusInsufficient),
 				},
 			},
-			installationStatus: models.LastInstallationPreparationStatusFailed,
-			statusInfoChecker:  makeValueChecker(statusInfoUnpreparingHostExists),
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusFailed,
+			lastInstallationPreparationReason: "arbitrary failure reason",
+			statusInfoChecker:                 makeValueChecker(statusInfoUnpreparingHostExists),
 		},
 		{
 			name:        "one insufficient host + preparation succeeded",
@@ -1781,8 +2258,9 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 					Status: swag.String(models.HostStatusInsufficient),
 				},
 			},
-			installationStatus: models.LastInstallationPreparationStatusSuccess,
-			statusInfoChecker:  makeValueChecker(statusInfoUnpreparingHostExists),
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusSuccess,
+			lastInstallationPreparationReason: constants.InstallationPreparationReasonSuccess,
+			statusInfoChecker:                 makeValueChecker(statusInfoUnpreparingHostExists),
 		},
 		{
 			name:        "preparation failed",
@@ -1803,8 +2281,9 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 					Status: swag.String(models.HostStatusPreparingForInstallation),
 				},
 			},
-			installationStatus: models.LastInstallationPreparationStatusFailed,
-			statusInfoChecker:  makeValueChecker(statusInfoClusterFailedToPrepare),
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusFailed,
+			lastInstallationPreparationReason: "arbitrary failure reason",
+			statusInfoChecker:                 makeValueChecker(statusInfoClusterFailedToPrepare),
 		},
 		{
 			name:        "all hosts prepared + preparation succeeded",
@@ -1825,8 +2304,9 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 					Status: swag.String(models.HostStatusPreparingSuccessful),
 				},
 			},
-			installationStatus: models.LastInstallationPreparationStatusSuccess,
-			statusInfoChecker:  makeValueChecker(statusInfoInstalling),
+			lastInstallationPreparationStatus: models.LastInstallationPreparationStatusSuccess,
+			lastInstallationPreparationReason: constants.InstallationPreparationReasonSuccess,
+			statusInfoChecker:                 makeValueChecker(statusInfoInstalling),
 		},
 	}
 	for i := range tests {
@@ -1843,9 +2323,11 @@ var _ = Describe("RefreshCluster - preparing for install", func() {
 					StatusInfo:      swag.String(statusInfoPreparingForInstallation),
 					StatusUpdatedAt: strfmt.DateTime(time.Now()),
 					LastInstallationPreparation: models.LastInstallationPreparation{
-						Status: t.installationStatus,
-						Reason: "",
+						Status: t.lastInstallationPreparationStatus,
+						Reason: t.lastInstallationPreparationReason,
 					},
+					OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+					ControlPlaneCount: 3,
 				},
 			}
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
@@ -1902,9 +2384,9 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -1941,6 +2423,7 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 			vipDhcpAllocation     bool
 			networkType           string
 			sno                   bool
+			controlPlaneCount     int64
 		}{
 			{
 				name:            "pending-for-input to pending-for-input",
@@ -2003,7 +2486,7 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 					isServiceCidrDefined:                {status: ValidationFailure, messagePattern: "Service Network CIDR is undefined"},
 					noCidrOverlapping:                   {status: ValidationPending, messagePattern: "At least one of the CIDRs .Cluster Network, Service Network. is undefined"},
 					networkPrefixValid:                  {status: ValidationPending, messagePattern: "Cluster Network CIDR is undefined"},
-					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN or OVNKubernetes"},
+					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN, OVNKubernetes, Cilium, Calico, CiscoACI, or None"},
 				}),
 				errorExpected:         false,
 				userManagedNetworking: true,
@@ -2084,7 +2567,8 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 					networkPrefixValid:                  {status: ValidationFailure, messagePattern: "Host prefix, now 0, must be a positive integer"},
 					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
 				}),
-				errorExpected: false,
+				errorExpected:     false,
+				controlPlaneCount: 1,
 			},
 			{
 				name:     "pending-for-input to insufficient - overlapping",
@@ -2366,9 +2850,10 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 					isServiceCidrDefined:                {status: ValidationSuccess, messagePattern: "Service Network CIDR is defined"},
 					noCidrOverlapping:                   {status: ValidationSuccess, messagePattern: "No CIDRS are overlapping"},
 					networkPrefixValid:                  {status: ValidationSuccess, messagePattern: "Cluster Network prefix is valid."},
-					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: regexp.QuoteMeta("High-availability mode 'None' (SNO) is not supported by OpenShiftSDN; use another network type instead")},
+					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: regexp.QuoteMeta("Control Plane Count '1' (SNO) is not supported by OpenShiftSDN; use another network type instead")},
 				}),
-				errorExpected: false,
+				errorExpected:     false,
+				controlPlaneCount: 1,
 			},
 		}
 
@@ -2390,11 +2875,17 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 						UserManagedNetworking: &t.userManagedNetworking,
 						NetworkType:           &t.networkType,
 						VipDhcpAllocation:     &t.vipDhcpAllocation,
+						OpenshiftVersion:      testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount:     t.controlPlaneCount,
 					},
 				}
+
+				if cluster.ControlPlaneCount == 0 {
+					cluster.ControlPlaneCount = 3
+				}
+
 				if t.sno {
-					ha := models.ClusterHighAvailabilityModeNone
-					cluster.HighAvailabilityMode = &ha
+					cluster.ControlPlaneCount = 1
 				}
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 
@@ -2514,7 +3005,7 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 					isServiceCidrDefined:                {status: ValidationFailure, messagePattern: "Service Network CIDR is undefined"},
 					noCidrOverlapping:                   {status: ValidationPending, messagePattern: "At least one of the CIDRs .Cluster Network, Service Network. is undefined"},
 					networkPrefixValid:                  {status: ValidationPending, messagePattern: "Cluster Network CIDR is undefined"},
-					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN or OVNKubernetes"}}),
+					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN, OVNKubernetes, Cilium, Calico, CiscoACI, or None"}}),
 				errorExpected:         false,
 				userManagedNetworking: true,
 			},
@@ -2548,12 +3039,12 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 					isServiceCidrDefined:                {status: ValidationFailure, messagePattern: "Service Network CIDR is undefined"},
 					noCidrOverlapping:                   {status: ValidationPending, messagePattern: "At least one of the CIDRs .Cluster Network, Service Network. is undefined"},
 					networkPrefixValid:                  {status: ValidationPending, messagePattern: "Cluster Network CIDR is undefined"},
-					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN or OVNKubernetes"}}),
+					isNetworkTypeValid:                  {status: ValidationFailure, messagePattern: "The network type is not valid; the valid network types are OpenShiftSDN, OVNKubernetes, Cilium, Calico, CiscoACI, or None"}}),
 				errorExpected:         false,
 				userManagedNetworking: true,
 			},
 			{
-				name:            "pending-for-input to ready user-managed-networking testing_now",
+				name:            "pending-for-input to ready user-managed-networking commontesting_now",
 				srcState:        models.ClusterStatusPendingForInput,
 				dstState:        models.ClusterStatusReady,
 				clusterNetworks: common.TestIPv6Networking.ClusterNetworks,
@@ -2857,6 +3348,8 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 						BaseDNSDomain:         "test.com",
 						UserManagedNetworking: &t.userManagedNetworking,
 						NetworkType:           &t.networkType,
+						OpenshiftVersion:      testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount:     3,
 					},
 				}
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
@@ -2897,17 +3390,17 @@ var _ = Describe("Refresh Cluster - Advanced networking validations", func() {
 
 var _ = Describe("Refresh Cluster - With DHCP", func() {
 	var (
-		ctx                                     = context.Background()
-		db                                      *gorm.DB
-		clusterId, hid1, hid2, hid3, hid4, hid5 strfmt.UUID
-		cluster                                 common.Cluster
-		clusterApi                              *Manager
-		mockEvents                              *eventsapi.MockHandler
-		mockHostAPI                             *host.MockAPI
-		mockMetric                              *metrics.MockAPI
-		ctrl                                    *gomock.Controller
-		dbName                                  string
-		mockS3Api                               *s3wrapper.MockAPI
+		ctx                                           = context.Background()
+		db                                            *gorm.DB
+		clusterId, hid1, hid2, hid3, hid4, hid5, hid6 strfmt.UUID
+		cluster                                       common.Cluster
+		clusterApi                                    *Manager
+		mockEvents                                    *eventsapi.MockHandler
+		mockHostAPI                                   *host.MockAPI
+		mockMetric                                    *metrics.MockAPI
+		ctrl                                          *gomock.Controller
+		dbName                                        string
+		mockS3Api                                     *s3wrapper.MockAPI
 	)
 
 	mockHostAPIIsRequireUserActionResetFalse := func() {
@@ -2920,17 +3413,18 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
 		mockS3Api.EXPECT().DoesObjectExist(gomock.Any(), gomock.Any()).Return(false, nil).AnyTimes()
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
 		hid3 = strfmt.UUID(uuid.New().String())
 		hid4 = strfmt.UUID(uuid.New().String())
 		hid5 = strfmt.UUID(uuid.New().String())
+		hid6 = strfmt.UUID(uuid.New().String())
 		clusterId = strfmt.UUID(uuid.New().String())
 	})
 
@@ -2977,6 +3471,8 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 			setMachineCidrUpdatedAt bool
 			vipDhcpAllocation       bool
 			errorExpected           bool
+			openshiftVersion        string
+			controlPlaneCount       int64
 		}{
 			{
 				name:              "pending-for-input to pending-for-input",
@@ -2992,8 +3488,6 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 				hosts: []models.Host{
 					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
-					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Role: models.HostRoleMaster},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoPendingForInput),
 				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
@@ -3007,13 +3501,15 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
 			},
 			{
-				name:            "pending-for-input to insufficient - masters > 3",
+				name:            "pending-for-input to insufficient, too much masters - non-standard HA OCP Control Plane not available",
 				srcState:        models.ClusterStatusPendingForInput,
 				dstState:        models.ClusterStatusInsufficient,
 				machineNetworks: common.TestIPv4Networking.MachineNetworks,
@@ -3039,10 +3535,234 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
 					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
 					SufficientMastersCount: {status: ValidationFailure,
-						messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
-							common.MinMasterHostsNeededForInstallation)},
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
 				}),
 				errorExpected: false,
+			},
+			{
+				name:            "pending-for-input to insufficient, not enough masters - non-standard HA OCP Control Plane not available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
+					SufficientMastersCount: {status: ValidationFailure,
+						messagePattern: fmt.Sprintf(
+							"The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.",
+							common.AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder,
+						)},
+				}),
+				errorExpected: false,
+			},
+			{
+				name:            "pending-for-input to insufficient, too much masters - non-standard HA OCP Control Plane available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid5, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid6, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 5 dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+				controlPlaneCount: 5,
+			},
+			{
+				name:            "pending-for-input to insufficient, not enough masters - non-standard HA OCP Control Plane available",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set."},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 4 dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+				controlPlaneCount: 4,
+			},
+			{
+				name:            "pending-for-input to ready, TNA Cluster - sufficient amount of potential masters with arbiter",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusReady,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoReady),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to insufficient, TNA Cluster - sufficient amount of potential masters without arbiter",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to ready, TNF Cluster - valid TNF",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusReady,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoReady),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+			},
+			{
+				name:            "pending-for-input to insufficient, TNF Cluster - invalid TNF because masters don't have fencing credentials",
+				srcState:        models.ClusterStatusPendingForInput,
+				dstState:        models.ClusterStatusInsufficient,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+				},
+				statusInfoChecker: makeValueChecker(StatusInfoInsufficient),
+				validationsChecker: makeJsonChecker(map[ValidationID]validationCheckResult{
+					IsMachineCidrDefined:                {status: ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+					IsMachineCidrEqualsToCalculatedCidr: {status: ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+					AreApiVipsDefined:                   {status: ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+					AreApiVipsValid:                     {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AreIngressVipsDefined:               {status: ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+					AreIngressVipsValid:                 {status: ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use"},
+					AllHostsAreReadyToInstall:           {status: ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+					IsDNSDomainDefined:                  {status: ValidationSuccess, messagePattern: "The base domain is defined"},
+					IsPullSecretSet:                     {status: ValidationSuccess, messagePattern: "The pull secret is set"},
+					isNetworkTypeValid:                  {status: ValidationSuccess, messagePattern: "The cluster has a valid network type"},
+					SufficientMastersCount:              {status: ValidationFailure, messagePattern: "The cluster must have exactly 2 dedicated control plane nodes and at least 1 arbiter node or the control plane nodes must have fencing credentials. Add or remove hosts, or change their roles configurations to meet the requirement."},
+				}),
+				errorExpected:     false,
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
 			},
 			{
 				name:            "pending-for-input to insufficient - not all hosts are ready to install - not enough workers",
@@ -3382,6 +4102,47 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 				errorExpected:      false,
 			},
 			{
+				name:            "finalizing to finalizing - TNA Cluster",
+				srcState:        models.ClusterStatusFinalizing,
+				srcStatusInfo:   statusInfoFinalizing,
+				dstState:        models.ClusterStatusFinalizing,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoFinalizing),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForArbiterClusters,
+				controlPlaneCount:  2,
+			},
+			{
+				name:            "finalizing to finalizing - TNF Cluster",
+				srcState:        models.ClusterStatusFinalizing,
+				srcStatusInfo:   statusInfoFinalizing,
+				dstState:        models.ClusterStatusFinalizing,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusKnown), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoFinalizing),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount:  2,
+			},
+			{
 				name:            "error to error",
 				srcState:        models.ClusterStatusError,
 				dstState:        models.ClusterStatusError,
@@ -3441,6 +4202,47 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 				validationsChecker: nil,
 				errorExpected:      false,
 			},
+			{
+				name:            "Installing to Installing - TNA Cluster",
+				srcState:        models.ClusterStatusInstalling,
+				srcStatusInfo:   statusInfoInstalling,
+				dstState:        models.ClusterStatusInstalling,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoInstalling),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForArbiterClusters,
+				controlPlaneCount:  2,
+			},
+			{
+				name:            "Installing to Installing - TNF Cluster",
+				srcState:        models.ClusterStatusInstalling,
+				srcStatusInfo:   statusInfoInstalling,
+				dstState:        models.ClusterStatusInstalling,
+				machineNetworks: common.TestIPv4Networking.MachineNetworks,
+				apiVips:         common.TestIPv4Networking.APIVips,
+				ingressVips:     common.TestIPv4Networking.IngressVips,
+				dnsDomain:       "test.com",
+				pullSecretSet:   true,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker:  makeValueChecker(statusInfoInstalling),
+				validationsChecker: nil,
+				errorExpected:      false,
+				openshiftVersion:   common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount:  2,
+			},
 		}
 
 		for i := range tests {
@@ -3461,8 +4263,19 @@ var _ = Describe("Refresh Cluster - With DHCP", func() {
 						ServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
 						NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
 						StatusUpdatedAt:   strfmt.DateTime(time.Now()),
+						OpenshiftVersion:  t.openshiftVersion,
+						ControlPlaneCount: t.controlPlaneCount,
 					},
 				}
+
+				if cluster.Cluster.OpenshiftVersion == "" {
+					cluster.Cluster.OpenshiftVersion = testing.ValidOCPVersionForNonStandardHAOCPControlPlane
+				}
+
+				if cluster.ControlPlaneCount == 0 {
+					cluster.ControlPlaneCount = 3
+				}
+
 				if t.setMachineCidrUpdatedAt {
 					cluster.MachineNetworkCidrUpdatedAt = time.Now()
 				} else {
@@ -3535,9 +4348,9 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
-		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false)
+		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -3568,9 +4381,11 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 			installationTimeout bool
 			vipDhcpAllocation   bool
 			operators           []*models.MonitoredOperator
+			openshiftVersion    string
+			controlPlaneCount   int64
 		}{
 			{
-				name:          "installing to installing",
+				name:          "installing to installing - non non-standard HA OCP Control Plane",
 				srcState:      models.ClusterStatusInstalling,
 				srcStatusInfo: statusInfoInstalling,
 				dstState:      models.ClusterStatusInstalling,
@@ -3582,6 +4397,49 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid5, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+			},
+			{
+				name:          "installing to installing - non-standard HA OCP Control Plane",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusInstalling,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid5, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+					{ID: &hid6, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+			},
+			{
+				name:          "installing to installing - TNA Cluster",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusInstalling,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing to installing - TNF Cluster",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusInstalling,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "valid"},
+					{ID: &hid2, Status: swag.String(models.ClusterStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "valid"},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "installing to installing-pending-user-action",
@@ -3612,6 +4470,34 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
 			},
 			{
+				name:          "installing to installing-pending-user-action - with arbiter host",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusInstallingPendingUserAction,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing to installing-pending-user-action - with arbiter host (2)",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusInstallingPendingUserAction,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
 				name:          "finalizing to installing-pending-user-action",
 				srcState:      models.ClusterStatusFinalizing,
 				srcStatusInfo: statusInfoFinalizing,
@@ -3625,6 +4511,20 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid6, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+			},
+			{
+				name:          "finalizing to installing-pending-user-action - with arbiter host",
+				srcState:      models.ClusterStatusFinalizing,
+				srcStatusInfo: statusInfoFinalizing,
+				dstState:      models.ClusterStatusInstallingPendingUserAction,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid6, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "installing-pending-user-action to installing-pending-user-action",
@@ -3653,6 +4553,34 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid5, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+			},
+			{
+				name:          "installing-pending-user-action to installing-pending-user-action - with arbiter host",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusInstallingPendingUserAction,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing-pending-user-action to installing-pending-user-action - with arbiter host (2)",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusInstallingPendingUserAction,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstallingPendingUserAction), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstallingPendingUserAction),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "installing-pending-user-action to error",
@@ -3698,6 +4626,35 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 				installationTimeout: true,
 			},
 			{
+				name:          "installing-pending-user-action to error - arbiter host error",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusError,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusError), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoError),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing-pending-user-action to error - 3 masters installing and arbiter host error",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusError,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.HostStatusError), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoError),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 3,
+			},
+			{
 				name:          "installing-pending-user-action to installing",
 				srcState:      models.ClusterStatusInstallingPendingUserAction,
 				srcStatusInfo: statusInfoInstallingPendingUserAction,
@@ -3710,6 +4667,20 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid5, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+			},
+			{
+				name:          "installing-pending-user-action to installing - with arbiter host",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusInstalling,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoInstalling),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "installing-pending-user-action to finalizing",
@@ -3742,7 +4713,36 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
 			},
 			{
-				name:          "installing to finalizing",
+				name:          "installing-pending-user-action to finalizing - with arbiter host",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing-pending-user-action to finalizing - with one arbiter host installed and another in progress",
+				srcState:      models.ClusterStatusInstallingPendingUserAction,
+				srcStatusInfo: statusInfoInstallingPendingUserAction,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+					{ID: &hid4, Status: swag.String(models.HostStatusInstallingInProgress), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing to finalizing - non non-standard HA OCP Control Plane",
 				srcState:      models.ClusterStatusInstalling,
 				srcStatusInfo: statusInfoInstalling,
 				dstState:      models.ClusterStatusFinalizing,
@@ -3754,6 +4754,48 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid5, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+			},
+			{
+				name:          "installing to finalizing - non-standard HA OCP Control Plane",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid4, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+					{ID: &hid5, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForNonStandardHAOCPControlPlane,
+			},
+			{
+				name:          "installing to finalizing - TNA Cluster",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+			},
+			{
+				name:          "installing to finalizing - TNF Cluster",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "installing to error - failing master",
@@ -3782,6 +4824,20 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					{ID: &hid5, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
 				},
 				statusInfoChecker: makeValueChecker(statusInfoError),
+			},
+			{
+				name:          "installing to error - failing arbiter",
+				srcState:      models.ClusterStatusInstalling,
+				srcStatusInfo: statusInfoInstalling,
+				dstState:      models.ClusterStatusError,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalling), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusError), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoError),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
 			},
 			{
 				name:          "finalizing to error due to timeout",
@@ -3845,6 +4901,98 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					},
 				},
 			},
+			{
+				name:          "finalizing to finalizing - TNA Cluster",
+				srcState:      models.ClusterStatusFinalizing,
+				srcStatusInfo: statusInfoFinalizing,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+				withOCMClient:     true,
+				requiresAMSUpdate: true,
+				operators: []*models.MonitoredOperator{
+					{
+						Name:         operators.OperatorConsole.Name,
+						OperatorType: models.OperatorTypeBuiltin,
+						Status:       models.OperatorStatusAvailable,
+					},
+				},
+			},
+			{
+				name:          "finalizing to finalizing - TNA Cluster (2)",
+				srcState:      models.ClusterStatusFinalizing,
+				srcStatusInfo: statusInfoFinalizing,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+					{ID: &hid3, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleArbiter},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForArbiterClusters,
+				controlPlaneCount: 2,
+				withOCMClient:     true,
+				// console URL should be updated only once in AMS
+				requiresAMSUpdate: false,
+				operators: []*models.MonitoredOperator{
+					{
+						Name:         operators.OperatorConsole.Name,
+						OperatorType: models.OperatorTypeBuiltin,
+						Status:       models.OperatorStatusAvailable,
+					},
+				},
+			},
+			{
+				name:          "finalizing to finalizing - TNF Cluster",
+				srcState:      models.ClusterStatusFinalizing,
+				srcStatusInfo: statusInfoFinalizing,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+				withOCMClient:     true,
+				requiresAMSUpdate: true,
+				operators: []*models.MonitoredOperator{
+					{
+						Name:         operators.OperatorConsole.Name,
+						OperatorType: models.OperatorTypeBuiltin,
+						Status:       models.OperatorStatusAvailable,
+					},
+				},
+			},
+			{
+				name:          "finalizing to finalizing - TNF Cluster (2)",
+				srcState:      models.ClusterStatusFinalizing,
+				srcStatusInfo: statusInfoFinalizing,
+				dstState:      models.ClusterStatusFinalizing,
+				hosts: []models.Host{
+					{ID: &hid1, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+					{ID: &hid2, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster, FencingCredentials: "credentials"},
+				},
+				statusInfoChecker: makeValueChecker(statusInfoFinalizing),
+				openshiftVersion:  common.MinimumVersionForTwoNodesWithFencing,
+				controlPlaneCount: 2,
+				withOCMClient:     true,
+				// console URL should be updated only once in AMS
+				requiresAMSUpdate: false,
+				operators: []*models.MonitoredOperator{
+					{
+						Name:         operators.OperatorConsole.Name,
+						OperatorType: models.OperatorTypeBuiltin,
+						Status:       models.OperatorStatusAvailable,
+					},
+				},
+			},
 		}
 
 		for i := range tests {
@@ -3865,13 +5013,21 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 						PullSecretSet:      t.pullSecretSet,
 						MonitoredOperators: t.operators,
 						StatusUpdatedAt:    strfmt.DateTime(time.Now()),
+						OpenshiftVersion:   testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount:  t.controlPlaneCount,
 					},
+				}
+				if t.openshiftVersion != "" {
+					cluster.Cluster.OpenshiftVersion = t.openshiftVersion
+				}
+				if cluster.ControlPlaneCount == 0 {
+					cluster.ControlPlaneCount = 3
 				}
 				if t.withOCMClient {
 					mockAccountsMgmt = ocm.NewMockOCMAccountsMgmt(ctrl)
 					ocmClient := &ocm.Client{AccountsMgmt: mockAccountsMgmt, Config: &ocm.Config{}}
-					clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-						mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, ocmClient, mockS3Api, nil, nil, nil, false)
+					clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+						mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, ocmClient, mockS3Api, nil, nil, nil, false, nil)
 					if !t.requiresAMSUpdate {
 						cluster.IsAmsSubscriptionConsoleUrlSet = true
 					}
@@ -3897,6 +5053,11 @@ var _ = Describe("Refresh Cluster - Installing Cases", func() {
 					mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
 						eventstest.WithNameMatcher(eventgen.ClusterStatusUpdatedEventName),
 						eventstest.WithClusterIdMatcher(clusterId.String()))).AnyTimes()
+				}
+				if t.dstState == models.ClusterStatusError {
+					mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+						eventstest.WithNameMatcher(eventgen.ClusterInstallationFailedEventName),
+						eventstest.WithClusterIdMatcher(clusterId.String()))).Times(1)
 				}
 				if t.srcState == models.ClusterStatusFinalizing && !t.requiresAMSUpdate && !t.installationTimeout &&
 					funk.ContainsString([]string{models.ClusterStatusInstalled, models.ClusterStatusFinalizing}, t.dstState) {
@@ -3968,9 +5129,9 @@ var _ = Describe("Log Collection - refresh cluster", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
-		clusterApi = NewManager(logTimeoutConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterApi = NewManager(logTimeoutConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 		clusterId = strfmt.UUID(uuid.New().String())
 	})
 
@@ -4110,9 +5271,9 @@ var _ = Describe("NTP refresh cluster", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -4335,18 +5496,19 @@ var _ = Describe("NTP refresh cluster", func() {
 			It(t.name, func() {
 				cluster = common.Cluster{
 					Cluster: models.Cluster{
-						ClusterNetworks: common.TestIPv4Networking.ClusterNetworks,
-						ServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
-						MachineNetworks: common.TestIPv4Networking.MachineNetworks,
-						APIVips:         common.TestIPv4Networking.APIVips,
-						IngressVips:     common.TestIPv4Networking.IngressVips,
-						ID:              &clusterId,
-						Status:          &t.srcState,
-						StatusInfo:      &t.srcStatusInfo,
-						BaseDNSDomain:   "test.com",
-						PullSecretSet:   t.pullSecretSet,
-
-						NetworkType: swag.String(models.ClusterNetworkTypeOVNKubernetes),
+						ClusterNetworks:   common.TestIPv4Networking.ClusterNetworks,
+						ServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+						MachineNetworks:   common.TestIPv4Networking.MachineNetworks,
+						APIVips:           common.TestIPv4Networking.APIVips,
+						IngressVips:       common.TestIPv4Networking.IngressVips,
+						ID:                &clusterId,
+						Status:            &t.srcState,
+						StatusInfo:        &t.srcStatusInfo,
+						BaseDNSDomain:     "test.com",
+						PullSecretSet:     t.pullSecretSet,
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+						ControlPlaneCount: 3,
 					},
 				}
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
@@ -4402,8 +5564,8 @@ var _ = Describe("Single node", func() {
 	mockHostAPIIsRequireUserActionResetFalse := func() {
 		mockHostAPI.EXPECT().IsRequireUserActionReset(gomock.Any()).Return(false).AnyTimes()
 	}
-	mockIsValidMasterCandidate := func() {
-		mockHostAPI.EXPECT().IsValidMasterCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
+	mockIsValidCandidate := func() {
+		mockHostAPI.EXPECT().IsValidCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
 	}
 
 	BeforeEach(func() {
@@ -4412,10 +5574,10 @@ var _ = Describe("Single node", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		dnsApi := dns.NewDNSHandler(nil, common.GetTestLog())
-		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, dnsApi, nil, nil, false)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, dnsApi, nil, nil, false, nil)
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
 		hid3 = strfmt.UUID(uuid.New().String())
@@ -4440,6 +5602,7 @@ var _ = Describe("Single node", func() {
 			validationsChecker      *validationsChecker
 			setMachineCidrUpdatedAt bool
 			errorExpected           bool
+			controlPlaneCount       int64
 		}{
 			{
 				name:          "non ha mode, too many nodes",
@@ -4614,36 +5777,37 @@ var _ = Describe("Single node", func() {
 		}
 		for i := range tests {
 			t := tests[i]
-			haMode := models.ClusterHighAvailabilityModeNone
 			It(t.name, func() {
 				cluster = common.Cluster{
 					Cluster: models.Cluster{
-						ClusterNetworks:      common.TestIPv4Networking.ClusterNetworks,
-						ServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-						MachineNetworks:      common.TestIPv4Networking.MachineNetworks,
-						APIVips:              common.TestIPv4Networking.APIVips,
-						IngressVips:          common.TestIPv4Networking.IngressVips,
-						ID:                   &clusterId,
-						Status:               &t.srcState,
-						StatusInfo:           &t.srcStatusInfo,
-						BaseDNSDomain:        "test.com",
-						PullSecretSet:        t.pullSecretSet,
-						NetworkType:          swag.String(models.ClusterNetworkTypeOVNKubernetes),
-						HighAvailabilityMode: &haMode,
+						ClusterNetworks:   common.TestIPv4Networking.ClusterNetworks,
+						ServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+						MachineNetworks:   common.TestIPv4Networking.MachineNetworks,
+						APIVips:           common.TestIPv4Networking.APIVips,
+						IngressVips:       common.TestIPv4Networking.IngressVips,
+						ID:                &clusterId,
+						Status:            &t.srcState,
+						StatusInfo:        &t.srcStatusInfo,
+						BaseDNSDomain:     "test.com",
+						PullSecretSet:     t.pullSecretSet,
+						NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+						OpenshiftVersion:  testing.ValidOCPVersionForNonStandardHAOCPControlPlane,
+						ControlPlaneCount: 1,
 					},
 				}
+
 				if t.srcState == models.ClusterStatusPreparingForInstallation && t.dstState == models.ClusterStatusInstalling {
 					cluster.Cluster.StatusUpdatedAt = strfmt.DateTime(time.Now())
 					cluster.LastInstallationPreparation = models.LastInstallationPreparation{
 						Status: models.LastInstallationPreparationStatusSuccess,
-						Reason: "",
+						Reason: constants.InstallationPreparationReasonSuccess,
 					}
 
 					mockMetric.EXPECT().InstallationStarted().Times(1)
 
 				}
 				Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
-				mockIsValidMasterCandidate()
+				mockIsValidCandidate()
 				for i := range t.hosts {
 					t.hosts[i].InfraEnvID = clusterId
 					t.hosts[i].ClusterID = &clusterId
@@ -4693,6 +5857,87 @@ var _ = Describe("ValidationResult sort", func() {
 	})
 })
 
+var _ = Describe("installation timeout", func() {
+	var (
+		db               *gorm.DB
+		clusterId        strfmt.UUID
+		clusterApi       *Manager
+		mockEvents       *eventsapi.MockHandler
+		mockHostAPI      *host.MockAPI
+		mockMetric       *metrics.MockAPI
+		ctrl             *gomock.Controller
+		dbName           string
+		operatorsManager *operators.Manager
+		mockS3Api        *s3wrapper.MockAPI
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+		ctrl = gomock.NewController(GinkgoT())
+		mockEvents = eventsapi.NewMockHandler(ctrl)
+		mockHostAPI = host.NewMockAPI(ctrl)
+		mockMetric = metrics.NewMockAPI(ctrl)
+		mockS3Api = s3wrapper.NewMockAPI(ctrl)
+		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterId = strfmt.UUID(uuid.New().String())
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, true, nil)
+	})
+	createCluster := func(status, statusInfo string, installStartedAt time.Time) *common.Cluster {
+		id := strfmt.UUID(uuid.NewString())
+		infraenvId := strfmt.UUID(uuid.NewString())
+		cls := &common.Cluster{
+			Cluster: models.Cluster{
+				ID:                     &clusterId,
+				Status:                 swag.String(status),
+				StatusInfo:             swag.String(statusInfo),
+				InstallStartedAt:       strfmt.DateTime(installStartedAt),
+				OpenshiftVersion:       "4.15",
+				EmailDomain:            "redhat.com",
+				OrgSoftTimeoutsEnabled: true,
+				ControlPlaneCount:      1,
+				Hosts: []*models.Host{
+					{
+						ID:         &id,
+						InfraEnvID: infraenvId,
+						ClusterID:  &clusterId,
+						Status:     swag.String(models.HostStatusInstallingInProgress),
+						Role:       models.HostRoleMaster,
+					},
+				},
+			},
+		}
+		Expect(db.Create(cls).Error).ToNot(HaveOccurred())
+		return cls
+	}
+	AfterEach(func() {
+		ctrl.Finish()
+		common.DeleteTestDB(db, dbName)
+	})
+	DescribeTable("installation timeout cases",
+		func(status, statusInfo string, installStartedAt time.Time, timeoutExpected bool) {
+			cls := createCluster(status, statusInfo, installStartedAt)
+			if timeoutExpected {
+				mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).Times(2)
+				mockMetric.EXPECT().ClusterInstallationFinished(gomock.Any(), gomock.Any(), gomock.Any(),
+					gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
+			}
+			returnedCluster, err := clusterApi.RefreshStatus(context.Background(), cls, db)
+			Expect(err).ToNot(HaveOccurred())
+			if timeoutExpected {
+				Expect(swag.StringValue(returnedCluster.Status)).To(Equal(models.ClusterStatusError))
+				Expect(swag.StringValue(returnedCluster.StatusInfo)).To(Equal(fmt.Sprintf(statusInfoInstallationTimeout, int64((24 * time.Hour).Minutes()))))
+			} else {
+				Expect(swag.StringValue(returnedCluster.Status)).To(Equal(status))
+			}
+		},
+		Entry("timeout expired for installing status", models.ClusterStatusInstalling, statusInfoInstalling, time.Now().Add(-24*time.Hour), true),
+		Entry("timeout not expired for installing status", models.ClusterStatusInstalling, statusInfoInstalling, time.Now().Add(-23*time.Hour), false),
+		Entry("timeout expired for finalizing status", models.ClusterStatusFinalizing, statusInfoFinalizing, time.Now().Add(-24*time.Hour), true),
+		Entry("timeout not expired for finalizing status", models.ClusterStatusFinalizing, statusInfoFinalizing, time.Now().Add(-23*time.Hour), false),
+	)
+})
+
 var _ = Describe("finalizing timeouts", func() {
 	var (
 		ctx              = context.Background()
@@ -4715,7 +5960,7 @@ var _ = Describe("finalizing timeouts", func() {
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
 		mockS3Api = s3wrapper.NewMockAPI(ctrl)
-		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		clusterId = strfmt.UUID(uuid.New().String())
 	})
 
@@ -4737,6 +5982,7 @@ var _ = Describe("finalizing timeouts", func() {
 					FinalizingStageStartedAt: strfmt.DateTime(stageTimestamp),
 				},
 				OrgSoftTimeoutsEnabled: true,
+				InstallStartedAt:       strfmt.DateTime(time.Now()),
 			},
 		}
 		Expect(db.Create(cls).Error).ToNot(HaveOccurred())
@@ -4752,12 +5998,12 @@ var _ = Describe("finalizing timeouts", func() {
 	}
 	Context("soft timeouts disabled", func() {
 		BeforeEach(func() {
-			clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-				mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false)
+			clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+				mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, false, nil)
 		})
 		for _, st := range finalizingStages {
 			stage := st
-			timeout := finalizingStageTimeout(stage, nil, logrus.New())
+			timeout := finalizingStageTimeout(stage, nil, false, logrus.New())
 			Context(fmt.Sprintf("finalizing stage '%s' timeout expired", stage), func() {
 				if funk.Contains(nonFailingFinalizingStages, stage) {
 					It("should stay in same status and trigger soft timeout", func() {
@@ -4772,7 +6018,7 @@ var _ = Describe("finalizing timeouts", func() {
 				} else {
 					It("should move to error", func() {
 						cls := createCluster(models.ClusterStatusFinalizing, stage, time.Now(), time.Now().Add(-(timeout + time.Second)))
-						mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).Times(1)
+						mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).Times(2)
 						mockMetric.EXPECT().ClusterInstallationFinished(gomock.Any(), models.ClusterStatusError, models.ClusterStatusFinalizing,
 							cls.OpenshiftVersion, *cls.ID, cls.EmailDomain, gomock.Any()).Times(1)
 						clusterAfterUpdate, err := clusterApi.RefreshStatus(ctx, cls, db)
@@ -4790,8 +6036,8 @@ var _ = Describe("finalizing timeouts", func() {
 	})
 	Context("soft timeouts enabled", func() {
 		BeforeEach(func() {
-			clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, testing.GetDummyNotificationStream(ctrl),
-				mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, true)
+			clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
+				mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, mockS3Api, nil, nil, nil, true, nil)
 
 		})
 		It("finalizing status timeout not active", func() {
@@ -4803,7 +6049,7 @@ var _ = Describe("finalizing timeouts", func() {
 		})
 		for _, st := range finalizingStages {
 			stage := st
-			timeout := finalizingStageTimeout(stage, nil, logrus.New())
+			timeout := finalizingStageTimeout(stage, nil, true, logrus.New())
 			It(fmt.Sprintf("finalizing stage '%s' timeout expired", stage), func() {
 				cls := createCluster(models.ClusterStatusFinalizing, stage, time.Now(), time.Now().Add(-(timeout + time.Second)))
 				mockEvents.EXPECT().SendClusterEvent(gomock.Any(), gomock.Any()).Times(1)
@@ -4839,3 +6085,152 @@ func makeFreeNetworksAddressesStr(elems ...*models.FreeNetworkAddresses) string 
 	Expect(err).ToNot(HaveOccurred())
 	return string(b)
 }
+
+var _ = Describe("Finalizing stage timeout reset", func() {
+	var (
+		ctx          = context.Background()
+		db           *gorm.DB
+		clusterApi   *Manager
+		mockEvents   *eventsapi.MockHandler
+		mockHostAPI  *host.MockAPI
+		mockMetric   *metrics.MockAPI
+		mockS3Api    *s3wrapper.MockAPI
+		ctrl         *gomock.Controller
+		dbName       string
+		clusterId    strfmt.UUID
+		operatorsApi operators.API
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+		ctrl = gomock.NewController(GinkgoT())
+		mockEvents = eventsapi.NewMockHandler(ctrl)
+		mockHostAPI = host.NewMockAPI(ctrl)
+		mockMetric = metrics.NewMockAPI(ctrl)
+		mockS3Api = s3wrapper.NewMockAPI(ctrl)
+		operatorsApi = operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
+		clusterApi = NewManager(getDefaultConfig(), common.GetTestLog().WithField("pkg", "cluster-monitor"), db,
+			commontesting.GetDummyNotificationStream(ctrl), mockEvents, nil, mockHostAPI, mockMetric, nil, nil,
+			operatorsApi, nil, mockS3Api, nil, nil, nil, false, nil)
+		clusterId = strfmt.UUID(uuid.New().String())
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+		common.DeleteTestDB(db, dbName)
+	})
+
+	It("should reset finalizing stage fields on transition from InstallingPendingUserAction to Finalizing", func() {
+		oldTimestamp := time.Now().Add(-2 * time.Hour)
+		cluster := common.Cluster{
+			Cluster: models.Cluster{
+				ID:               &clusterId,
+				Status:           swag.String(models.ClusterStatusInstallingPendingUserAction),
+				StatusInfo:       swag.String("Waiting for user action"),
+				BaseDNSDomain:    "test.com",
+				PullSecretSet:    true,
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				StatusUpdatedAt:  strfmt.DateTime(time.Now()),
+				InstallStartedAt: strfmt.DateTime(time.Now().Add(-1 * time.Hour)),
+				MachineNetworks:  common.TestIPv4Networking.MachineNetworks,
+				APIVips:          common.TestIPv4Networking.APIVips,
+				IngressVips:      common.TestIPv4Networking.IngressVips,
+			},
+		}
+		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+		Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterId.String()).Updates(map[string]interface{}{
+			"progress_finalizing_stage_started_at": oldTimestamp,
+			"progress_finalizing_stage_timed_out":  true,
+		}).Error).ShouldNot(HaveOccurred())
+
+		hid1, hid2, hid3 := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+		hid4, hid5, hid6 := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+
+		hosts := []models.Host{
+			{ID: &hid1, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid2, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid3, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid4, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+			{ID: &hid5, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+			{ID: &hid6, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstallingInProgress), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+		}
+
+		for i := range hosts {
+			Expect(db.Create(&hosts[i]).Error).ShouldNot(HaveOccurred())
+		}
+
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.ClusterStatusUpdatedEventName),
+			eventstest.WithClusterIdMatcher(clusterId.String()))).AnyTimes()
+
+		cluster = getClusterFromDB(clusterId, db)
+		clusterAfterRefresh, err := clusterApi.RefreshStatus(ctx, &cluster, db)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(clusterAfterRefresh).ToNot(BeNil())
+		Expect(swag.StringValue(clusterAfterRefresh.Status)).To(Equal(models.ClusterStatusFinalizing))
+
+		var progressStartedAt time.Time
+		var progressTimedOut bool
+		row := db.Raw("SELECT progress_finalizing_stage_started_at, progress_finalizing_stage_timed_out FROM clusters WHERE id = ?", clusterId.String()).Row()
+		Expect(row.Scan(&progressStartedAt, &progressTimedOut)).ShouldNot(HaveOccurred())
+
+		Expect(progressStartedAt).To(BeTemporally("~", time.Now(), 5*time.Second))
+		Expect(progressStartedAt).NotTo(BeTemporally("~", oldTimestamp, 1*time.Minute))
+		Expect(progressTimedOut).To(BeFalse())
+	})
+
+	It("should NOT reset finalizing stage fields on transition from Installing to Finalizing", func() {
+		cluster := common.Cluster{
+			Cluster: models.Cluster{
+				ID:               &clusterId,
+				Status:           swag.String(models.ClusterStatusInstalling),
+				StatusInfo:       swag.String("Installing"),
+				BaseDNSDomain:    "test.com",
+				PullSecretSet:    true,
+				OpenshiftVersion: common.TestDefaultConfig.OpenShiftVersion,
+				StatusUpdatedAt:  strfmt.DateTime(time.Now()),
+				InstallStartedAt: strfmt.DateTime(time.Now().Add(-1 * time.Hour)),
+				MachineNetworks:  common.TestIPv4Networking.MachineNetworks,
+				APIVips:          common.TestIPv4Networking.APIVips,
+				IngressVips:      common.TestIPv4Networking.IngressVips,
+			},
+		}
+		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
+
+		hid1, hid2, hid3 := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+		hid4, hid5 := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+
+		hosts := []models.Host{
+			{ID: &hid1, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid2, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid3, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleMaster},
+			{ID: &hid4, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+			{ID: &hid5, InfraEnvID: clusterId, ClusterID: &clusterId, Status: swag.String(models.HostStatusInstalled), Inventory: common.GenerateTestDefaultInventory(), Role: models.HostRoleWorker},
+		}
+
+		for i := range hosts {
+			Expect(db.Create(&hosts[i]).Error).ShouldNot(HaveOccurred())
+		}
+
+		mockEvents.EXPECT().SendClusterEvent(gomock.Any(), eventstest.NewEventMatcher(
+			eventstest.WithNameMatcher(eventgen.ClusterStatusUpdatedEventName),
+			eventstest.WithClusterIdMatcher(clusterId.String()))).AnyTimes()
+
+		cluster = getClusterFromDB(clusterId, db)
+		clusterAfterRefresh, err := clusterApi.RefreshStatus(ctx, &cluster, db)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(clusterAfterRefresh).ToNot(BeNil())
+		Expect(swag.StringValue(clusterAfterRefresh.Status)).To(Equal(models.ClusterStatusFinalizing))
+
+		var progressStartedAt *time.Time
+		var progressTimedOut *bool
+		row := db.Raw("SELECT progress_finalizing_stage_started_at, progress_finalizing_stage_timed_out FROM clusters WHERE id = ?", clusterId.String()).Row()
+		err = row.Scan(&progressStartedAt, &progressTimedOut)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		if progressStartedAt != nil {
+			Expect(*progressStartedAt).NotTo(BeTemporally("~", time.Now(), 5*time.Second))
+		}
+	})
+})

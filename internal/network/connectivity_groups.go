@@ -2,8 +2,8 @@ package network
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
+	"sort"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/golang-collections/go-datastructures/bitarray"
@@ -11,25 +11,18 @@ import (
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
 	"github.com/thoas/go-funk"
-	"golang.org/x/sys/unix"
 )
 
-type AddressFamily int
+type AddressFamily = common.AddressFamily
 
 const (
-	IPv4 AddressFamily = unix.AF_INET
-	IPv6 AddressFamily = unix.AF_INET6
+	IPv4 AddressFamily = common.IPv4
+	IPv6 AddressFamily = common.IPv6
 )
 
-func (a AddressFamily) String() string {
-	switch a {
-	case IPv4:
-		return "IPv4"
-	case IPv6:
-		return "IPv6"
-	default:
-		return fmt.Sprintf("Unexpected family value %d", a)
-	}
+type Connectivity struct {
+	MajorityGroups       map[string][]strfmt.UUID `json:"majority_groups"`
+	L3ConnectedAddresses map[strfmt.UUID][]string `json:"l3_connected_addresses"`
 }
 
 type connectivityKey struct {
@@ -80,11 +73,11 @@ type connectivitySet struct {
 }
 
 func NewConnectivitySet(size int) *connectivitySet {
-	return &connectivitySet{array: bitarray.NewBitArray(uint64(size))}
+	return &connectivitySet{array: bitarray.NewBitArray(uint64(size))} // nolint: gosec
 }
 
 func (c *connectivitySet) add(item int) error {
-	return c.array.SetBit(uint64(item))
+	return c.array.SetBit(uint64(item)) // nolint: gosec
 }
 
 func (c *connectivitySet) intersect(other *connectivitySet) *connectivitySet {
@@ -100,7 +93,7 @@ func (c *connectivitySet) union(other *connectivitySet) *connectivitySet {
 }
 
 func (c *connectivitySet) containsElement(id int) bool {
-	b, err := c.array.GetBit(uint64(id))
+	b, err := c.array.GetBit(uint64(id)) // nolint: gosec
 	return err == nil && b
 }
 
@@ -244,9 +237,9 @@ func (c *connectivityGroupList) addOrMergeGroup(cg *connectivityGroup) {
 	}
 }
 
-func (c *connectivityGroupList) largestGroup() *connectivityGroup {
+func (c *connectivityGroupList) largestGroup(minGroupSize int) *connectivityGroup {
 	size := c.biggestGroupSize()
-	if size < 3 {
+	if size < minGroupSize {
 		return nil
 	}
 	groupsBySize := c.groupsBySize[size]
@@ -306,7 +299,7 @@ func (m *majorityGroupCalculator) createFullMeshGroup(groupCandidates []*groupCa
 
 	// The primary groups are used for intersection with group candidate which is not full mesh
 	primaryGroups := groupList.setAndMergePrimaryGroups()
-	for groupCandidate := groupList.largestGroup(); groupCandidate != nil; groupCandidate = groupList.largestGroup() {
+	for groupCandidate := groupList.largestGroup(m.minGroupSize); groupCandidate != nil; groupCandidate = groupList.largestGroup(m.minGroupSize) {
 		if groupCandidate.isFullMesh() {
 			return groupCandidate
 		}
@@ -331,8 +324,8 @@ func (m *majorityGroupCalculator) createFullMeshGroup(groupCandidates []*groupCa
 				intersectedGroup := groupCandidate.intersect(pg)
 
 				// Groups have to be smaller than the existing size since it was already checked,
-				// and greater than 3 (minimal number of hosts for a cluster).
-				if intersectedGroup.size() >= 3 && intersectedGroup.size() < currentSize {
+				// and greater than the minimum group size.
+				if intersectedGroup.size() >= m.minGroupSize && intersectedGroup.size() < currentSize {
 					groupList.addOrMergeGroup(intersectedGroup)
 
 					// If the intersected group is larger than the biggest group size we already have, use this one.
@@ -376,6 +369,11 @@ type l2Query struct {
 	connectivityReport models.ConnectivityReport
 }
 
+func (l *l2Query) isIPv6() bool {
+	_, bits := l.parsedCidr.Mask.Size()
+	return bits == net.IPv6len*8
+}
+
 func (l *l2Query) next() strfmt.UUID {
 	for l.current != len(l.connectivityReport.RemoteHosts) {
 		rh := l.connectivityReport.RemoteHosts[l.current]
@@ -384,6 +382,17 @@ func (l *l2Query) next() strfmt.UUID {
 			ip := net.ParseIP(l2.RemoteIPAddress)
 			if ip != nil && l.parsedCidr.Contains(ip) && l2.Successful {
 				return rh.HostID
+			}
+		}
+		if l.isIPv6() {
+			// nmap uses NDP (Network Discovery Protocol) for IPv6 L2 discovery.  There are cases that NDP responses do not
+			// arrive and parsed by nmap, but still there is connectivity between the hosts.  In this case we fallback to L3
+			// check and verify that the remote address is in the required subnet.
+			for _, l3 := range rh.L3Connectivity {
+				ip := net.ParseIP(l3.RemoteIPAddress)
+				if ip != nil && l.parsedCidr.Contains(ip) && l3.Successful {
+					return rh.HostID
+				}
 			}
 		}
 	}
@@ -436,7 +445,7 @@ func (l *l3Query) next() strfmt.UUID {
 				foundAddresses[l3.RemoteIPAddress] = true
 			}
 		}
-		if len(addresses) == len(foundAddresses) {
+		if len(foundAddresses) > 0 && len(addresses) == len(foundAddresses) {
 			return rh.HostID
 		}
 	}
@@ -495,6 +504,7 @@ func newL3QueryFactory(hosts []*models.Host, family AddressFamily) (hostQueryFac
 type majorityGroupCalculator struct {
 	hostQueryFactory hostQueryFactory
 	numHosts         int
+	minGroupSize     int
 }
 
 /*
@@ -532,7 +542,7 @@ func (m *majorityGroupCalculator) createMajorityGroup(hosts []*models.Host) ([]s
 	candidates := make([]*groupCandidate, 0)
 	for hostIndex := range hosts {
 		candidate := m.createHostGroupCandidate(hostIndex, cMap)
-		if candidate.set.size() >= 3 {
+		if candidate.set.size() >= m.minGroupSize {
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -543,35 +553,36 @@ func (m *majorityGroupCalculator) createMajorityGroup(hosts []*models.Host) ([]s
 	return make([]strfmt.UUID, 0), nil
 }
 
-func calculateMajorityGroup(hosts []*models.Host, factory hostQueryFactory) ([]strfmt.UUID, error) {
+func calculateMajorityGroup(hosts []*models.Host, factory hostQueryFactory, minGroupSize int) ([]strfmt.UUID, error) {
 	calc := &majorityGroupCalculator{
 		hostQueryFactory: factory,
 		numHosts:         len(hosts),
+		minGroupSize:     minGroupSize,
 	}
 	return calc.createMajorityGroup(hosts)
 }
 
 /*
- * Crate majority for a cidr.  A majority group is a the largest group of hosts in a cluster that all of them have full mesh
+ * Create majority for a cidr.  A majority group is a the largest group of hosts in a cluster that all of them have full mesh
  * to the other group members.
  * It is done by taking a sorted connectivity group list according to the group size, and from this group take the
  * largest one
  */
-func CreateL2MajorityGroup(cidr string, hosts []*models.Host) ([]strfmt.UUID, error) {
+func CreateL2MajorityGroup(cidr string, hosts []*models.Host, minGroupSize int) ([]strfmt.UUID, error) {
 	factory, err := newL2QueryFactory(cidr)
 	if err != nil {
 		return nil, err
 	}
-	return calculateMajorityGroup(hosts, factory)
+	return calculateMajorityGroup(hosts, factory, minGroupSize)
 }
 
 /*
- * Crate majority for address family.  A majority group is a the largest group of hosts in a cluster that all of them have full mesh
+ * Create majority for address family.  A majority group is a the largest group of hosts in a cluster that all of them have full mesh
  * to the other group members.
  * It is done by taking a sorted connectivity group list according to the group size, and from this group take the
  * largest one
  */
-func CreateL3MajorityGroup(hosts []*models.Host, family AddressFamily) ([]strfmt.UUID, error) {
+func CreateL3MajorityGroup(hosts []*models.Host, family AddressFamily, minGroupSize int) ([]strfmt.UUID, error) {
 	if !funk.Contains([]AddressFamily{IPv4, IPv6}, family) {
 		return nil, errors.Errorf("Unexpected address family %+v", family)
 	}
@@ -579,5 +590,57 @@ func CreateL3MajorityGroup(hosts []*models.Host, family AddressFamily) ([]strfmt
 	if err != nil {
 		return nil, err
 	}
-	return calculateMajorityGroup(hosts, factory)
+	return calculateMajorityGroup(hosts, factory, minGroupSize)
+}
+
+func GatherL3ConnectedAddresses(hosts []*models.Host) (map[strfmt.UUID][]string, error) {
+	counts := make(map[strfmt.UUID]map[string]int)
+	for _, host := range hosts {
+		if host.Connectivity == "" {
+			continue
+		}
+		var report models.ConnectivityReport
+		if err := json.Unmarshal([]byte(host.Connectivity), &report); err != nil {
+			return nil, err
+		}
+		for _, rh := range report.RemoteHosts {
+			if rh.HostID == *host.ID {
+				continue
+			}
+			// There are cases (especially in previous versions of connectivity check) that remote IP address appears
+			// more than once in connectivity results. The map is needed in order to verify that a remote ip address
+			// is not counted more than once for host-pair.
+			hostResults := make(map[string]bool)
+			for _, cn := range rh.L3Connectivity {
+				if cn.Successful {
+					hostResults[cn.RemoteIPAddress] = true
+				}
+			}
+			if len(hostResults) > 0 {
+				m, ok := counts[rh.HostID]
+				if !ok {
+					m = make(map[string]int)
+					counts[rh.HostID] = m
+				}
+				for remoteIpAddress := range hostResults {
+					m[remoteIpAddress] = m[remoteIpAddress] + 1
+				}
+			}
+		}
+	}
+	ret := make(map[strfmt.UUID][]string)
+	for hid, hcounts := range counts {
+		for addr, count := range hcounts {
+			if count == len(hosts)-1 {
+				ret[hid] = append(ret[hid], addr)
+			}
+		}
+	}
+
+	// Sort address lists to ensure deterministic results across multiple function calls
+	for _, addresses := range ret {
+		sort.Strings(addresses)
+	}
+
+	return ret, nil
 }

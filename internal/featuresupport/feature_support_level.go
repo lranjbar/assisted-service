@@ -2,21 +2,23 @@ package featuresupport
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
-	"github.com/thoas/go-funk"
 )
 
 var featuresList = map[models.FeatureSupportLevelID]SupportLevelFeature{
 	// Generic features
-	models.FeatureSupportLevelIDSNO:                 (&SnoFeature{}).New(),
-	models.FeatureSupportLevelIDCUSTOMMANIFEST:      (&CustomManifestFeature{}).New(),
-	models.FeatureSupportLevelIDSINGLENODEEXPANSION: (&SingleNodeExpansionFeature{}).New(),
-	models.FeatureSupportLevelIDMINIMALISO:          (&MinimalIso{}).New(),
-	models.FeatureSupportLevelIDFULLISO:             (&FullIso{}).New(),
-	models.FeatureSupportLevelIDSKIPMCOREBOOT:       &skipMcoReboot{},
+	models.FeatureSupportLevelIDSNO:                       (&SnoFeature{}).New(),
+	models.FeatureSupportLevelIDTNA:                       (&TnaFeature{}).New(),
+	models.FeatureSupportLevelIDTNF:                       (&TnfFeature{}).New(),
+	models.FeatureSupportLevelIDCUSTOMMANIFEST:            (&CustomManifestFeature{}).New(),
+	models.FeatureSupportLevelIDSINGLENODEEXPANSION:       (&SingleNodeExpansionFeature{}).New(),
+	models.FeatureSupportLevelIDMINIMALISO:                (&MinimalIso{}).New(),
+	models.FeatureSupportLevelIDFULLISO:                   (&FullIso{}).New(),
+	models.FeatureSupportLevelIDNONSTANDARDHACONTROLPLANE: (&NonStandardHAControlPlane{}).New(),
 
 	// Network features
 	models.FeatureSupportLevelIDVIPAUTOALLOC:              (&VipAutoAllocFeature{}).New(),
@@ -27,13 +29,42 @@ var featuresList = map[models.FeatureSupportLevelID]SupportLevelFeature{
 	models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING: (&PlatformManagedNetworkingFeature{}).New(),
 	models.FeatureSupportLevelIDSDNNETWORKTYPE:            (&SDNNetworkTypeFeature{}).New(),
 	models.FeatureSupportLevelIDOVNNETWORKTYPE:            (&OVNNetworkTypeFeature{}).New(),
+	models.FeatureSupportLevelIDCILIUMNETWORKTYPE:         (&CiliumNetworkTypeFeature{}).New(),
+	models.FeatureSupportLevelIDCALICONETWORKTYPE:         (&CalicoNetworkTypeFeature{}).New(),
+	models.FeatureSupportLevelIDCISCOACINETWORKTYPE:       (&CiscoACINetworkTypeFeature{}).New(),
+	models.FeatureSupportLevelIDNONENETWORKTYPE:           (&NoneNetworkTypeFeature{}).New(),
+	models.FeatureSupportLevelIDUSERMANAGEDLOADBALANCER:   (&UserManagedLoadBalancerFeature{}).New(),
+	models.FeatureSupportLevelIDDUALSTACKPRIMARYIPV6:      (&DualStackPrimaryIPv6Feature{}).New(),
 
 	// Olm Operators features
-	models.FeatureSupportLevelIDLVM: (&LvmFeature{}).New(),
-	models.FeatureSupportLevelIDCNV: (&CnvFeature{}).New(),
-	models.FeatureSupportLevelIDLSO: (&LsoFeature{}).New(),
-	models.FeatureSupportLevelIDMCE: (&MceFeature{}).New(),
-	models.FeatureSupportLevelIDODF: (&OdfFeature{}).New(),
+	models.FeatureSupportLevelIDLVM:                    (&LvmFeature{}).New(),
+	models.FeatureSupportLevelIDCNV:                    (&CnvFeature{}).New(),
+	models.FeatureSupportLevelIDLSO:                    (&LsoFeature{}).New(),
+	models.FeatureSupportLevelIDMCE:                    (&MceFeature{}).New(),
+	models.FeatureSupportLevelIDODF:                    (&OdfFeature{}).New(),
+	models.FeatureSupportLevelIDMTV:                    (&MtvFeature{}).New(),
+	models.FeatureSupportLevelIDOSC:                    (&OscFeature{}).New(),
+	models.FeatureSupportLevelIDNODEFEATUREDISCOVERY:   (&NodeFeatureDiscoveryFeature{}).New(),
+	models.FeatureSupportLevelIDNVIDIAGPU:              (&NvidiaGPUFeature{}).New(),
+	models.FeatureSupportLevelIDPIPELINES:              (&PipelinesFeature{}).New(),
+	models.FeatureSupportLevelIDSERVICEMESH:            (&ServiceMeshFeature{}).New(),
+	models.FeatureSupportLevelIDSERVERLESS:             (&ServerLessFeature{}).New(),
+	models.FeatureSupportLevelIDOPENSHIFTAI:            (&OpenShiftAIFeature{}).New(),
+	models.FeatureSupportLevelIDAUTHORINO:              (&AuthorinoFeature{}).New(),
+	models.FeatureSupportLevelIDNMSTATE:                (&NmstateFeature{}).New(),
+	models.FeatureSupportLevelIDAMDGPU:                 (&AMDGPUFeature{}).New(),
+	models.FeatureSupportLevelIDKMM:                    (&KMMFeature{}).New(),
+	models.FeatureSupportLevelIDNODEHEALTHCHECK:        (&NodeHealthcheckFeature{}).New(),
+	models.FeatureSupportLevelIDSELFNODEREMEDIATION:    (&SelfNodeRemediationFeature{}).New(),
+	models.FeatureSupportLevelIDFENCEAGENTSREMEDIATION: (&FenceAgentsRemediationFeature{}).New(),
+	models.FeatureSupportLevelIDNODEMAINTENANCE:        (&NodeMaintenanceFeature{}).New(),
+	models.FeatureSupportLevelIDKUBEDESCHEDULER:        (&KubeDeschedulerFeature{}).New(),
+	models.FeatureSupportLevelIDCLUSTEROBSERVABILITY:   (&ClusterObservabilityFeature{}).New(),
+	models.FeatureSupportLevelIDNUMARESOURCES:          (&NumaResourcesFeature{}).New(),
+	models.FeatureSupportLevelIDOADP:                   (&OadpFeature{}).New(),
+	models.FeatureSupportLevelIDMETALLB:                (&MetalLBFeature{}).New(),
+	models.FeatureSupportLevelIDLOKI:                   (&LokiFeature{}).New(),
+	models.FeatureSupportLevelIDOPENSHIFTLOGGING:       (&OpenShiftLoggingFeature{}).New(),
 
 	// Platform features
 	models.FeatureSupportLevelIDNUTANIXINTEGRATION:  (&NutanixIntegrationFeature{}).New(),
@@ -48,39 +79,81 @@ func GetFeatureByID(featureID models.FeatureSupportLevelID) SupportLevelFeature 
 	return featuresList[featureID]
 }
 
-func getFeatureSupportList(features map[models.FeatureSupportLevelID]SupportLevelFeature, filters SupportLevelFilters) models.SupportLevels {
-	featureSupportList := models.SupportLevels{}
+func getFeatureSupportList(features map[models.FeatureSupportLevelID]SupportLevelFeature, filters SupportLevelFilters) []models.Feature {
+	ret := make([]models.Feature, 0, len(features))
 
 	for _, feature := range features {
-		featureID := feature.getId()
+		// skip features that collide with the given filters
+		if skipPlatformRelatedFeature(feature.getId(), filters.PlatformType != nil) {
+			continue
+		}
+
+		supportLevel, reason := feature.getSupportLevel(filters)
+
+		incompatibilities := feature.getIncompatibleFeatures(filters.OpenshiftVersion)
+		incompatibilities = filterIncompatibilities(incompatibilities, filters)
+
+		feat := models.Feature{
+			FeatureSupportLevelID: feature.getId(),
+			Incompatibilities:     incompatibilities,
+			SupportLevel:          supportLevel,
+			Reason:                reason,
+		}
 
 		if !isFeatureCompatibleWithArchitecture(feature, filters.OpenshiftVersion, swag.StringValue(filters.CPUArchitecture)) {
-			featureSupportList[string(featureID)] = models.SupportLevelUnavailable
-		} else {
-			featureSupportList[string(featureID)] = feature.getSupportLevel(filters)
+			feat.SupportLevel = models.SupportLevelUnavailable
+			feat.Reason = models.IncompatibilityReasonCPUArchitecture
 		}
+
+		ret = append(ret, feat)
 	}
-	return featureSupportList
+
+	return ret
 }
 
-// removeEmptySupportLevel remove features with an empty support level value
-// Currently in case of filtering features by <platform> we cannot return all other platforms in that list.
-func removeEmptySupportLevel(supportLevels models.SupportLevels) {
-	var featuresToRemove []string
-
-	for featureId, supportLevel := range supportLevels {
-		if string(supportLevel) == "" {
-			featuresToRemove = append(featuresToRemove, featureId)
-		}
+// skipPlatformRelatedFeature return true if
+//   - the feature is related to platform and platform type is not set.
+//   - the feature is PlatformManagedNetworking and platform type is set.
+func skipPlatformRelatedFeature(featureID models.FeatureSupportLevelID, platformTypeSet bool) bool {
+	if platformTypeSet && slices.Contains(platformFeatures(), featureID) {
+		return true
 	}
 
-	for _, featureId := range featuresToRemove {
-		delete(supportLevels, featureId)
+	// PlatformManagedNetworking is not relevant without platform type - in this case remove disable this feature support-level
+	if !platformTypeSet && featureID == models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING {
+		return true
+	}
+
+	return false
+}
+
+func filterIncompatibilities(incompatibilities []models.FeatureSupportLevelID, filters SupportLevelFilters) []models.FeatureSupportLevelID {
+	ret := make([]models.FeatureSupportLevelID, 0, len(incompatibilities))
+
+	for _, incompatibility := range incompatibilities {
+		if skipPlatformRelatedFeature(incompatibility, filters.PlatformType != nil) {
+			continue
+		}
+
+		ret = append(ret, incompatibility)
+	}
+
+	return ret
+}
+
+func platformFeatures() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
+		models.FeatureSupportLevelIDNUTANIXINTEGRATION,
+		models.FeatureSupportLevelIDVSPHEREINTEGRATION,
+		models.FeatureSupportLevelIDEXTERNALPLATFORMOCI,
+		models.FeatureSupportLevelIDBAREMETALPLATFORM,
+		models.FeatureSupportLevelIDNONEPLATFORM,
+		models.FeatureSupportLevelIDEXTERNALPLATFORM,
 	}
 }
 
 // GetFeatureSupportList Get features support level list, cpuArchitecture is optional and the default value is x86
-func GetFeatureSupportList(openshiftVersion string, cpuArchitecture *string, platformType *models.PlatformType, externalPlatformName *string) models.SupportLevels {
+func GetFeatureSupportList(openshiftVersion string, cpuArchitecture *string, platformType *models.PlatformType, externalPlatformName *string) []models.Feature {
 	filters := SupportLevelFilters{
 		OpenshiftVersion:     openshiftVersion,
 		CPUArchitecture:      cpuArchitecture,
@@ -95,9 +168,6 @@ func GetFeatureSupportList(openshiftVersion string, cpuArchitecture *string, pla
 	if featuresSupportList == nil {
 		featuresSupportList = getFeatureSupportList(featuresList, filters)
 	}
-
-	// remove features that collide with the given filters
-	removeEmptySupportLevel(featuresSupportList)
 
 	return featuresSupportList
 }
@@ -117,13 +187,36 @@ func IsFeatureAvailable(featureId models.FeatureSupportLevelID, openshiftVersion
 	return GetSupportLevel(featureId, filters) != models.SupportLevelUnavailable
 }
 
+func IsFeatureCompatibleWithOther(openshiftVersion string, featureID models.FeatureSupportLevelID, other []models.FeatureSupportLevelID) bool {
+	if other == nil {
+		return true
+	}
+
+	feature := GetFeatureByID(featureID)
+	if feature == nil {
+		return true // Unknown features are considered compatible with everything
+	}
+
+	incompatibilities := feature.getIncompatibleFeatures(openshiftVersion)
+	for _, incompatibility := range incompatibilities {
+		if slices.Contains(other, incompatibility) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func isFeatureCompatible(openshiftVersion string, feature SupportLevelFeature, features ...SupportLevelFeature) *SupportLevelFeature {
 	incompatibilities := feature.getIncompatibleFeatures(openshiftVersion)
-	if incompatibilities != nil {
-		for _, f := range features {
-			if funk.Contains(*incompatibilities, f.getId()) {
-				return &f
-			}
+
+	if len(incompatibilities) == 0 {
+		return nil
+	}
+
+	for _, f := range features {
+		if slices.Contains(incompatibilities, f.getId()) {
+			return &f
 		}
 	}
 

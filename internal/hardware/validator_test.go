@@ -4,14 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"net/netip"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/alecthomas/units"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	"github.com/kelseyhightower/envconfig"
 	. "github.com/onsi/ginkgo"
@@ -24,6 +26,7 @@ import (
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/mock/gomock"
 	"k8s.io/utils/ptr"
 )
 
@@ -37,6 +40,10 @@ const (
 	defaultMasterRam                    = 1024
 	defaultMasterDiskSize               = 10
 	defaultMasterDiskSpeedThreshold     = 4
+	defaultArbiterCores                 = 1
+	defaultArbiterRam                   = 1536
+	defaultArbiterDiskSize              = 15
+	defaultArbiterDiskSpeedThreshold    = 3
 	defaultWorkerCores                  = 2
 	defaultWorkerRam                    = 2048
 	defaultWorkerDiskSize               = 20
@@ -53,39 +60,47 @@ var _ = Describe("Disk eligibility", func() {
 	const (
 		minDiskSizeGb = 100
 	)
-	var versionRequirements = VersionedRequirementsDecoder{
+	var defaultVersionRequirementsData = map[string]models.VersionedHostRequirements{
 		"default": {
 			Version: "default",
-			MasterRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultMasterCores,
-				RAMMib:                           defaultMasterRam,
-				DiskSizeGb:                       minDiskSizeGb,
-				InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
+			MasterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultMasterCores)),
+				RAMMib:                           ptr.To(int64(defaultMasterRam)),
+				DiskSizeGb:                       ptr.To(int64(minDiskSizeGb)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultMasterDiskSpeedThreshold)),
 			},
-			WorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultWorkerCores,
-				RAMMib:                           defaultWorkerRam,
-				DiskSizeGb:                       minDiskSizeGb,
-				InstallationDiskSpeedThresholdMs: defaultWorkerDiskSpeedThreshold,
+			ArbiterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultArbiterCores)),
+				RAMMib:                           ptr.To(int64(defaultArbiterRam)),
+				DiskSizeGb:                       ptr.To(int64(minDiskSizeGb)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultArbiterDiskSpeedThreshold)),
 			},
-			SNORequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultSnoCores,
-				RAMMib:                           defaultSnoRam,
-				DiskSizeGb:                       minDiskSizeGb,
-				InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
+			WorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultWorkerCores)),
+				RAMMib:                           ptr.To(int64(defaultWorkerRam)),
+				DiskSizeGb:                       ptr.To(int64(minDiskSizeGb)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultWorkerDiskSpeedThreshold)),
 			},
-			EdgeWorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultEdgeWorkerCores,
-				RAMMib:                           defaultEdgeWorkerRam,
-				DiskSizeGb:                       defaultEdgeWorkerDiskSize,
-				InstallationDiskSpeedThresholdMs: defaultEdgeWorkerDiskSpeedThreshold,
+			SNORequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultSnoCores)),
+				RAMMib:                           ptr.To(int64(defaultSnoRam)),
+				DiskSizeGb:                       ptr.To(int64(minDiskSizeGb)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultMasterDiskSpeedThreshold)),
+			},
+			EdgeWorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultEdgeWorkerCores)),
+				RAMMib:                           ptr.To(int64(defaultEdgeWorkerRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultEdgeWorkerDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultEdgeWorkerDiskSpeedThreshold)),
 			},
 		},
 	}
+	var versionRequirements = NewVersionedRequirementsDecoderFromMap(defaultVersionRequirementsData)
 
 	var (
 		hwvalidator          Validator
 		testDisk             models.Disk
+		inventory            *models.Inventory
 		bigEnoughSize        int64
 		tooSmallSize         int64
 		ctx                  context.Context
@@ -123,6 +138,12 @@ var _ = Describe("Disk eligibility", func() {
 			DriveType: models.DriveTypeSSD,
 			SizeBytes: bigEnoughSize,
 		}
+		inventory = &models.Inventory{
+			Disks: []*models.Disk{&testDisk},
+			CPU: &models.CPU{
+				Architecture: models.ClusterCPUArchitectureX8664,
+			},
+		}
 		ctx = context.TODO()
 	})
 
@@ -133,253 +154,524 @@ var _ = Describe("Disk eligibility", func() {
 	It("Check if SSD is eligible", func() {
 		testDisk.DriveType = models.DriveTypeSSD
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env SSD is eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
 	It("Check if HDD is eligible", func() {
 		testDisk.DriveType = models.DriveTypeHDD
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env HDD is eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
-	It("Check if iSCSI is eligible only on newer OCI clusters", func() {
+	It("Check if iSCSI is eligible", func() {
 		testDisk.DriveType = models.DriveTypeISCSI
+		testDisk.Name = "iscsi0"
 		cluster.OpenshiftVersion = "4.15.0"
 		hostInventory, _ := common.UnmarshalInventory(host.Inventory)
-		hostInventory.SystemVendor.Manufacturer = "OracleCloud.com"
-		hw, _ := json.Marshal(&hostInventory)
-		host.Inventory = string(hw)
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
 
+		// Add a default IPv6 route
+		inventory.Routes = append(hostInventory.Routes, &models.Route{
+			Family:      int32(common.IPv6),
+			Interface:   "eth0",
+			Gateway:     "fe80:db8::1",
+			Destination: "::",
+			Metric:      600,
+		})
+		inventory.Interfaces = hostInventory.Interfaces
+
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Check iSCSI is not eligible when host IPv4 address isn't set")
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(ContainElement(iscsiHostIPNotAvailable))
+
+		By("Check iSCSI is not eligible when host IPv4 address is an empty string")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: ""}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(iscsiHostIPNotAvailable))
+
+		By("Check iSCSI is eligible when host IPv4 address is not part of default network interface")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check iSCSI is not eligible when host IPv4 address is part of default network interface")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "1.2.3.4"}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongISCSINetworkTemplate, "1.2.3.4")))
+
+		By("Check iSCSI is eligible when host IPv6 address is not part of default network interface")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "1002:db8::10"}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check iSCSI is not eligible when host IPv6 address is part of default network interface")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "1001:db8::10"}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongISCSINetworkTemplate, "1001:db8::10")))
 
 		By("Check iSCSI on older version is not eligible")
-		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil)
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
 		cluster.OpenshiftVersion = "4.14.1"
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
-
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).To(ContainElement("Drive type is iSCSI, it must be one of HDD, SSD, Multipath, RAID, FC."))
 
-		By("Check infra env iSCSI is not eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
-
+		By("Check iSCSI is eligible on day2 cluster")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.OpenshiftVersion = ""
+		infraEnv.OpenshiftVersion = "4.16"
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check infra env iSCSI is eligible")
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check that iSCSI is not eligible when its holder is Multipath.", func() {
+			testDisk.Holders = "dm-0"
+			allDisks := []*models.Disk{&testDisk, {Name: "iscsi0", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}, {Name: "dm-0", DriveType: models.DriveTypeMultipath}}
+			inventory.Disks = allDisks
+
+			notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(diskIsMultipathMember, "dm-0")))
+		})
+	})
+
+	It("Check iSCSI on a dual-homed host with a default route on every NIC", func() {
+		const (
+			managementIP = "10.238.146.168"
+			iSCSIHostIP  = "172.165.4.111"
+		)
+
+		testDisk.DriveType = models.DriveTypeISCSI
+		testDisk.Name = "sda"
+		cluster.OpenshiftVersion = "4.15.0"
+
+		inventory.Interfaces = []*models.Interface{
+			{Name: "eno5", IPV4Addresses: []string{managementIP + "/24"}},
+			{Name: "eno6", IPV4Addresses: []string{iSCSIHostIP + "/16"}},
+		}
+		inventory.Routes = []*models.Route{
+			{Family: int32(common.IPv4), Interface: "eno6", Gateway: "172.165.0.1", Destination: "0.0.0.0", Metric: 100},
+			{Family: int32(common.IPv4), Interface: "eno5", Gateway: "10.238.146.1", Destination: "0.0.0.0", Metric: 101},
+		}
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: iSCSIHostIP}
+
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Check iSCSI is eligible while the machine network is unknown and the default route is ambiguous")
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check iSCSI is eligible once the machine network shows the cluster claims the other NIC")
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "10.238.146.0/24"}}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check iSCSI is not eligible when the session really does run over the machine network NIC")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: managementIP}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongISCSINetworkTemplate, managementIP)))
+
+		By("Check the default route still decides when the host owns exactly one")
+		cluster.MachineNetworks = nil
+		inventory.Routes = inventory.Routes[:1]
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: iSCSIHostIP}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongISCSINetworkTemplate, iSCSIHostIP)))
+
+		By("Check machine networks that are malformed or of another family do not count as known")
+		const iSCSIHostIPv6 = "2001:db8:1::10"
+		inventory.Interfaces[0].IPV6Addresses = []string{iSCSIHostIPv6 + "/64"}
+		inventory.Routes = []*models.Route{
+			{Family: int32(common.IPv6), Interface: "eno5", Gateway: "2001:db8:1::1", Destination: "::", Metric: 100},
+		}
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "not-a-cidr"}, {Cidr: "10.238.146.0/24"}}
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: iSCSIHostIPv6}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongISCSINetworkTemplate, iSCSIHostIPv6)))
+	})
+
+	It("Check if RAID is eligible", func() {
+		testDisk.DriveType = models.DriveTypeRAID
+
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Check RAID is eligible when openshift version is 4.14")
+		cluster.OpenshiftVersion = "4.14.0"
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check RAID on older version is not eligible")
+		cluster.OpenshiftVersion = "4.13.0"
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement("Drive type is RAID, it must be one of HDD, SSD, Multipath, FC."))
+
+		By("Check infra env RAID is not eligible")
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement("Drive type is RAID, it must be one of HDD, SSD, Multipath, FC."))
 	})
 
 	It("Check that FC multipath is eligible", func() {
 		testDisk.Name = "dm-0"
 		testDisk.DriveType = models.DriveTypeMultipath
 		allDisks := []*models.Disk{&testDisk, {Name: "sda", DriveType: models.DriveTypeFC, Holders: "dm-0"}, {Name: "sdb", DriveType: models.DriveTypeFC, Holders: "dm-0"}}
+		inventory.Disks = allDisks
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, allDisks)
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env FC multipath is eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, allDisks)
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
-	It("Check that iSCSI multipath is not eligible", func() {
+	It("Check that FC disk with multipath holder is not eligible", func() {
+		testDisk.DriveType = models.DriveTypeFC
+		testDisk.Holders = "dm-0"
+		allDisks := []*models.Disk{&testDisk, {Name: "sdb", DriveType: models.DriveTypeFC, Holders: "dm-0"}, {Name: "dm-0", DriveType: models.DriveTypeMultipath}}
+		inventory.Disks = allDisks
+
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(diskIsMultipathMember, "dm-0")))
+	})
+
+	It("Check that mixed types under multipath isn't eligible", func() {
+		testDisk.Name = "dm-0"
+		testDisk.DriveType = models.DriveTypeMultipath
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Most of iSCSI, few of FC")
+		allDisks := []*models.Disk{&testDisk, {Name: "sda", DriveType: models.DriveTypeFC, Holders: "dm-0"}, {Name: "sdb", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}, {Name: "sdc", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}}
+		inventory.Disks = allDisks
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(mixedTypesInMultipath))
+
+		By("Most of FC, few of iSCSI")
+		allDisks = []*models.Disk{&testDisk, {Name: "sda", DriveType: models.DriveTypeFC, Holders: "dm-0"}, {Name: "sdb", DriveType: models.DriveTypeFC, Holders: "dm-0"}, {Name: "sdc", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}}
+		inventory.Disks = allDisks
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(mixedTypesInMultipath))
+	})
+	It("Check that Multipath with anything other than FC/iSCSI is not eligible.", func() {
+		testDisk.Name = "dm-0"
+		testDisk.DriveType = models.DriveTypeMultipath
+		allDisks := []*models.Disk{&testDisk, {Name: "sda", DriveType: models.DriveTypeUnknown, Holders: "dm-0"}, {Name: "sdb", DriveType: models.DriveTypeUnknown, Holders: "dm-0"}}
+		inventory.Disks = allDisks
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(fmt.Sprintf(wrongMultipathTypeTemplate, strings.Join([]string{string(models.DriveTypeFC), string(models.DriveTypeISCSI)}, ", "))))
+	})
+	It("Check that Multipath iSCSI is eligible", func() {
 		testDisk.Name = "dm-0"
 		testDisk.DriveType = models.DriveTypeMultipath
 		allDisks := []*models.Disk{&testDisk, {Name: "sda", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}, {Name: "sdb", DriveType: models.DriveTypeISCSI, Holders: "dm-0"}}
+		inventory.Disks = allDisks
+		cluster.OpenshiftVersion = "4.15.0"
+		hostInventory, _ := common.UnmarshalInventory(host.Inventory)
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, allDisks)
+		// Add a default IPv6 route
+		inventory.Routes = append(hostInventory.Routes, &models.Route{
+			Family:      int32(common.IPv6),
+			Interface:   "eth0",
+			Gateway:     "fe80:db8::1",
+			Destination: "::",
+			Metric:      600,
+		})
+		inventory.Interfaces = hostInventory.Interfaces
 
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Check Multipath iSCSI is not eligible when host IPv4 address isn't set")
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).To(ContainElement(ErrsInIscsiDisableMultipathInstallation))
 
-		By("Check infra env iSCSI multipath is not eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, allDisks)
-
+		By("Check Multipath iSCSI is eligible when host IPv4 address is not part of default network interface")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty(), fmt.Sprintf("Debug info: inventory: %s", host.Inventory))
+
+		By("Check Multipath iSCSI is not eligible when host IPv4 address is part of default network interface")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "1.2.3.4"}
+		}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(ErrsInIscsiDisableMultipathInstallation))
+
+		By("Check Multipath iSCSI is eligible when host IPv6 address is not part of default network interface")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "1002:db8::10"}
+		}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check Multipath iSCSI is not eligible when host IPv6 address is part of default network interface")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "1001:db8::10"}
+		}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(ErrsInIscsiDisableMultipathInstallation))
+
+		By("Check Multipath iSCSI on older version is not eligible")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		}
+		cluster.OpenshiftVersion = "4.14.1"
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(ContainElement(ErrsInIscsiDisableMultipathInstallation))
+
+		By("Check Multipath iSCSI is eligible on day2 cluster")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		}
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.OpenshiftVersion = ""
+		infraEnv.OpenshiftVersion = "4.16"
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check infra env Multipath iSCSI is eligible")
+		for _, disk := range allDisks {
+			disk.Iscsi = &models.Iscsi{HostIPAddress: "4.5.6.7"}
+		}
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
-
-	It("Check if FC is not eligible on non-s390x", func() {
+	It("Check if FC is not eligible on non-s390x/x86_64", func() {
 		testDisk.DriveType = models.DriveTypeFC
+		inventory.CPU.Architecture = models.ClusterCPUArchitectureArm64
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
-
-		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
-
-		By("Check infra env FC is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
+
+		By("Check infra env FC is only eligible for s390x/x86_64")
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 	})
 
 	It("Check if FC is eligible for s390x", func() {
 		testDisk.DriveType = models.DriveTypeFC
+		inventory.CPU.Architecture = models.ClusterCPUArchitectureS390x
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
-
-		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
-
-		By("Check infra env FC is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check infra env FC is eligible for s390x")
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+	})
+
+	It("Check if FC is eligible for x86_64", func() {
+		testDisk.DriveType = models.DriveTypeFC
+		inventory.CPU.Architecture = models.ClusterCPUArchitectureX8664
+
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
+
+		By("Check infra env FC is eligible for x86_64")
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
 	It("Check if ECKD is not eligible on non-s390x", func() {
 		testDisk.DriveType = models.DriveTypeECKD
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 
 		By("Check infra env ECKD is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 	})
 
 	It("Check if ECKD is eligible for s390x", func() {
 		testDisk.DriveType = models.DriveTypeECKD
+		inventory.CPU.Architecture = models.ClusterCPUArchitectureS390x
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env ECKD is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
 	It("Check if FBA is not eligible on non-s390x", func() {
 		testDisk.DriveType = models.DriveTypeFBA
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 
 		By("Check infra env FBA is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 	})
 
 	It("Check if FBA is eligible for s390x", func() {
 		testDisk.DriveType = models.DriveTypeFBA
+		inventory.CPU.Architecture = models.ClusterCPUArchitectureS390x
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env FBA is only eligible for s390x")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureS390x, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 	})
 
 	It("Check that ODD is not eligible", func() {
 		testDisk.DriveType = models.DriveTypeODD
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 
 		By("Check infra-env ODD is not eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 	})
 
 	It("Check that a big enough size is eligible", func() {
 		testDisk.SizeBytes = bigEnoughSize
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra-env a big enough size is eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
 		By("Check infra env take a master configuration in case it is smaller than workers")
-		versionRequirements["default"].MasterRequirements.DiskSizeGb = minDiskSizeGb - 2
+		*defaultVersionRequirementsData["default"].MasterRequirements.DiskSizeGb = int64(minDiskSizeGb - 2)
 		tooSmallSizeForWorker := conversions.GbToBytes(minDiskSizeGb) - 1
 		testDisk.SizeBytes = tooSmallSizeForWorker
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(BeEmpty())
+		Expect(notEligibleReasons).To(BeEmpty())
 
-		versionRequirements["default"].MasterRequirements.DiskSizeGb = minDiskSizeGb
+		*defaultVersionRequirementsData["default"].MasterRequirements.DiskSizeGb = int64(minDiskSizeGb)
 	})
 
 	It("Check that a small size is not eligible", func() {
 		testDisk.SizeBytes = tooSmallSize
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 
 		By("Check infra-env a small size is not eligible")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).ToNot(BeEmpty())
+		Expect(notEligibleReasons).ToNot(BeEmpty())
 	})
 
 	It("Check that existing non-eligibility reasons are preserved", func() {
 		existingReasons := []string{"Reason 1", "Reason 2"}
 		testDisk.InstallationEligibility.NotEligibleReasons = existingReasons
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ConsistOf(existingReasons))
+		Expect(notEligibleReasons).To(ConsistOf(existingReasons))
 
 		By("Check infra-env existing non-eligibility reasons are preserved")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ConsistOf(existingReasons))
+		Expect(notEligibleReasons).To(ConsistOf(existingReasons))
 	})
 
 	It("Check that a small size reason is added to existing reasons", func() {
@@ -388,18 +680,18 @@ var _ = Describe("Disk eligibility", func() {
 
 		testDisk.SizeBytes = tooSmallSize
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ContainElements(existingReasons))
-		Expect(eligible).To(HaveLen(len(existingReasons) + 1))
+		Expect(notEligibleReasons).To(ContainElements(existingReasons))
+		Expect(notEligibleReasons).To(HaveLen(len(existingReasons) + 1))
 
 		By("Check infra env a small size reason is added to existing reasons")
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, nil, &host, inventory)
 
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ContainElements(existingReasons))
-		Expect(eligible).To(HaveLen(len(existingReasons) + 1))
+		Expect(notEligibleReasons).To(ContainElements(existingReasons))
+		Expect(notEligibleReasons).To(HaveLen(len(existingReasons) + 1))
 	})
 
 	It("Check that a old service reasons have been purged", func() {
@@ -409,16 +701,252 @@ var _ = Describe("Disk eligibility", func() {
 
 		testDisk.SizeBytes = tooSmallSize
 
-		eligible, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ContainElements(existingReasons))
-		Expect(eligible).To(HaveLen(len(existingReasons) + 1))
+		Expect(notEligibleReasons).To(ContainElements(existingReasons))
+		Expect(notEligibleReasons).To(HaveLen(len(existingReasons) + 1))
 
 		testDisk.InstallationEligibility.NotEligibleReasons = existingReasons
-		eligible, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, models.ClusterCPUArchitectureX8664, []*models.Disk{&testDisk})
+		notEligibleReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(eligible).To(ContainElements(existingReasons))
-		Expect(eligible).To(HaveLen(len(existingReasons) + 1))
+		Expect(notEligibleReasons).To(ContainElements(existingReasons))
+		Expect(notEligibleReasons).To(HaveLen(len(existingReasons) + 1))
+	})
+
+	It("Check all error message types are properly deduplicated", func() {
+		cluster.OpenshiftVersion = "4.15.0"
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		By("Check tooSmallDiskTemplate deduplication")
+		// Use a small disk that will fail the size check
+		testDisk.SizeBytes = tooSmallSize
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		// The validator now uses preciseHumanizeBytes, so we need to match that format
+		// For 99999999999 bytes (100GB-1), preciseHumanizeBytes shows "100 GB"
+		// For 100000000000 bytes (100GB), preciseHumanizeBytes shows "100 GB"
+		diskSizeStr := "100 GB (short by 1 B)"
+		reqSizeStr := "100 GB" // 100000000000 bytes shows as 100 GB with precise function
+
+		expectedMsg := fmt.Sprintf(
+			tooSmallDiskTemplate,
+			diskSizeStr,
+			reqSizeStr,
+		)
+
+		// First call to generate the error
+		firstCallReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(expectedMsg))
+
+		// Second call should deduplicate
+		secondCallReasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(expectedMsg))
+
+		By("Check wrongDriveTypeTemplate deduplication")
+		// Reset disk size and set invalid drive type
+		testDisk.SizeBytes = bigEnoughSize
+		testDisk.DriveType = models.DriveTypeODD
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		expectedMsg = fmt.Sprintf(
+			wrongDriveTypeTemplate,
+			testDisk.DriveType,
+			strings.Join(hwvalidator.(*validator).getValidDeviceStorageTypes(inventory.CPU.Architecture, cluster.OpenshiftVersion), ", "),
+		)
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(expectedMsg))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(expectedMsg))
+
+		By("Check wrongMultipathTypeTemplate deduplication")
+		testDisk.DriveType = models.DriveTypeMultipath
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+		// Empty inventory.Disks to trigger the multipath error
+		inventory.Disks = []*models.Disk{&testDisk}
+
+		expectedMsg = fmt.Sprintf(wrongMultipathTypeTemplate, fmt.Sprintf("%s, %s", models.DriveTypeFC, models.DriveTypeISCSI))
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(expectedMsg))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(expectedMsg))
+
+		By("Check mixedTypesInMultipath deduplication")
+		testDisk.DriveType = models.DriveTypeMultipath
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		// Add both FC and iSCSI disks to trigger mixed types error
+		fcDisk := models.Disk{Name: "sda", DriveType: models.DriveTypeFC, Holders: testDisk.Name}
+		iscsiDisk := models.Disk{
+			Name:      "sdb",
+			DriveType: models.DriveTypeISCSI,
+			Holders:   testDisk.Name,
+			// Add valid iSCSI config to prevent iSCSI validation error
+			Iscsi: &models.Iscsi{HostIPAddress: "4.5.6.7"},
+		}
+		inventory.Disks = []*models.Disk{&testDisk, &fcDisk, &iscsiDisk}
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(mixedTypesInMultipath))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(mixedTypesInMultipath))
+
+		By("Check ErrsInIscsiDisableMultipathInstallation deduplication")
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		testDisk.Name = "dm-0"
+		testDisk.DriveType = models.DriveTypeMultipath
+
+		iscsiDisk = models.Disk{
+			Name:      "sda",
+			DriveType: models.DriveTypeISCSI,
+			Holders:   testDisk.Name,
+			// Missing Iscsi config to trigger the error
+		}
+
+		inventory.Disks = []*models.Disk{&testDisk, &iscsiDisk}
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(ErrsInIscsiDisableMultipathInstallation))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(ErrsInIscsiDisableMultipathInstallation))
+
+		By("Check iscsiHostIPNotAvailable deduplication")
+		testDisk.DriveType = models.DriveTypeISCSI
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+		// No iSCSI config to trigger the error
+		testDisk.Iscsi = nil
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(iscsiHostIPNotAvailable))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(iscsiHostIPNotAvailable))
+
+		By("Check wrongISCSINetworkTemplate deduplication")
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: "1.2.3.4"}
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		// Setup routes and interfaces to trigger the network error
+		inventory.Routes = []*models.Route{{
+			Family:      int32(common.IPv4),
+			Interface:   "eth0",
+			Gateway:     "192.168.1.1",
+			Destination: "0.0.0.0",
+		}}
+		inventory.Interfaces = []*models.Interface{{
+			Name:          "eth0",
+			IPV4Addresses: []string{"1.2.3.4/24"},
+		}}
+
+		expectedMsg = fmt.Sprintf(wrongISCSINetworkTemplate, "1.2.3.4")
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(expectedMsg))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(expectedMsg))
+
+		By("Check iscsiNetworkInterfaceNotFound deduplication")
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+		// Keep route but remove interface to trigger not found error
+		cluster.MachineNetworks = nil
+		inventory.Interfaces = []*models.Interface{}
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(iscsiNetworkInterfaceNotFound))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(iscsiNetworkInterfaceNotFound))
+
+		By("Check iscsiHostIPParseErrorTemplate deduplication")
+		invalidIP := "invalid-ip-address"
+		testDisk.DriveType = models.DriveTypeISCSI
+		testDisk.Iscsi = &models.Iscsi{HostIPAddress: invalidIP}
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		// Simulate the same parse error the real code would produce
+		_, parseErr := netip.ParseAddr(invalidIP)
+		expectedMsg = fmt.Errorf(iscsiHostIPParseErrorTemplate, invalidIP, parseErr).Error()
+
+		// First call to generate the error
+		firstCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(firstCallReasons).To(HaveLen(1))
+		Expect(firstCallReasons[0]).To(Equal(expectedMsg))
+
+		// Second call should deduplicate
+		secondCallReasons, err = hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(secondCallReasons).To(HaveLen(1))
+		Expect(secondCallReasons[0]).To(Equal(expectedMsg))
+	})
+
+	It("shows precise size in too small error message (99.9 GB vs 100 GB)", func() {
+		cluster.OpenshiftVersion = "4.14"
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return([]*models.OperatorHostRequirements{}, nil).AnyTimes()
+
+		testDisk.SizeBytes = int64(99900000000)
+		testDisk.InstallationEligibility.NotEligibleReasons = []string{}
+
+		reasons, err := hwvalidator.DiskIsEligible(ctx, &testDisk, infraEnv, &cluster, &host, inventory)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(reasons).To(HaveLen(1))
+		expected := fmt.Sprintf(tooSmallDiskTemplate, "99.9 GB", "100 GB")
+		Expect(reasons[0]).To(Equal(expected))
 	})
 })
 
@@ -510,6 +1038,67 @@ var _ = Describe("hardware_validator", func() {
 		Expect(disks[8].Name).Should(Equal("nvme01fs3"))
 	})
 
+	It("validate_bootable_disk_preferred", func() {
+		eligible := models.DiskInstallationEligibility{
+			Eligible: true,
+		}
+
+		inventory.Disks = []*models.Disk{
+			{DriveType: models.DriveTypeSSD, Name: "nvme0", SizeBytes: validDiskSize, InstallationEligibility: eligible, Bootable: false},
+			{DriveType: models.DriveTypeSSD, Name: "nvme1", SizeBytes: validDiskSize, InstallationEligibility: eligible, Bootable: true},
+		}
+		hw, err := json.Marshal(&inventory)
+		Expect(err).NotTo(HaveOccurred())
+		host1.Inventory = string(hw)
+		disks, err := hwvalidator.GetHostValidDisks(host1)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(disks)).Should(Equal(2))
+		Expect(disks[0].Name).Should(Equal("nvme1"))
+		Expect(disks[0].Bootable).Should(BeTrue())
+		Expect(disks[1].Name).Should(Equal("nvme0"))
+		Expect(disks[1].Bootable).Should(BeFalse())
+	})
+
+	It("validate_bootable_disk_preferred_over_non_nvme", func() {
+		eligible := models.DiskInstallationEligibility{
+			Eligible: true,
+		}
+
+		inventory.Disks = []*models.Disk{
+			{DriveType: models.DriveTypeHDD, Name: "sda", SizeBytes: validDiskSize, InstallationEligibility: eligible, Bootable: false},
+			{DriveType: models.DriveTypeSSD, Name: "nvme0", SizeBytes: validDiskSize, InstallationEligibility: eligible, Bootable: true},
+		}
+		hw, err := json.Marshal(&inventory)
+		Expect(err).NotTo(HaveOccurred())
+		host1.Inventory = string(hw)
+		disks, err := hwvalidator.GetHostValidDisks(host1)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(disks)).Should(Equal(2))
+		Expect(disks[0].Name).Should(Equal("nvme0"))
+		Expect(disks[0].Bootable).Should(BeTrue())
+	})
+
+	It("validate_multiple_bootable_disks_sorted_by_size", func() {
+		eligible := models.DiskInstallationEligibility{
+			Eligible: true,
+		}
+
+		inventory.Disks = []*models.Disk{
+			{DriveType: models.DriveTypeSSD, Name: "nvme0", SizeBytes: validDiskSize, InstallationEligibility: eligible, Bootable: true, Hctl: "N:0:1:3"},
+			{DriveType: models.DriveTypeSSD, Name: "nvme1", SizeBytes: validDiskSize * 200, InstallationEligibility: eligible, Bootable: true, Hctl: "N:0:1:2"},
+			{DriveType: models.DriveTypeSSD, Name: "nvme2", SizeBytes: validDiskSize * 400, InstallationEligibility: eligible, Bootable: true, Hctl: "N:0:1:1"},
+		}
+		hw, err := json.Marshal(&inventory)
+		Expect(err).NotTo(HaveOccurred())
+		host1.Inventory = string(hw)
+		disks, err := hwvalidator.GetHostValidDisks(host1)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(disks)).Should(Equal(3))
+		Expect(disks[0].Name).Should(Equal("nvme0"))
+		Expect(disks[1].Name).Should(Equal("nvme1"))
+		Expect(disks[2].Name).Should(Equal("nvme2"))
+	})
+
 	It("validate_aws_disk_detected", func() {
 		inventory.Disks = []*models.Disk{
 			{
@@ -560,6 +1149,12 @@ var _ = Describe("Cluster host requirements", func() {
 				"disk_size_gb":                         defaultMasterDiskSize,
 				"installation_disk_speed_threshold_ms": defaultMasterDiskSpeedThreshold,
 			},
+			"arbiter": map[string]interface{}{
+				"cpu_cores":                            defaultArbiterCores,
+				"ram_mib":                              defaultArbiterRam,
+				"disk_size_gb":                         defaultArbiterDiskSize,
+				"installation_disk_speed_threshold_ms": defaultArbiterDiskSpeedThreshold,
+			},
 			"worker": map[string]interface{}{
 				"cpu_cores":                            defaultWorkerCores,
 				"ram_mib":                              defaultWorkerRam,
@@ -582,19 +1177,22 @@ var _ = Describe("Cluster host requirements", func() {
 		{
 			"version": "4.6",
 			"master": map[string]interface{}{
-				"cpu_cores":    4,
-				"ram_mib":      16384,
-				"disk_size_gb": 100,
+				"cpu_cores":                            4,
+				"ram_mib":                              16384,
+				"disk_size_gb":                         100,
+				"installation_disk_speed_threshold_ms": 0,
 			},
 			"worker": map[string]interface{}{
-				"cpu_cores":    2,
-				"ram_mib":      8192,
-				"disk_size_gb": 100,
+				"cpu_cores":                            2,
+				"ram_mib":                              8192,
+				"disk_size_gb":                         100,
+				"installation_disk_speed_threshold_ms": 0,
 			},
 			"sno": map[string]interface{}{
-				"cpu_cores":    8,
-				"ram_mib":      16384,
-				"disk_size_gb": 100,
+				"cpu_cores":                            8,
+				"ram_mib":                              16384,
+				"disk_size_gb":                         100,
+				"installation_disk_speed_threshold_ms": 0,
 			},
 		},
 		{
@@ -657,7 +1255,6 @@ var _ = Describe("Cluster host requirements", func() {
 		_ = os.Setenv(prefixedRequirementsEnv, string(versionRequirements))
 		_ = os.Setenv("EDGE_WORKERS_PRODUCT_NAMES", "test, BlueField SoC,marvell")
 		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ShouldNot(HaveOccurred())
-		Expect(cfg.VersionedRequirements).ToNot(HaveKey(openShiftVersionNotInJSON))
 		details1 = models.ClusterHostRequirementsDetails{
 			InstallationDiskSpeedThresholdMs: 10,
 			RAMMib:                           1024,
@@ -722,7 +1319,7 @@ var _ = Describe("Cluster host requirements", func() {
 		role := models.HostRoleMaster
 		id1 := strfmt.UUID(uuid.New().String())
 		host = &models.Host{ID: &id1, ClusterID: cluster.ID, Role: role}
-		cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+		cluster.ControlPlaneCount = 1
 
 		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Eq(cluster), gomock.Eq(host)).Return(operatorRequirements, nil)
 
@@ -742,6 +1339,33 @@ var _ = Describe("Cluster host requirements", func() {
 		Expect(result.Total.CPUCores).To(BeEquivalentTo(defaultSnoCores + details1.CPUCores + details2.CPUCores))
 		Expect(result.Total.RAMMib).To(BeEquivalentTo(defaultSnoRam + details1.RAMMib + details2.RAMMib))
 		Expect(result.Total.InstallationDiskSpeedThresholdMs).To(BeEquivalentTo(defaultMasterDiskSpeedThreshold))
+	})
+
+	It("should contain correct default requirements for arbiter host", func() {
+		role := models.HostRoleArbiter
+		id1 := strfmt.UUID(uuid.New().String())
+		host = &models.Host{ID: &id1, ClusterID: cluster.ID, Role: role}
+
+		operatorsMock.EXPECT().GetRequirementsBreakdownForHostInCluster(gomock.Any(), gomock.Eq(cluster), gomock.Eq(host)).Return(operatorRequirements, nil)
+
+		result, err := hwvalidator.GetClusterHostRequirements(context.TODO(), cluster, host)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result).ToNot(BeNil())
+
+		Expect(result.Ocp.DiskSizeGb).To(BeEquivalentTo(defaultArbiterDiskSize))
+		Expect(result.Ocp.CPUCores).To(BeEquivalentTo(defaultArbiterCores))
+		Expect(result.Ocp.RAMMib).To(BeEquivalentTo(defaultArbiterRam))
+		Expect(result.Ocp.InstallationDiskSpeedThresholdMs).To(BeEquivalentTo(defaultArbiterDiskSpeedThreshold))
+
+		Expect(result.Operators).To(ConsistOf(operatorRequirements))
+
+		Expect(result.Total.DiskSizeGb).To(BeEquivalentTo(defaultArbiterDiskSize + details1.DiskSizeGb + details2.DiskSizeGb))
+		Expect(result.Total.CPUCores).To(BeEquivalentTo(defaultArbiterCores + details1.CPUCores + details2.CPUCores))
+		Expect(result.Total.RAMMib).To(BeEquivalentTo(defaultArbiterRam + details1.RAMMib + details2.RAMMib))
+		Expect(result.Total.InstallationDiskSpeedThresholdMs).To(BeEquivalentTo(defaultArbiterDiskSpeedThreshold))
+		Expect(result.Total.NetworkLatencyThresholdMs).To(Equal(details1.NetworkLatencyThresholdMs))
+		Expect(result.Total.PacketLossPercentage).To(Equal(details1.PacketLossPercentage))
 	})
 
 	It("should contain correct default requirements for worker host", func() {
@@ -1000,84 +1624,101 @@ var _ = Describe("Preflight host requirements", func() {
 		operatorRequirements []*models.OperatorHardwareRequirements
 	)
 
-	var versionRequirements = VersionedRequirementsDecoder{
+	var versionRequirements = NewVersionedRequirementsDecoderFromMap(map[string]models.VersionedHostRequirements{
 		"default": {
 			Version: "default",
-			MasterRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultMasterCores,
-				RAMMib:                           defaultMasterRam,
-				DiskSizeGb:                       defaultMasterDiskSize,
-				InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
+			MasterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultMasterCores)),
+				RAMMib:                           ptr.To(int64(defaultMasterRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultMasterDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultMasterDiskSpeedThreshold)),
 			},
-			WorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultWorkerCores,
-				RAMMib:                           defaultWorkerRam,
-				DiskSizeGb:                       defaultWorkerDiskSize,
-				InstallationDiskSpeedThresholdMs: defaultWorkerDiskSpeedThreshold,
+			ArbiterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultWorkerCores)),
+				RAMMib:                           ptr.To(int64(defaultWorkerRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultWorkerDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultWorkerDiskSpeedThreshold)),
 			},
-			SNORequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultSnoCores,
-				RAMMib:                           defaultSnoRam,
-				DiskSizeGb:                       defaultMasterDiskSize,
-				InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
+			WorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultWorkerCores)),
+				RAMMib:                           ptr.To(int64(defaultWorkerRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultWorkerDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultWorkerDiskSpeedThreshold)),
 			},
-			EdgeWorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         defaultWorkerCores,
-				RAMMib:                           defaultWorkerRam,
-				DiskSizeGb:                       defaultWorkerDiskSize,
-				InstallationDiskSpeedThresholdMs: defaultWorkerDiskSpeedThreshold,
+			SNORequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultSnoCores)),
+				RAMMib:                           ptr.To(int64(defaultSnoRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultMasterDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultMasterDiskSpeedThreshold)),
+			},
+			EdgeWorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(defaultWorkerCores)),
+				RAMMib:                           ptr.To(int64(defaultWorkerRam)),
+				DiskSizeGb:                       ptr.To(int64(defaultWorkerDiskSize)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(defaultWorkerDiskSpeedThreshold)),
 			},
 		},
 		"4.6": {
 			Version: "4.6",
-			MasterRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:   4,
-				RAMMib:     16384,
-				DiskSizeGb: 100,
+			MasterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(4)),
+				RAMMib:     ptr.To(int64(16384)),
+				DiskSizeGb: ptr.To(int64(100)),
 			},
-			WorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:   2,
-				RAMMib:     8192,
-				DiskSizeGb: 100,
+			ArbiterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(2)),
+				RAMMib:     ptr.To(int64(8192)),
+				DiskSizeGb: ptr.To(int64(100)),
 			},
-			SNORequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:   8,
-				RAMMib:     16384,
-				DiskSizeGb: 100,
+			WorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(2)),
+				RAMMib:     ptr.To(int64(8192)),
+				DiskSizeGb: ptr.To(int64(100)),
 			},
-			EdgeWorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:   2,
-				RAMMib:     8192,
-				DiskSizeGb: 100,
+			SNORequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(8)),
+				RAMMib:     ptr.To(int64(16384)),
+				DiskSizeGb: ptr.To(int64(100)),
+			},
+			EdgeWorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(2)),
+				RAMMib:     ptr.To(int64(8192)),
+				DiskSizeGb: ptr.To(int64(100)),
 			},
 		},
 		"4.7": {
 			Version: "4.7",
-			MasterRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         5,
-				RAMMib:                           17408,
-				DiskSizeGb:                       101,
-				InstallationDiskSpeedThresholdMs: 1,
+			MasterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(5)),
+				RAMMib:                           ptr.To(int64(17408)),
+				DiskSizeGb:                       ptr.To(int64(101)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(1)),
 			},
-			WorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         3,
-				RAMMib:                           9216,
-				DiskSizeGb:                       102,
-				InstallationDiskSpeedThresholdMs: 2,
+			ArbiterRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(3)),
+				RAMMib:                           ptr.To(int64(9216)),
+				DiskSizeGb:                       ptr.To(int64(102)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(2)),
 			},
-			SNORequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:   7,
-				RAMMib:     31744,
-				DiskSizeGb: 103,
+			WorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(3)),
+				RAMMib:                           ptr.To(int64(9216)),
+				DiskSizeGb:                       ptr.To(int64(102)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(2)),
 			},
-			EdgeWorkerRequirements: &models.ClusterHostRequirementsDetails{
-				CPUCores:                         3,
-				RAMMib:                           9216,
-				DiskSizeGb:                       102,
-				InstallationDiskSpeedThresholdMs: 2,
+			SNORequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:   ptr.To(int64(7)),
+				RAMMib:     ptr.To(int64(31744)),
+				DiskSizeGb: ptr.To(int64(103)),
+			},
+			EdgeWorkerRequirements: &models.VersionedClusterHostRequirementsDetails{
+				CPUCores:                         ptr.To(int64(3)),
+				RAMMib:                           ptr.To(int64(9216)),
+				DiskSizeGb:                       ptr.To(int64(102)),
+				InstallationDiskSpeedThresholdMs: ptr.To(int64(2)),
 			},
 		},
-	}
+	})
 
 	const (
 		openShiftVersionNotInConfig = "4.5"
@@ -1130,6 +1771,14 @@ var _ = Describe("Preflight host requirements", func() {
 					InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
 				},
 			},
+			Arbiter: &models.HostTypeHardwareRequirements{
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores:                         defaultWorkerCores,
+					DiskSizeGb:                       defaultWorkerDiskSize,
+					RAMMib:                           defaultWorkerRam,
+					InstallationDiskSpeedThresholdMs: defaultWorkerDiskSpeedThreshold,
+				},
+			},
 			Worker: &models.HostTypeHardwareRequirements{
 				Quantitative: &models.ClusterHostRequirementsDetails{
 					CPUCores:                         defaultWorkerCores,
@@ -1144,7 +1793,7 @@ var _ = Describe("Preflight host requirements", func() {
 	})
 
 	It("should contain correct preflight  host requirements - single node", func() {
-		cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+		cluster.ControlPlaneCount = 1
 		operatorsMock.EXPECT().GetPreflightRequirementsBreakdownForCluster(gomock.Any(), gomock.Eq(cluster)).Return(operatorRequirements, nil)
 
 		result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), cluster)
@@ -1159,6 +1808,14 @@ var _ = Describe("Preflight host requirements", func() {
 					DiskSizeGb:                       defaultMasterDiskSize,
 					RAMMib:                           defaultSnoRam,
 					InstallationDiskSpeedThresholdMs: defaultMasterDiskSpeedThreshold,
+				},
+			},
+			Arbiter: &models.HostTypeHardwareRequirements{
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores:                         defaultWorkerCores,
+					DiskSizeGb:                       defaultWorkerDiskSize,
+					RAMMib:                           defaultWorkerRam,
+					InstallationDiskSpeedThresholdMs: defaultWorkerDiskSpeedThreshold,
 				},
 			},
 			Worker: &models.HostTypeHardwareRequirements{
@@ -1202,6 +1859,14 @@ var _ = Describe("Preflight host requirements", func() {
 					InstallationDiskSpeedThresholdMs: 1,
 				},
 			},
+			Arbiter: &models.HostTypeHardwareRequirements{
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores:                         3,
+					DiskSizeGb:                       102,
+					RAMMib:                           9 * int64(units.KiB),
+					InstallationDiskSpeedThresholdMs: 2,
+				},
+			},
 			Worker: &models.HostTypeHardwareRequirements{
 				Quantitative: &models.ClusterHostRequirementsDetails{
 					CPUCores:                         3,
@@ -1234,6 +1899,7 @@ var _ = Describe("Preflight host requirements", func() {
 			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeTrue())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeTrue())
 			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeTrue())
 		})
 
@@ -1254,6 +1920,7 @@ var _ = Describe("Preflight host requirements", func() {
 			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeTrue())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeFalse())
 			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeFalse())
 		})
 
@@ -1274,6 +1941,7 @@ var _ = Describe("Preflight host requirements", func() {
 			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeFalse())
 			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeTrue())
 		})
 
@@ -1294,6 +1962,27 @@ var _ = Describe("Preflight host requirements", func() {
 			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeFalse())
+		})
+
+		It("TPM - unset enable_on with tpmv2 mode is treated as disabled", func() {
+
+			diskEncryptionClusterID := strfmt.UUID(uuid.New().String())
+			diskEncryptionCluster := &common.Cluster{Cluster: models.Cluster{
+				ID:               &diskEncryptionClusterID,
+				OpenshiftVersion: openShiftVersionNotInConfig,
+				DiskEncryption: &models.DiskEncryption{
+					Mode: swag.String(models.DiskEncryptionModeTpmv2),
+				},
+			}}
+
+			operatorsMock.EXPECT().GetPreflightRequirementsBreakdownForCluster(gomock.Any(), gomock.Eq(diskEncryptionCluster)).Return(operatorRequirements, nil)
+
+			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeFalse())
 			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeFalse())
 		})
 
@@ -1314,6 +2003,28 @@ var _ = Describe("Preflight host requirements", func() {
 			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeFalse())
+		})
+
+		It("TPM - arbiters only", func() {
+
+			diskEncryptionClusterID := strfmt.UUID(uuid.New().String())
+			diskEncryptionCluster := &common.Cluster{Cluster: models.Cluster{
+				ID:               &diskEncryptionClusterID,
+				OpenshiftVersion: openShiftVersionNotInConfig,
+				DiskEncryption: &models.DiskEncryption{
+					EnableOn: swag.String(models.DiskEncryptionEnableOnArbiters),
+					Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+				},
+			}}
+
+			operatorsMock.EXPECT().GetPreflightRequirementsBreakdownForCluster(gomock.Any(), gomock.Eq(diskEncryptionCluster)).Return(operatorRequirements, nil)
+
+			result, err := hwvalidator.GetPreflightHardwareRequirements(context.TODO(), diskEncryptionCluster)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Ocp.Master.Quantitative.TpmEnabledInBios).To(BeFalse())
+			Expect(result.Ocp.Arbiter.Quantitative.TpmEnabledInBios).To(BeTrue())
 			Expect(result.Ocp.Worker.Quantitative.TpmEnabledInBios).To(BeFalse())
 		})
 	})

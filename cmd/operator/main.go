@@ -18,16 +18,24 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 
+	certtypes "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
+	hiveext "github.com/openshift/assisted-service/api/hiveextension/v1beta1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/internal/controller/controllers"
+	"github.com/openshift/assisted-service/internal/kubernetes"
 	"github.com/openshift/assisted-service/internal/spoke_k8s_client"
+	"github.com/openshift/assisted-service/internal/system"
+	"github.com/openshift/assisted-service/internal/tlsconfig"
 	"github.com/openshift/assisted-service/models"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -38,10 +46,14 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 )
 
@@ -68,6 +80,36 @@ func init() {
 	utilruntime.Must(apiregv1.AddToScheme(scheme))
 
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
+
+	utilruntime.Must(clusterv1.AddToScheme(scheme))
+
+	utilruntime.Must(configv1.AddToScheme(scheme))
+
+	utilruntime.Must(hivev1.AddToScheme(scheme))
+
+	utilruntime.Must(hiveext.AddToScheme(scheme))
+
+	utilruntime.Must(certtypes.AddToScheme(scheme))
+}
+
+func validateManagedClusterCRDExists(mgr manager.Manager) error {
+	gvk, err := apiutil.GVKForObject(&clusterv1.ManagedCluster{}, mgr.GetScheme())
+	if err != nil {
+		return err
+	}
+	if _, err = mgr.GetRESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getPodIntrospector(log logrus.FieldLogger, mgr manager.Manager) kubernetes.PodIntrospector {
+	introspector, err := kubernetes.NewKubePodIntrospector(mgr.GetClient())
+	if err != nil {
+		log.WithError(err).Error("failed to create pod introspector, using noop introspector")
+		return kubernetes.NewNoopPodIntrospector()
+	}
+	return introspector
 }
 
 func main() {
@@ -84,16 +126,43 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443}),
+
+	restCfg := ctrl.GetConfigOrDie()
+
+	kubeClient, err := client.New(restCfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to initialize client")
+		os.Exit(1)
+	}
+	isOpenShift, err := controllers.ServerIsOpenShift(context.Background(), kubeClient)
+	if err != nil {
+		setupLog.Error(err, "failed to check server")
+		os.Exit(1)
+	}
+
+	tlsResult, err := tlsconfig.ResolveTLSConfig(context.Background(), restCfg, isOpenShift)
+	if err != nil {
+		setupLog.Error(err, "unable to fetch TLS config from APIServer")
+		os.Exit(1)
+	}
+	tlsOpts := []func(*tls.Config){tlsResult.TLSConfig}
+
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443, TLSOpts: tlsOpts}),
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "86f835c3.agent-install.openshift.io",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+	if validateManagedClusterCRDExists(mgr) != nil {
+		setupLog.Error(err, "Managed Cluster CRD does not exist in cluster")
 		os.Exit(1)
 	}
 
@@ -142,16 +211,24 @@ func main() {
 	}
 
 	log := logrus.New()
-	spokeClientFactory := spoke_k8s_client.NewSpokeK8sClientFactory(log)
+	spokeClientFactory, err := spoke_k8s_client.NewFactory(log, nil, system.NewLocalSystemInfo())
+	if err != nil {
+		log.WithError(err).Error("failed to create spoke client factory")
+		os.Exit(1)
+	}
 	spokeClientCache := controllers.NewSpokeClientCache(spokeClientFactory)
 
+	introspector := getPodIntrospector(log, mgr)
 	if err = (&controllers.AgentServiceConfigReconciler{
 		AgentServiceConfigReconcileContext: controllers.AgentServiceConfigReconcileContext{
-			Log:          log,
-			Scheme:       mgr.GetScheme(),
-			NodeSelector: nodeSelector,
-			Tolerations:  tolerations,
-			Recorder:     mgr.GetEventRecorderFor("agentserviceconfig-controller"),
+			Log:             log,
+			Scheme:          mgr.GetScheme(),
+			NodeSelector:    nodeSelector,
+			Tolerations:     tolerations,
+			Recorder:        mgr.GetEventRecorderFor("agentserviceconfig-controller"), //nolint:staticcheck // required few changes
+			PodIntrospector: introspector,
+			IsOpenShift:     isOpenShift,
+			RestConfig:      restCfg,
 		},
 		Client:    mgr.GetClient(),
 		Namespace: ns,
@@ -166,7 +243,9 @@ func main() {
 			Scheme:       mgr.GetScheme(),
 			NodeSelector: nodeSelector,
 			Tolerations:  tolerations,
-			Recorder:     mgr.GetEventRecorderFor("hypershiftagentserviceconfig-controller"),
+			Recorder:     mgr.GetEventRecorderFor("hypershiftagentserviceconfig-controller"), //nolint:staticcheck // required few changes
+			IsOpenShift:  isOpenShift,
+			RestConfig:   restCfg,
 		},
 		Client:       mgr.GetClient(),
 		SpokeClients: spokeClientCache,
@@ -174,7 +253,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "HypershiftAgentServiceConfig")
 		os.Exit(1)
 	}
-	// +kubebuilder:scaffold:builder
+
+	// local cluster import is only relevant if assisted installer can manage/scale the local cluster and this is only the case for OpenShift
+	if isOpenShift {
+		if err = (controllers.NewLocalClusterImportReconciler(mgr.GetClient(), controllers.AgentServiceConfigName, log)).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "LocalClusterImportReconciler")
+			os.Exit(1)
+		}
+	}
 
 	if err := mgr.AddHealthzCheck("health", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -185,8 +271,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+	defer cancel()
+
+	// The APIServer resource only exists on OpenShift, so there is no
+	// cluster-wide TLS profile to watch on other Kubernetes flavors.
+	if isOpenShift {
+		if err := tlsconfig.SetupSecurityProfileWatcher(mgr, tlsResult, cancel); err != nil {
+			setupLog.Error(err, "unable to start TLS profile watcher")
+			os.Exit(1)
+		}
+	}
+
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

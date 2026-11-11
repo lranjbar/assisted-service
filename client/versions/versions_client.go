@@ -21,6 +21,12 @@ type API interface {
 	   V2ListComponentVersions List of component versions.*/
 	V2ListComponentVersions(ctx context.Context, params *V2ListComponentVersionsParams) (*V2ListComponentVersionsOK, error)
 	/*
+	   V2ListReleaseSources Retrieves openshift release sources configuration.*/
+	V2ListReleaseSources(ctx context.Context, params *V2ListReleaseSourcesParams) (*V2ListReleaseSourcesOK, error)
+	/*
+	   V2ListSupportedOfflineOpenshiftVersions Retrieves the list of OpenShift supported offline versions.*/
+	V2ListSupportedOfflineOpenshiftVersions(ctx context.Context, params *V2ListSupportedOfflineOpenshiftVersionsParams) (*V2ListSupportedOfflineOpenshiftVersionsOK, error)
+	/*
 	   V2ListSupportedOpenshiftVersions Retrieves the list of OpenShift supported versions.*/
 	V2ListSupportedOpenshiftVersions(ctx context.Context, params *V2ListSupportedOpenshiftVersionsParams) (*V2ListSupportedOpenshiftVersionsOK, error)
 }
@@ -65,6 +71,56 @@ func (a *Client) V2ListComponentVersions(ctx context.Context, params *V2ListComp
 		return nil, err
 	}
 	return result.(*V2ListComponentVersionsOK), nil
+
+}
+
+/*
+V2ListReleaseSources Retrieves openshift release sources configuration.
+*/
+func (a *Client) V2ListReleaseSources(ctx context.Context, params *V2ListReleaseSourcesParams) (*V2ListReleaseSourcesOK, error) {
+
+	result, err := a.transport.Submit(&runtime.ClientOperation{
+		ID:                 "v2ListReleaseSources",
+		Method:             "GET",
+		PathPattern:        "/v2/release-sources",
+		ProducesMediaTypes: []string{"application/json"},
+		ConsumesMediaTypes: []string{"application/json"},
+		Schemes:            []string{"http", "https"},
+		Params:             params,
+		Reader:             &V2ListReleaseSourcesReader{formats: a.formats},
+		AuthInfo:           a.authInfo,
+		Context:            ctx,
+		Client:             params.HTTPClient,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*V2ListReleaseSourcesOK), nil
+
+}
+
+/*
+V2ListSupportedOfflineOpenshiftVersions Retrieves the list of OpenShift supported offline versions.
+*/
+func (a *Client) V2ListSupportedOfflineOpenshiftVersions(ctx context.Context, params *V2ListSupportedOfflineOpenshiftVersionsParams) (*V2ListSupportedOfflineOpenshiftVersionsOK, error) {
+
+	result, err := a.transport.Submit(&runtime.ClientOperation{
+		ID:                 "v2ListSupportedOfflineOpenshiftVersions",
+		Method:             "GET",
+		PathPattern:        "/v2/offline-openshift-versions",
+		ProducesMediaTypes: []string{"application/json"},
+		ConsumesMediaTypes: []string{"application/json"},
+		Schemes:            []string{"http", "https"},
+		Params:             params,
+		Reader:             &V2ListSupportedOfflineOpenshiftVersionsReader{formats: a.formats},
+		AuthInfo:           a.authInfo,
+		Context:            ctx,
+		Client:             params.HTTPClient,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*V2ListSupportedOfflineOpenshiftVersionsOK), nil
 
 }
 

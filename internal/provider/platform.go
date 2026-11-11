@@ -113,7 +113,7 @@ func checkPlatformWrongParamsInput(platform *models.Platform, userManagedNetwork
 	if userManagedNetworking == nil &&
 		cluster != nil &&
 		platform != nil &&
-		swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeFull && // no need to check SNO, it will be validated later in the update/creation
+		cluster.ControlPlaneCount >= common.MinMasterHostsNeededForInstallationInHaMode && // no need to check SNO, it will be validated later in the update/creation
 		(!(isClusterPlatformBM(cluster) && isPlatformNone(platform)) &&
 			!(isClusterPlatformNone(cluster) && isPlatformBM(platform))) {
 
@@ -210,7 +210,7 @@ func getUpdateParamsForPlatformUMNMandatory(platform *models.Platform, userManag
 		return checkPlaformUpdate(platform, cluster), nil, nil
 	}
 
-	if *cluster.HighAvailabilityMode == models.ClusterHighAvailabilityModeNone {
+	if cluster.ControlPlaneCount == 1 {
 		if !swag.BoolValue(userManagedNetworking) || (platform != nil && !isUMNMandatoryForPlatform(platform)) {
 			return nil, nil, common.NewApiError(http.StatusBadRequest, errors.New("disabling User Managed Networking or setting platform different than none or oci platforms is not allowed in single node Openshift"))
 		}
@@ -256,8 +256,17 @@ func GetActualUpdateClusterPlatformParams(platform *models.Platform, userManaged
 	return platform, userManagedNetworking, nil
 }
 
-func GetClusterPlatformByHighAvailabilityMode(platform *models.Platform, userManagedNetworking *bool, highAvailabilityMode *string) (*models.Platform, *bool, error) {
-	if swag.StringValue(highAvailabilityMode) == models.ClusterHighAvailabilityModeFull {
+func GetClusterPlatformByControlPlaneCount(platform *models.Platform, userManagedNetworking *bool, controlPlaneCount *int64) (*models.Platform, *bool, error) {
+	if controlPlaneCount == nil {
+		return nil, nil, common.NewApiError(http.StatusBadRequest, errors.Errorf("Invalid value for controlPlaneCount: nil"))
+	}
+
+	// Currently arbiter clusters can only be used in baremetal or none platforms, but we will still allow this function to set the platform to other values because of 2 reasons:
+	// 1. The validation comes afterward anyway, since arbiter cluster are allowed to have controlPlaneCount valid for normal HA cluster.
+	// 2. It will make it easier to add support for other platforms in the future.
+	// In practice the second condition is unnecessary since if the first condition is false then the second is also false, but it's clearer to keep it explicitly.
+	if swag.Int64Value(controlPlaneCount) >= common.MinMasterHostsNeededForInstallationInHaArbiterMode ||
+		swag.Int64Value(controlPlaneCount) >= common.MinMasterHostsNeededForInstallationInHaMode {
 		if (platform == nil || isPlatformBM(platform)) && !swag.BoolValue(userManagedNetworking) {
 			return createPlatformFromType(models.PlatformTypeBaremetal), swag.Bool(false), nil
 		}
@@ -270,7 +279,7 @@ func GetClusterPlatformByHighAvailabilityMode(platform *models.Platform, userMan
 				return platform, swag.Bool(true), nil
 			}
 		}
-	} else { // *highAvailabilityMode == models.ClusterHighAvailabilityModeNone
+	} else if swag.Int64Value(controlPlaneCount) == 1 {
 		if isPlatformBM(platform) {
 			return nil, nil, common.NewApiError(http.StatusBadRequest, errors.Errorf("Can't set %s platform on single node OpenShift", *platform.Type))
 		}
@@ -288,7 +297,7 @@ func GetClusterPlatformByHighAvailabilityMode(platform *models.Platform, userMan
 	return nil, nil, common.NewApiError(http.StatusBadRequest, errors.Errorf("Got invalid platform (%s) and/or user-managed-networking (%v)", *platform.Type, userManagedNetworking))
 }
 
-func GetActualCreateClusterPlatformParams(platform *models.Platform, userManagedNetworking *bool, highAvailabilityMode *string, cpuArchitecture string) (*models.Platform, *bool, error) {
+func GetActualCreateClusterPlatformParams(platform *models.Platform, userManagedNetworking *bool, controlPlaneCount *int64, cpuArchitecture string) (*models.Platform, *bool, error) {
 	if err := checkPlatformWrongParamsInput(platform, userManagedNetworking, nil); err != nil {
 		return nil, nil, err
 	}
@@ -298,8 +307,12 @@ func GetActualCreateClusterPlatformParams(platform *models.Platform, userManaged
 	if cpuArchitecture == models.ClusterCPUArchitectureS390x || cpuArchitecture == models.ClusterCPUArchitecturePpc64le {
 		if userManagedNetworking != nil && !*userManagedNetworking {
 			return nil, nil, common.NewApiError(http.StatusBadRequest, errors.Errorf("Can't disable User Managed Networking on %s architecture", cpuArchitecture))
-		} else if platform != nil && !isPlatformNone(platform) {
+		} else if platform != nil && !isPlatformNone(platform) && !common.IsPlatformExternal(platform) {
 			return nil, nil, common.NewApiError(http.StatusBadRequest, errors.Errorf("Can't set %s platform on %s architecture", *platform.Type, cpuArchitecture))
+		}
+		// If platform is external, keep it; otherwise default to none
+		if platform != nil && common.IsPlatformExternal(platform) {
+			return platform, swag.Bool(true), nil
 		}
 		return createPlatformFromType(models.PlatformTypeNone), swag.Bool(true), nil
 	}
@@ -307,7 +320,7 @@ func GetActualCreateClusterPlatformParams(platform *models.Platform, userManaged
 	if platform != nil && !isPlatformBM(platform) && !isUMNMandatoryForPlatform(platform) {
 		return platform, userManagedNetworking, nil
 	}
-	return GetClusterPlatformByHighAvailabilityMode(platform, userManagedNetworking, highAvailabilityMode)
+	return GetClusterPlatformByControlPlaneCount(platform, userManagedNetworking, controlPlaneCount)
 }
 
 func GetPlatformFeatureID(platformType models.PlatformType) models.FeatureSupportLevelID {

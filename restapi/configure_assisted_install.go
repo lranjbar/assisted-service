@@ -52,8 +52,14 @@ type InstallerAPI interface {
 	 */
 	DownloadMinimalInitrd(ctx context.Context, params installer.DownloadMinimalInitrdParams) middleware.Responder
 
-	/* GetClusterSupportedPlatforms A list of platforms that this cluster can support in its current configuration. */
+	/* GetClusterSupportedPlatforms Deprecated. Returns a list of platforms that this cluster can support in its current configuration.
+	   Prefer deriving platform eligibility from cluster hosts and inventory together with
+	   GET /v2/support-levels/features (or GET /v2/support-levels/features/detailed) for the cluster OpenShift version and CPU architecture.
+	*/
 	GetClusterSupportedPlatforms(ctx context.Context, params installer.GetClusterSupportedPlatformsParams) middleware.Responder
+
+	/* GetDetailedSupportedFeatures Retrieves detailed features information including support level, incompatibilities, and operator dependencies. */
+	GetDetailedSupportedFeatures(ctx context.Context, params installer.GetDetailedSupportedFeaturesParams) middleware.Responder
 
 	/* GetInfraEnv Retrieves the details of the infra-env. */
 	GetInfraEnv(ctx context.Context, params installer.GetInfraEnvParams) middleware.Responder
@@ -187,6 +193,9 @@ type InstallerAPI interface {
 	/* V2RegisterCluster Creates a new OpenShift cluster definition. */
 	V2RegisterCluster(ctx context.Context, params installer.V2RegisterClusterParams) middleware.Responder
 
+	/* V2RegisterDisconnectedCluster Create a disconnected OpenShift cluster for offline installation with embedded ignition */
+	V2RegisterDisconnectedCluster(ctx context.Context, params installer.V2RegisterDisconnectedClusterParams) middleware.Responder
+
 	/* V2RegisterHost Registers a new OpenShift agent. */
 	V2RegisterHost(ctx context.Context, params installer.V2RegisterHostParams) middleware.Responder
 
@@ -262,6 +271,12 @@ type ManifestsAPI interface {
 
 /* OperatorsAPI  */
 type OperatorsAPI interface {
+	/* V2GetBundle Get operator properties for a bundle */
+	V2GetBundle(ctx context.Context, params operators.V2GetBundleParams) middleware.Responder
+
+	/* V2ListBundles Get list of available bundles */
+	V2ListBundles(ctx context.Context, params operators.V2ListBundlesParams) middleware.Responder
+
 	/* V2ListOfClusterOperators Lists operators to be monitored for a cluster. */
 	V2ListOfClusterOperators(ctx context.Context, params operators.V2ListOfClusterOperatorsParams) middleware.Responder
 
@@ -281,6 +296,12 @@ type OperatorsAPI interface {
 type VersionsAPI interface {
 	/* V2ListComponentVersions List of component versions. */
 	V2ListComponentVersions(ctx context.Context, params versions.V2ListComponentVersionsParams) middleware.Responder
+
+	/* V2ListReleaseSources Retrieves openshift release sources configuration. */
+	V2ListReleaseSources(ctx context.Context, params versions.V2ListReleaseSourcesParams) middleware.Responder
+
+	/* V2ListSupportedOfflineOpenshiftVersions Retrieves the list of OpenShift supported offline versions. */
+	V2ListSupportedOfflineOpenshiftVersions(ctx context.Context, params versions.V2ListSupportedOfflineOpenshiftVersionsParams) middleware.Responder
 
 	/* V2ListSupportedOpenshiftVersions Retrieves the list of OpenShift supported versions. */
 	V2ListSupportedOpenshiftVersions(ctx context.Context, params versions.V2ListSupportedOpenshiftVersionsParams) middleware.Responder
@@ -317,6 +338,9 @@ type Config struct {
 
 	// AuthUserAuth Applies when the "Authorization" header is set
 	AuthUserAuth func(token string) (interface{}, error)
+
+	// AuthWatcherAuth Applies when the "Watcher-Authorization" header is set
+	AuthWatcherAuth func(token string) (interface{}, error)
 
 	// Authenticator to use for all APIKey authentication
 	APIKeyAuthenticator func(string, string, security.TokenAuthentication) runtime.Authenticator
@@ -407,6 +431,13 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		return c.AuthUserAuth(token)
 	}
 
+	api.WatcherAuthAuth = func(token string) (interface{}, error) {
+		if c.AuthWatcherAuth == nil {
+			return token, nil
+		}
+		return c.AuthWatcherAuth(token)
+	}
+
 	api.APIAuthorizer = authorizer(c.Authorizer)
 	api.InstallerBindHostHandler = installer.BindHostHandlerFunc(func(params installer.BindHostParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()
@@ -427,6 +458,11 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		ctx := params.HTTPRequest.Context()
 		ctx = storeAuth(ctx, principal)
 		return c.InstallerAPI.GetClusterSupportedPlatforms(ctx, params)
+	})
+	api.InstallerGetDetailedSupportedFeaturesHandler = installer.GetDetailedSupportedFeaturesHandlerFunc(func(params installer.GetDetailedSupportedFeaturesParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.InstallerAPI.GetDetailedSupportedFeatures(ctx, params)
 	})
 	api.InstallerGetInfraEnvHandler = installer.GetInfraEnvHandlerFunc(func(params installer.GetInfraEnvParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()
@@ -523,6 +559,11 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		ctx = storeAuth(ctx, principal)
 		return c.InstallerAPI.V2DownloadClusterLogs(ctx, params)
 	})
+	api.OperatorsV2GetBundleHandler = operators.V2GetBundleHandlerFunc(func(params operators.V2GetBundleParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.OperatorsAPI.V2GetBundle(ctx, params)
+	})
 	api.InstallerV2GetClusterDefaultConfigHandler = installer.V2GetClusterDefaultConfigHandlerFunc(func(params installer.V2GetClusterDefaultConfigParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()
 		ctx = storeAuth(ctx, principal)
@@ -547,6 +588,11 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		ctx := params.HTTPRequest.Context()
 		ctx = storeAuth(ctx, principal)
 		return c.InstallerAPI.V2GetPresignedForClusterFiles(ctx, params)
+	})
+	api.OperatorsV2ListBundlesHandler = operators.V2ListBundlesHandlerFunc(func(params operators.V2ListBundlesParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.OperatorsAPI.V2ListBundles(ctx, params)
 	})
 	api.ManifestsV2ListClusterManifestsHandler = manifests.V2ListClusterManifestsHandlerFunc(func(params manifests.V2ListClusterManifestsParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()
@@ -693,6 +739,16 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		ctx = storeAuth(ctx, principal)
 		return c.InstallerAPI.V2ListHosts(ctx, params)
 	})
+	api.VersionsV2ListReleaseSourcesHandler = versions.V2ListReleaseSourcesHandlerFunc(func(params versions.V2ListReleaseSourcesParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.VersionsAPI.V2ListReleaseSources(ctx, params)
+	})
+	api.VersionsV2ListSupportedOfflineOpenshiftVersionsHandler = versions.V2ListSupportedOfflineOpenshiftVersionsHandlerFunc(func(params versions.V2ListSupportedOfflineOpenshiftVersionsParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.VersionsAPI.V2ListSupportedOfflineOpenshiftVersions(ctx, params)
+	})
 	api.VersionsV2ListSupportedOpenshiftVersionsHandler = versions.V2ListSupportedOpenshiftVersionsHandlerFunc(func(params versions.V2ListSupportedOpenshiftVersionsParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()
 		ctx = storeAuth(ctx, principal)
@@ -707,6 +763,11 @@ func HandlerAPI(c Config) (http.Handler, *operations.AssistedInstallAPI, error) 
 		ctx := params.HTTPRequest.Context()
 		ctx = storeAuth(ctx, principal)
 		return c.InstallerAPI.V2RegisterCluster(ctx, params)
+	})
+	api.InstallerV2RegisterDisconnectedClusterHandler = installer.V2RegisterDisconnectedClusterHandlerFunc(func(params installer.V2RegisterDisconnectedClusterParams, principal interface{}) middleware.Responder {
+		ctx := params.HTTPRequest.Context()
+		ctx = storeAuth(ctx, principal)
+		return c.InstallerAPI.V2RegisterDisconnectedCluster(ctx, params)
 	})
 	api.InstallerV2RegisterHostHandler = installer.V2RegisterHostHandlerFunc(func(params installer.V2RegisterHostParams, principal interface{}) middleware.Responder {
 		ctx := params.HTTPRequest.Context()

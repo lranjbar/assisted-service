@@ -1,22 +1,26 @@
 package installercache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/alecthomas/units"
+	"github.com/go-openapi/strfmt"
+	"github.com/google/uuid"
+	eventsapi "github.com/openshift/assisted-service/internal/events/api"
+	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/oc"
-	"github.com/pkg/errors"
+	"github.com/openshift/assisted-service/models"
 	"github.com/sirupsen/logrus"
-)
-
-var (
-	DeleteGracePeriod   time.Duration = -5 * time.Minute
-	CacheLimitThreshold               = 0.8
+	"golang.org/x/sys/unix"
 )
 
 // Installers implements a thread safe LRU cache for ocp install binaries
@@ -25,10 +29,44 @@ var (
 type Installers struct {
 	sync.Mutex
 	log logrus.FieldLogger
-	// total capcity of the allowed storage (in bytes)
-	storageCapacity int64
 	// parent directory of the binary cache
-	cacheDir string
+	eventsHandler   eventsapi.Handler
+	diskStatsHelper metrics.DiskStatsHelper
+	config          Config
+	metricsAPI      metrics.API
+}
+
+type Size int64
+
+type Config struct {
+	CacheDir string
+	// MaxCapacity is the capacity of the installer cache and will be marshalled to a count of bytes from a form like "20 GiB"
+	MaxCapacity Size `envconfig:"INSTALLER_CACHE_CAPACITY" default:"0"`
+	// MaxReleaseSize is the expected maximum size of a single release and will be marshalled to a count of bytes from a form like "20 GiB"
+	MaxReleaseSize Size `envconfig:"INSTALLER_CACHE_MAX_RELEASE_SIZE" default:"2GiB"`
+	// ReleaseFetchRetryIntervalMicroseconds is the number of microseconds that the cache should wait before retrying the fetch of a release if unable to do so for capacity reasons.
+	ReleaseFetchRetryInterval time.Duration `envconfig:"INSTALLER_CACHE_RELEASE_FETCH_RETRY_INTERVAL" default:"30s"`
+}
+
+func (s *Size) Decode(value string) error {
+	toParse := strings.ReplaceAll(strings.TrimSpace(value), " ", "")
+
+	bytes, err := units.ParseStrictBytes(toParse)
+	if err != nil {
+		return fmt.Errorf("failed to parse size %q (from %q): %w", toParse, value, err)
+	}
+
+	*s = Size(bytes)
+
+	return nil
+}
+
+type errorInsufficientCacheCapacity struct {
+	Message string
+}
+
+func (e *errorInsufficientCacheCapacity) Error() string {
+	return e.Message
 }
 
 type fileInfo struct {
@@ -38,69 +76,200 @@ type fileInfo struct {
 
 func (fi *fileInfo) Compare(other *fileInfo) bool {
 	//oldest file will be first in queue
-	return fi.info.ModTime().Unix() < other.info.ModTime().Unix()
+	// Using micoseconds to make sure that the comparison is granular enough
+	return fi.info.ModTime().UnixMicro() < other.info.ModTime().UnixMicro()
 }
+
+const (
+	metricEventInstallerCacheRelease = "installercache.release.metrics"
+)
 
 type Release struct {
-	Path string
+	Path          string
+	eventsHandler eventsapi.Handler
+	// startTime is the time at which the request was made to fetch the release.
+	startTime time.Time
+	// clusterID is the UUID of the cluster for which the release is being fetched.
+	clusterID strfmt.UUID
+	// releaseId is the release that is being fetched, for example "4.10.67-x86_64".
+	releaseID string
+	// cached is `true` if the release was found in the cache, otherwise `false`.
+	cached bool
+	// extractDuration is the amount of time taken to perform extraction, zero if no extraction took place.
+	extractDuration float64
+	// cleanup is called to clean up the release when it is no longer needed
+	cleanup func() error
 }
 
-func (rl *Release) Release() {
-	if err := os.Remove(rl.Path); err != nil {
-		logrus.New().WithError(err).Errorf("Failed to delete release link %s", rl.Path)
-	}
+// Cleanup is called to signal that the caller has finished using the release and that resources may be released.
+func (rl *Release) Cleanup(ctx context.Context) error {
+	rl.eventsHandler.V2AddMetricsEvent(
+		ctx, &rl.clusterID, nil, nil, "", models.EventSeverityInfo,
+		metricEventInstallerCacheRelease,
+		time.Now(),
+		"release_id", rl.releaseID,
+		"start_time", rl.startTime.Format(time.RFC3339),
+		"end_time", time.Now().Format(time.RFC3339),
+		"cached", rl.cached,
+		"extract_duration", rl.extractDuration,
+	)
+
+	return rl.cleanup()
 }
 
 // New constructs an installer cache with a given storage capacity
-func New(cacheDir string, storageCapacity int64, log logrus.FieldLogger) *Installers {
+// If the cache directory already exists, it will be removed and a new one will be created.
+func New(config Config, eventsHandler eventsapi.Handler, metricsAPI metrics.API, diskStatsHelper metrics.DiskStatsHelper, log logrus.FieldLogger) (*Installers, error) {
+	log.Infof("Creating installer cache with config: %+v", config)
+
+	if config.MaxCapacity > 0 && config.MaxReleaseSize == 0 {
+		return nil, fmt.Errorf("config.MaxReleaseSize (%d bytes) must not be zero", config.MaxReleaseSize)
+	}
+	if config.MaxCapacity > 0 && config.MaxReleaseSize > config.MaxCapacity {
+		return nil, fmt.Errorf("config.MaxReleaseSize (%d bytes) must not be greater than config.MaxCapacity (%d bytes)", config.MaxReleaseSize, config.MaxCapacity)
+	}
+
+	err := os.RemoveAll(config.CacheDir)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to remove cache directory %s: %w", config.CacheDir, err)
+	}
+
+	err = os.MkdirAll(config.CacheDir, 0755)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cache directory %s: %w", config.CacheDir, err)
+	}
+
 	return &Installers{
 		log:             log,
-		storageCapacity: storageCapacity,
-		cacheDir:        cacheDir,
-	}
+		eventsHandler:   eventsHandler,
+		diskStatsHelper: diskStatsHelper,
+		config:          config,
+		metricsAPI:      metricsAPI,
+	}, nil
 }
 
 // Get returns the path to an openshift-baremetal-install binary extracted from
 // the referenced release image. Tries the mirror release image first if it's set. It is safe for concurrent use. A cache of
 // binaries is maintained to reduce re-downloading of the same release.
-func (i *Installers) Get(releaseID, releaseIDMirror, pullSecret string, ocRelease oc.Release) (*Release, error) {
+func (i *Installers) Get(ctx context.Context, releaseID, releaseIDMirror, pullSecret string, ocRelease oc.Release, ocpVersion string, clusterID strfmt.UUID) (*Release, error) {
+	majorMinorVersion, err := ocRelease.GetMajorMinorVersion(i.log, releaseID, releaseIDMirror, pullSecret)
+	if err != nil {
+		i.log.Warnf("unable to get majorMinorVersion to record metric for %s falling back to full URI", releaseID)
+		majorMinorVersion = "unknown"
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			release, err := i.get(releaseID, releaseIDMirror, pullSecret, ocRelease, ocpVersion, clusterID)
+			if err == nil {
+				i.metricsAPI.InstallerCacheGetReleaseCached(majorMinorVersion, release.cached)
+				return release, nil
+			}
+			_, isCapacityError := err.(*errorInsufficientCacheCapacity)
+			if !isCapacityError {
+				return nil, fmt.Errorf("failed to get installer path for release %s: %w", releaseID, err)
+			}
+			time.Sleep(i.config.ReleaseFetchRetryInterval)
+		}
+	}
+}
+
+func (i *Installers) getDiskUsageIncludingHardlinks() (uint64, error) {
+	usedBytes, _, err := i.diskStatsHelper.GetDiskUsage(i.config.CacheDir)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("could not determine disk usage information for cache dir %s: %w", i.config.CacheDir, err)
+	}
+	return usedBytes, nil
+}
+
+func (i *Installers) extractReleaseIfNeeded(path, releaseID, releaseIDMirror, pullSecret, ocpVersion string, ocRelease oc.Release) (extractDuration float64, cached bool, err error) {
+	_, err = os.Stat(path)
+	if err == nil {
+		return 0, true, nil // release was found in the cache
+	}
+	if !os.IsNotExist(err) {
+		return 0, false, err
+	}
+	usedBytes, err := i.getDiskUsageIncludingHardlinks()
+	if err != nil && !os.IsNotExist(err) {
+		return 0, false, fmt.Errorf("could not determine disk usage information for cache dir %s: %w", i.config.CacheDir, err)
+	}
+	if i.shouldEvict(int64(usedBytes)) && !i.evict() { // nolint: gosec
+		return 0, false, &errorInsufficientCacheCapacity{Message: fmt.Sprintf("insufficient capacity in %s to store release", i.config.CacheDir)}
+	}
+	extractStartTime := time.Now()
+	_, err = ocRelease.Extract(i.log, releaseID, releaseIDMirror, i.config.CacheDir, pullSecret, ocpVersion)
+	if err != nil {
+		return 0, false, err
+	}
+	return time.Since(extractStartTime).Seconds(), false, nil
+}
+
+func (i *Installers) get(releaseID, releaseIDMirror, pullSecret string, ocRelease oc.Release, ocpVersion string, clusterID strfmt.UUID) (*Release, error) {
 	i.Lock()
 	defer i.Unlock()
 
-	var workdir, binary, path string
-	var err error
-
-	releaseImageLocation := releaseID
-	if releaseIDMirror != "" {
-		releaseImageLocation = releaseIDMirror
+	release := &Release{
+		eventsHandler: i.eventsHandler,
+		clusterID:     clusterID,
+		releaseID:     releaseID,
+		startTime:     time.Now(),
 	}
-	workdir, binary, path = ocRelease.GetReleaseBinaryPath(releaseImageLocation, i.cacheDir)
-	if _, err = os.Stat(path); os.IsNotExist(err) {
-		//evict older files if necessary
-		i.evict()
 
-		//extract the binary
-		_, err = ocRelease.Extract(i.log, releaseID, releaseIDMirror, i.cacheDir, pullSecret)
-		if err != nil {
-			return &Release{}, err
-		}
-	} else {
-		//update the file mtime to signal it was recently used
-		err = os.Chtimes(path, time.Now(), time.Now())
-		if err != nil {
-			return &Release{}, errors.Wrap(err, fmt.Sprintf("Failed to update release binary %s", path))
-		}
+	workdir, binary, path, err := ocRelease.GetReleaseBinaryPath(releaseID, i.config.CacheDir, ocpVersion)
+	if err != nil {
+		return nil, err
 	}
+	release.extractDuration, release.cached, err = i.extractReleaseIfNeeded(path, releaseID, releaseIDMirror, pullSecret, ocpVersion, ocRelease)
+	if err != nil {
+		return nil, err
+	}
+
+	// update the file mtime to signal it was recently used
+	err = os.Chtimes(path, time.Now(), time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("failed to update release binary %s: %w", path, err)
+	}
+
 	// return a new hard link to the binary file
 	// the caller should delete the hard link when
 	// it finishes working with the file
-	link := filepath.Join(workdir, "ln_"+fmt.Sprint(time.Now().Unix())+
-		"_"+binary)
-	err = os.Link(path, link)
+	release.Path, err = i.getLinkForReleasePath(workdir, path, binary)
 	if err != nil {
-		return &Release{}, errors.Wrap(err, fmt.Sprintf("Failed to create hard link to binary %s", path))
+		return nil, err
 	}
-	return &Release{link}, nil
+
+	release.cleanup = func() error {
+		i.Lock()
+		defer i.Unlock()
+
+		return cleanHardLink(release.Path)
+	}
+
+	return release, nil
+}
+
+func (i *Installers) getLinkForReleasePath(workdir string, path string, binary string) (string, error) {
+	for {
+		link := filepath.Join(workdir, fmt.Sprintf("ln_%s_%s", uuid.NewString(), binary))
+		err := os.Link(path, link)
+		if err == nil {
+			return link, nil
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("failed to create hard link to binary %s: %w", path, err)
+		}
+	}
+}
+
+func (i *Installers) shouldEvict(totalUsed int64) (shouldEvict bool) {
+	if i.config.MaxCapacity == 0 {
+		// The cache eviction is completely disabled.
+		return false
+	}
+	return int64(i.config.MaxCapacity)-totalUsed < int64(i.config.MaxReleaseSize)
 }
 
 // Walk through the cacheDir and list the files recursively.
@@ -108,15 +277,9 @@ func (i *Installers) Get(releaseID, releaseIDMirror, pullSecret string, ocReleas
 // the oldest ones.
 //
 // Locking must be done outside evict() to avoid contentions.
-func (i *Installers) evict() {
-	//if cache limit is undefined skip eviction
-	if i.storageCapacity == 0 {
-		return
-	}
-
+func (i *Installers) evict() bool {
 	// store the file paths
 	files := NewPriorityQueue(&fileInfo{})
-	links := make([]*fileInfo, 0)
 	var totalSize int64
 
 	// visit process the file/dir pointed by path and store relevant
@@ -129,52 +292,57 @@ func (i *Installers) evict() {
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		//find hard links
+		//skip hard links
 		if strings.HasPrefix(info.Name(), "ln_") {
-			links = append(links, &fileInfo{path, info})
 			return nil
 		}
 
-		//save the other files based on their mod time
-		files.Add(&fileInfo{path, info})
-		totalSize += info.Size()
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Nlink == 1 {
+			if !ok {
+				i.log.Warnf("could not determine hardlink status for %s - item will not be filtered", path)
+			}
+			files.Add(&fileInfo{path, info})
+			totalSize += info.Size()
+		}
+
 		return nil
 	}
 
-	err := filepath.Walk(i.cacheDir, visit)
+	err := filepath.Walk(i.config.CacheDir, visit)
 	if err != nil {
-		if !os.IsNotExist(err) { //ignore first invocation where the cacheDir does not exist
-			i.log.WithError(err).Errorf("release binary eviction failed to inspect directory %s", i.cacheDir)
-		}
-		return
+		i.log.WithError(err).Errorf("release binary eviction failed to inspect directory %s", i.config.CacheDir)
+
+		return false
 	}
 
-	//prune the hard links just in case the deletion of resources
-	//in ignition.go did not succeeded as expected
-	for idx := 0; idx < len(links); idx++ {
-		finfo := links[idx]
-		//Allow a grace period of 5 minutes from the link creation time
-		//to ensure the link is not being used.
-		grace := time.Now().Add(DeleteGracePeriod).Unix()
-		if finfo.info.ModTime().Unix() < grace {
-			os.Remove(finfo.path)
-		}
-	}
-
-	//delete the oldest file if necessary
-	for totalSize >= int64(float64(i.storageCapacity)*CacheLimitThreshold) {
+	// delete the oldest file if necessary
+	evicted := false
+	for i.shouldEvict(totalSize) && files.Len() > 0 {
 		finfo, _ := files.Pop()
-		totalSize -= finfo.info.Size()
+
 		//remove the file
 		if err := i.evictFile(finfo.path); err != nil {
 			i.log.WithError(err).Errorf("failed to evict file %s", finfo.path)
+			continue
 		}
+
+		totalSize -= finfo.info.Size()
+		evicted = true
 	}
+	i.metricsAPI.InstallerCacheReleaseEvicted(evicted)
+	return evicted
 }
 
 func (i *Installers) evictFile(filePath string) error {
 	i.log.Infof("evicting binary file %s due to storage pressure", filePath)
-	err := os.Remove(filePath)
+
+	err := cleanPageCache(filePath)
+	if err != nil {
+		i.log.WithError(err).Warnf("failed to clean page cache for %s", filePath)
+	}
+
+	err = os.Remove(filePath)
 	if err != nil {
 		return err
 	}
@@ -188,5 +356,74 @@ func (i *Installers) evictFile(filePath string) error {
 	if len(entries) == 0 {
 		return os.Remove(parentDir)
 	}
+	return nil
+}
+
+func cleanHardLink(path string) error {
+	var ret error
+
+	// Ensure page cache is removed for the file
+	if err := cleanPageCacheForHardLink(path); err != nil {
+		ret = errors.Join(ret, fmt.Errorf("failed to clean page cache: %w", err))
+	}
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		ret = errors.Join(ret, fmt.Errorf("failed to remove binary: %w", err))
+	}
+
+	return ret
+}
+
+func cleanPageCacheForHardLink(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			return nil
+		default:
+			return fmt.Errorf("failed to open file %s: %w", path, err)
+		}
+	}
+
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file %s: %w", path, err)
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	// If we can't determine the hardlink status, run fadvise to be safe
+	// If there are more than 2 links, we don't need to run fadvise, as the file is still in use
+	if ok && stat != nil && stat.Nlink > 2 {
+		return nil
+	}
+
+	err = cleanPageCache(path)
+	if err != nil {
+		return fmt.Errorf("failed to clean page cache: %w", err)
+	}
+
+	return nil
+}
+
+func cleanPageCache(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			return nil
+		default:
+			return fmt.Errorf("failed to open file %s: %w", path, err)
+		}
+	}
+
+	defer f.Close()
+
+	err = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+	if err != nil {
+		return fmt.Errorf("fadvise failed: %w", err)
+	}
+
 	return nil
 }

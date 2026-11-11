@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/go-openapi/strfmt"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -15,6 +14,7 @@ import (
 	"github.com/openshift/assisted-service/internal/stream"
 	"github.com/openshift/assisted-service/models"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/mock/gomock"
 )
 
 var _ = Describe("Close", func() {
@@ -33,6 +33,10 @@ var _ = Describe("Close", func() {
 		logger.Out = io.Discard
 		ctrl = gomock.NewController(GinkgoT())
 		writer = stream.NewMockStreamWriter(ctrl)
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
 	})
 
 	It("should close the writer when closing", func() {
@@ -69,6 +73,11 @@ var _ = Describe("Notify", func() {
 		clusterID = strfmt.UUID(uuid.New().String())
 
 	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
 	It("succeeds when underlying writer is empty", func() {
 		event := &common.Event{}
 		var emptyWriter stream.StreamWriter

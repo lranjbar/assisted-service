@@ -19,6 +19,7 @@ import (
 	"github.com/openshift/assisted-service/internal/constants"
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
+	"github.com/openshift/assisted-service/internal/installcfg"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/provider/registry"
@@ -47,10 +48,14 @@ const (
 	maxHostAheadOfServiceTimeDiff                    = 1 * time.Hour
 	maxHostTimingMetrics                             = 4
 	maxPingCommandExamples                           = 4
+	// How much we allow the user to deviate from our official
+	// minimum. Some setups (e.g. VMs) might give just a bit less
+	// than requested, so we shouldn't be too strict about it
+	HostMemoryRequirementToleranceMiB int64 = 100
+	FailedToFindAction                      = "failed to find action for step"
+	OpenStackPlatform                       = "OpenStack Compute"
+	LateBindingMsg                          = "Host is not bound to a cluster"
 )
-
-const FailedToFindAction = "failed to find action for step"
-const OpenStackPlatform = "OpenStack Compute"
 
 var (
 	ImageStatusDownloadRateThreshold = 0.001
@@ -85,19 +90,22 @@ func (inventoryCache InventoryCache) GetOrUnmarshal(host *models.Host) (inventor
 }
 
 type validationContext struct {
-	host                    *models.Host
-	cluster                 *common.Cluster
-	infraEnv                *common.InfraEnv
-	inventory               *models.Inventory
-	db                      *gorm.DB
-	inventoryCache          InventoryCache
-	clusterHostRequirements *models.ClusterHostRequirements
-	minCPUCoresRequirement  int64
-	minRAMMibRequirement    int64
-	kubeApiEnabled          bool
-	softTimeoutsEnabled     bool
-	objectHandler           s3wrapper.API
-	ctx                     context.Context
+	host                            *models.Host
+	cluster                         *common.Cluster
+	infraEnv                        *common.InfraEnv
+	inventory                       *models.Inventory
+	db                              *gorm.DB
+	inventoryCache                  InventoryCache
+	clusterHostRequirements         *models.ClusterHostRequirements
+	minCPUCoresRequirement          int64
+	minRAMMibRequirement            int64
+	kubeApiEnabled                  bool
+	softTimeoutsEnabled             bool
+	objectHandler                   s3wrapper.API
+	ctx                             context.Context
+	mustGatherImageURLs             map[string]bool
+	mustGatherImagesLookupAttempted bool
+	mustGatherImagesErr             error
 }
 
 type validationCondition func(context *validationContext) (ValidationStatus, string)
@@ -154,7 +162,7 @@ func (v *validator) getBootDeviceInfo(host *models.Host) (*models.DiskInfo, erro
 
 func (c *validationContext) validateRole() error {
 	switch common.GetEffectiveRole(c.host) {
-	case models.HostRoleMaster, models.HostRoleWorker, models.HostRoleAutoAssign:
+	case models.HostRoleMaster, models.HostRoleArbiter, models.HostRoleWorker, models.HostRoleAutoAssign:
 		return nil
 	default:
 		return errors.Errorf("Illegal role defined: %s", common.GetEffectiveRole(c.host))
@@ -173,19 +181,19 @@ func (c *validationContext) validateMachineCIDR() error {
 }
 
 func (c *validationContext) loadClusterHostRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetClusterHostRequirements(context.TODO(), c.cluster, c.host)
+	requirements, err := hwValidator.GetClusterHostRequirements(c.ctx, c.cluster, c.host)
 	c.clusterHostRequirements = requirements
 	return err
 }
 
 func (c *validationContext) loadInfraEnvHostRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetInfraEnvHostRequirements(context.TODO(), c.infraEnv)
+	requirements, err := hwValidator.GetInfraEnvHostRequirements(c.ctx, c.infraEnv)
 	c.clusterHostRequirements = requirements
 	return err
 }
 
 func (c *validationContext) loadGeneralMinRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetPreflightHardwareRequirements(context.TODO(), c.cluster)
+	requirements, err := hwValidator.GetPreflightHardwareRequirements(c.ctx, c.cluster)
 	if err != nil {
 		return err
 	}
@@ -197,7 +205,7 @@ func (c *validationContext) loadGeneralMinRequirements(hwValidator hardware.Vali
 }
 
 func (c *validationContext) loadGeneralInfraEnvMinRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetPreflightInfraEnvHardwareRequirements(context.TODO(), c.infraEnv)
+	requirements, err := hwValidator.GetPreflightInfraEnvHardwareRequirements(c.ctx, c.infraEnv)
 	if err != nil {
 		return err
 	}
@@ -209,6 +217,10 @@ func (c *validationContext) loadGeneralInfraEnvMinRequirements(hwValidator hardw
 }
 
 func newValidationContext(ctx context.Context, host *models.Host, c *common.Cluster, i *common.InfraEnv, db *gorm.DB, inventoryCache InventoryCache, hwValidator hardware.Validator, kubeApiEnabled bool, objectHandler s3wrapper.API, softTimeoutsEnabled bool) (*validationContext, error) {
+	if ctx == nil {
+		// Fallback to a non-nil context to avoid forwarding nil; mirrors old context.TODO() semantics.
+		ctx = context.Background()
+	}
 	ret := &validationContext{
 		ctx:                 ctx,
 		host:                host,
@@ -300,6 +312,77 @@ func (v *validator) isMediaConnected(c *validationContext) (ValidationStatus, st
 	}
 }
 
+// isMtuValid - This validation distinguishes between CMN and UMN. For UMN, the MTU is checked across all interfaces, while for CMN, it focuses specifically on the MTU reports for the machine networks.
+func (v *validator) isMtuValid(c *validationContext) (ValidationStatus, string) {
+	if c.infraEnv != nil {
+		return ValidationSuccessSuppressOutput, LateBindingMsg
+	}
+	if c.inventory == nil {
+		return ValidationPending, "Missing host inventory"
+	}
+	if hostutil.IsDay2Host(c.host) {
+		return ValidationSuccess, "Day2 host is not required to be connected to other hosts in the cluster"
+	}
+	if common.IsSingleNodeCluster(c.cluster) {
+		return ValidationSuccessSuppressOutput, "The validation is not applicable to SNO"
+	}
+	if len(c.host.Connectivity) == 0 {
+		return ValidationPending, "Missing MTU report information"
+	}
+	connectivityReport, err := hostutil.UnmarshalConnectivityReport(c.host.Connectivity)
+	if err != nil {
+		return ValidationError, "Internal error - failed to parse host connectivity report"
+	}
+
+	if swag.BoolValue(c.cluster.UserManagedNetworking) {
+		return v.isMtuValidAllInterfaces(c, connectivityReport)
+	}
+	return v.isMtuValidInMachineNetwork(c, connectivityReport)
+}
+
+// isMtuValidAllInterfaces - intended for UMN, where the MTU report is checked across all interfaces.
+func (v *validator) isMtuValidAllInterfaces(c *validationContext, connectivityReport *models.ConnectivityReport) (ValidationStatus, string) {
+	for _, r := range connectivityReport.RemoteHosts {
+		for _, mtuReport := range r.MtuReport {
+			if !mtuReport.MtuSuccessful {
+				return ValidationFailure, fmt.Sprintf("MTU is broken. Interface: %s, remote IP address: %s", mtuReport.OutgoingNic, mtuReport.RemoteIPAddress)
+			}
+		}
+	}
+	return ValidationSuccess, "MTU is ok"
+}
+
+// isMtuValidInMachineNetwork - intended for CMN, focusing exclusively on the MTU reports for the machine network.
+func (v *validator) isMtuValidInMachineNetwork(c *validationContext, connectivityReport *models.ConnectivityReport) (ValidationStatus, string) {
+	parsedMachineNetworks, err := network.ComputeParsedMachineNetworks(c.cluster.MachineNetworks)
+	if err != nil {
+		return ValidationFailure, err.Error()
+	}
+	for _, r := range connectivityReport.RemoteHosts {
+		for _, mtuReport := range r.MtuReport {
+			remoteIP := net.ParseIP(mtuReport.RemoteIPAddress)
+			isRemoteIPV6 := remoteIP.To4() == nil // If To4() is nil, it's IPv6
+
+			// We are only interested in the source IP within machine networks. If it is not part of any machine network, we don't need to consider it.
+			findSourceIP, err := network.IsNicBelongsAnyMachineNetwork(mtuReport.OutgoingNic, parsedMachineNetworks, c.inventory.Interfaces, isRemoteIPV6)
+			if err != nil {
+				return ValidationError, err.Error()
+			}
+			if !findSourceIP {
+				continue
+			}
+
+			// We are only interested in the remote IP within machine networks. If it is not part of any machine network, we don't need to consider it.
+			if network.IsIPBelongsToAnyMachineNetwork(remoteIP, parsedMachineNetworks) {
+				if !mtuReport.MtuSuccessful {
+					return ValidationFailure, fmt.Sprintf("MTU is broken. Interface: %s, remote IP address: %s", mtuReport.OutgoingNic, mtuReport.RemoteIPAddress)
+				}
+			}
+		}
+	}
+	return ValidationSuccess, "MTU is ok"
+}
+
 func (v *validator) isConnected(c *validationContext) (ValidationStatus, string) {
 	maxHostDisconnectionTime := v.hwValidatorCfg.MaxHostDisconnectionTime
 	if c.host.Bootstrap {
@@ -331,6 +414,54 @@ func (v *validator) hasInventory(c *validationContext) (ValidationStatus, string
 	}
 }
 
+func (v *validator) inventoryNotPartiallyTruncated(c *validationContext) (ValidationStatus, string) {
+	if c.inventory == nil {
+		return ValidationPending, "Missing inventory"
+	}
+
+	if c.inventory.Truncation == nil {
+		return ValidationSuccess, "Inventory is not truncated"
+	}
+
+	switch c.inventory.Truncation.Type {
+	case models.InventoryTruncationTypePartial:
+		return ValidationFailure, createTruncationReason(*c.inventory.Truncation)
+	case models.InventoryTruncationTypeFull:
+		return ValidationSuccess, "Inventory is not partially truncated (inventory fully truncated)" // To be sure we don't duplicate the message with the next validation
+	default:
+		return ValidationError, "Unexpected inventory truncation type"
+	}
+}
+
+func (v *validator) inventoryNotFullyTruncated(c *validationContext) (ValidationStatus, string) {
+	if c.inventory == nil {
+		return ValidationPending, "Missing inventory"
+	}
+
+	if c.inventory.Truncation == nil {
+		return ValidationSuccess, "Inventory is not truncated"
+	}
+
+	switch c.inventory.Truncation.Type {
+	case models.InventoryTruncationTypePartial:
+		return ValidationSuccess, "Inventory is partially truncated"
+	case models.InventoryTruncationTypeFull:
+		return ValidationFailure, createTruncationReason(*c.inventory.Truncation)
+	default:
+		return ValidationError, "Unexpected inventory truncation type"
+	}
+}
+
+func createTruncationReason(truncation models.InventoryTruncation) string {
+	ret := fmt.Sprintf("Inventory is truncated (%s)", truncation.Type)
+
+	if len(truncation.Reasons) > 0 {
+		ret = fmt.Sprintf("%s: %s", ret, strings.Join(truncation.Reasons, "; "))
+	}
+
+	return ret
+}
+
 func (v *validator) hasMinCpuCores(c *validationContext) (ValidationStatus, string) {
 	if c.inventory == nil {
 		return ValidationPending, "Missing inventory"
@@ -347,7 +478,14 @@ func (v *validator) hasMinMemory(c *validationContext) (ValidationStatus, string
 	if c.inventory == nil {
 		return status, "Missing inventory"
 	}
-	status = boolValue(c.inventory.Memory.PhysicalBytes >= conversions.MibToBytes(c.minRAMMibRequirement))
+	tolerance := HostMemoryRequirementToleranceMiB
+	if c.inventory.Memory.PhysicalBytesMethod == models.MemoryMethodMeminfo {
+		// We are using the usable memory as a proxy for the physical memory, so
+		// allow for an extra 2% of physical memory that is present but not
+		// usable (because it is allocated for e.g. the BIOS).
+		tolerance += c.minRAMMibRequirement / 50
+	}
+	status = boolValue(c.inventory.Memory.PhysicalBytes >= conversions.MibToBytes(c.minRAMMibRequirement-tolerance))
 	if status == ValidationSuccess {
 		return status, "Sufficient minimum RAM"
 	}
@@ -402,7 +540,10 @@ func (v *validator) diskEncryptionRequirementsSatisfied(c *validationContext) (V
 	var status ValidationStatus
 	var message string
 
-	if c.infraEnv != nil || swag.StringValue(c.cluster.DiskEncryption.EnableOn) == models.DiskEncryptionEnableOnNone {
+	if c.infraEnv != nil {
+		return ValidationSuccessSuppressOutput, ""
+	}
+	if !hostutil.IsDay2Host(c.host) && !common.IsConfigured(c.cluster.DiskEncryption) {
 		return ValidationSuccessSuppressOutput, ""
 	}
 	if c.inventory == nil {
@@ -414,6 +555,9 @@ func (v *validator) diskEncryptionRequirementsSatisfied(c *validationContext) (V
 		//according to that information
 		luks, err := hostutil.GetDiskEncryptionForDay2(v.log, c.host)
 		if err != nil {
+			if !common.IsConfigured(c.cluster.DiskEncryption) {
+				return ValidationSuccessSuppressOutput, ""
+			}
 			return ValidationPending, "Missing ignition information"
 		}
 		if luks == nil || luks.Clevis == nil {
@@ -443,15 +587,15 @@ func (v *validator) diskEncryptionRequirementsSatisfied(c *validationContext) (V
 		if role == models.HostRoleAutoAssign {
 			return ValidationPending, "Missing role assignment"
 		}
-		if !hostutil.IsDiskEncryptionEnabledForRole(*c.cluster.DiskEncryption, role) {
+		if !common.EnabledForRole(*c.cluster.DiskEncryption, role) {
 			return ValidationSuccessSuppressOutput, ""
 		}
-		if swag.StringValue(c.cluster.DiskEncryption.Mode) == models.DiskEncryptionModeTang {
+		if common.IsSetWithTang(c.cluster.DiskEncryption) {
 			status, message = v.areTangServersReachable(c)
 			if status == ValidationFailure {
 				return status, message
 			}
-		} else { // Mode TPMv2
+		} else if common.IsSetWithTpm(c.cluster.DiskEncryption) {
 			status = boolValue(c.inventory.TpmVersion == models.InventoryTpmVersionNr20)
 		}
 
@@ -530,7 +674,7 @@ func (v *validator) hasMemoryForRole(c *validationContext) (ValidationStatus, st
 		return ValidationPending, "Missing inventory or role"
 	}
 	requiredBytes := conversions.MibToBytes(c.clusterHostRequirements.Total.RAMMib)
-	if c.inventory.Memory.PhysicalBytes >= requiredBytes {
+	if c.inventory.Memory.PhysicalBytes >= requiredBytes-conversions.MibToBytes(HostMemoryRequirementToleranceMiB) {
 		return ValidationSuccess, fmt.Sprintf("Sufficient RAM for role %s", common.GetEffectiveRole(c.host))
 	}
 	return ValidationFailure, fmt.Sprintf("Require at least %s RAM for role %s, found only %s",
@@ -597,13 +741,25 @@ func (v *validator) belongsToMachineCidr(c *validationContext) (ValidationStatus
 	if swag.StringValue(c.cluster.Kind) == models.ClusterKindAddHostsCluster {
 		return ValidationSuccess, "No machine network CIDR validation needed: Day2 cluster"
 	}
+
 	if c.inventory == nil || !network.IsMachineCidrAvailable(c.cluster) {
 		return ValidationPending, "Missing inventory or machine network CIDR"
 	}
-	if !network.IsHostInPrimaryMachineNetCidr(v.log, c.cluster, c.host) {
-		return ValidationFailure, "Host does not belong to machine network CIDRs. Verify that the host belongs to every CIDR listed under machine networks"
+
+	if !network.IsLoadBalancerUserManaged(c.cluster) {
+		if !network.IsHostInAllMachineNetworksCidr(v.log, c.cluster, c.host) {
+			return ValidationFailure, "Host does not belong to machine network CIDRs. Verify that the host belongs to every CIDR listed under machine networks"
+		}
+
+		return ValidationSuccess, "Host belongs to all machine network CIDRs"
 	}
-	return ValidationSuccess, "Host belongs to all machine network CIDRs"
+
+	// user-managed load balancer
+	if !network.IsHostInAtLeastOneMachineNetworkCidr(v.log, c.cluster, c.host) {
+		return ValidationFailure, "Host does not belong to any machine network CIDR. Verify that the host belongs to at least one CIDR listed under machine networks"
+	}
+
+	return ValidationSuccess, "Host belongs to at least one machine network CIDR"
 }
 
 func getRealHostname(host *models.Host, inventory *models.Inventory) string {
@@ -666,6 +822,9 @@ func (v *validator) belongsToL2MajorityGroup(c *validationContext, majorityGroup
 	if !network.IsMachineCidrAvailable(c.cluster) {
 		return ValidationPending
 	}
+	if majorityGroups == nil {
+		return ValidationFailure
+	}
 
 	// TODO(mko) This rule should be revised as soon as OCP supports multiple machineNetwork
 	//           entries using the same IP stack.
@@ -702,23 +861,28 @@ func (v *validator) belongsToL2MajorityGroup(c *validationContext, majorityGroup
 	return ValidationSuccess
 }
 
-func (v *validator) belongsToL3MajorityGroup(c *validationContext, majorityGroups map[string][]strfmt.UUID) ValidationStatus {
+func (v *validator) belongsToL3MajorityGroup(c *validationContext, connectivity network.Connectivity) ValidationStatus {
+	var ipv4Connectivity, ipv6Connectivity bool
 	ipv4, ipv6, err := network.GetConfiguredAddressFamilies(c.cluster)
 	if err != nil {
 		v.log.WithError(err).Warn("Get configured address families")
 		return ValidationError
 	}
-	if !(ipv4 || ipv6) {
+	if !(ipv4 || ipv6) || connectivity.L3ConnectedAddresses == nil {
 		return ValidationFailure
 	}
-	ret := true
-	if ipv4 {
-		ret = ret && funk.Contains(majorityGroups[network.IPv4.String()], *c.host.ID)
+	hostConnectedAddresses, ok := connectivity.L3ConnectedAddresses[*c.host.ID]
+	if !ok {
+		return ValidationFailure
 	}
-	if ipv6 {
-		ret = ret && funk.Contains(majorityGroups[network.IPv6.String()], *c.host.ID)
+	for _, addr := range hostConnectedAddresses {
+		if network.IsIPv4Addr(addr) {
+			ipv4Connectivity = true
+		} else {
+			ipv6Connectivity = true
+		}
 	}
-	return boolValue(ret)
+	return boolValue((!ipv4 || ipv4Connectivity) && (!ipv6 || ipv6Connectivity))
 }
 
 func (v *validator) belongsToMajorityGroup(c *validationContext) (ValidationStatus, string) {
@@ -735,21 +899,25 @@ func (v *validator) belongsToMajorityGroup(c *validationContext) (ValidationStat
 	if c.cluster.ConnectivityMajorityGroups == "" {
 		return ValidationPending, "Machine Network CIDR or Connectivity Majority Groups missing"
 	}
-	var majorityGroups map[string][]strfmt.UUID
-	err := json.Unmarshal([]byte(c.cluster.ConnectivityMajorityGroups), &majorityGroups)
+	var connectivity network.Connectivity
+	err := json.Unmarshal([]byte(c.cluster.ConnectivityMajorityGroups), &connectivity)
 	if err != nil {
 		v.log.WithError(err).Warn("Parse majority group")
 		return ValidationError, "Parse error for connectivity majority group"
 	}
 
 	var status ValidationStatus
-	if swag.BoolValue(c.cluster.UserManagedNetworking) {
-		status = v.belongsToL3MajorityGroup(c, majorityGroups)
+	if swag.BoolValue(c.cluster.UserManagedNetworking) || network.IsLoadBalancerUserManaged(c.cluster) {
+		status = v.belongsToL3MajorityGroup(c, connectivity)
 	} else {
-		status = v.belongsToL2MajorityGroup(c, majorityGroups)
+		status = v.belongsToL2MajorityGroup(c, connectivity.MajorityGroups)
 	}
-	if status == ValidationFailure && len(c.cluster.Hosts) < 3 {
-		return ValidationPending, "Not enough hosts in cluster to calculate connectivity groups"
+	if status == ValidationFailure {
+		isFencing := common.IsClusterTopologyTwoNodesWithFencing(c.cluster)
+		if (!isFencing && len(c.cluster.Hosts) < 3) ||
+			(isFencing && len(c.cluster.Hosts) < common.AllowedNumberOfMasterHostsInTwoNodesWithFencing) {
+			return ValidationPending, "Not enough hosts in cluster to calculate connectivity groups"
+		}
 	}
 
 	switch status {
@@ -846,32 +1014,75 @@ func (v *validator) sucessfullOrUnknownContainerImagesAvailability(c *validation
 		return ValidationError, "Validation error"
 	}
 	if !allImagesValid(imageStatuses) {
-		images, err := v.getFailedImagesNames(c.host)
-		if err == nil {
+		criticalFailures, mustGatherFailures, err := v.classifyFailedImages(c, imageStatuses)
+		if err != nil {
+			v.log.Error("Could not classify failed container images as must-gather or critical")
+			return ValidationFailure, "Failed to classify failed container images as must-gather or critical"
+		}
+
+		if len(criticalFailures) > 0 {
 			return ValidationFailure, fmt.Sprintf("Failed to fetch container images needed for installation from %s. "+
 				"This may be due to a network hiccup. Retry to install again. If this problem persists, "+
-				"check your network settings to make sure you’re not blocked.", strings.Join(images, ","))
+				"check your network settings to make sure you’re not blocked.", strings.Join(criticalFailures, ","))
 		}
-		return ValidationError, "Validation error"
+
+		if len(mustGatherFailures) > 0 {
+			v.log.Warn("Must-gather image(s) could not be pulled. Installation will proceed without them.")
+			return ValidationSuccess, fmt.Sprintf(
+				"All required container images were pulled successfully. "+
+					"Warning: must-gather image could not be fetched (%s). "+
+					"This does not affect installation, but must-gather data collection may be unavailable. "+
+					"Installation is proceeding.", strings.Join(mustGatherFailures, ","))
+		}
 	}
 	return ValidationSuccess, "All required container images were either pulled successfully or no attempt was made to pull them"
 }
 
-func (v *validator) getFailedImagesNames(host *models.Host) ([]string, error) {
-	imageStatuses, err := common.UnmarshalImageStatuses(host.ImagesStatus)
-	if err != nil {
-		return nil, err
+func (v *validator) getMustGatherImageURLs(c *validationContext) (map[string]bool, error) {
+	if c.mustGatherImagesLookupAttempted {
+		return c.mustGatherImageURLs, c.mustGatherImagesErr
 	}
 
-	imageNames := make([]string, 0)
+	c.mustGatherImagesLookupAttempted = true
+	c.mustGatherImageURLs = make(map[string]bool)
+	result := make(map[string]bool)
+	if c.cluster == nil {
+		c.mustGatherImageURLs = result
+		return c.mustGatherImageURLs, nil
+	}
+	mustGatherImages, err := v.versionHandler.GetMustGatherImages(
+		c.cluster.OpenshiftVersion, c.cluster.CPUArchitecture, c.cluster.PullSecret)
+	if err != nil {
+		c.mustGatherImagesErr = err
+		return nil, err
+	}
+	for _, img := range mustGatherImages {
+		result[img] = true
+	}
+	c.mustGatherImageURLs = result
+	return result, nil
+}
 
+func (v *validator) classifyFailedImages(c *validationContext, imageStatuses common.ImageStatuses) ([]string, []string, error) {
+	mustGatherURLs, err := v.getMustGatherImageURLs(c)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	criticalFailures := make([]string, 0)
+	mustGatherFailures := make([]string, 0)
 	for _, imageStatus := range imageStatuses {
-		if isInvalidImageStatus(imageStatus) {
-			imageNames = append(imageNames, imageStatus.Name)
+		if !isInvalidImageStatus(imageStatus) {
+			continue
+		}
+		if mustGatherURLs[imageStatus.Name] {
+			mustGatherFailures = append(mustGatherFailures, imageStatus.Name)
+		} else {
+			criticalFailures = append(criticalFailures, imageStatus.Name)
 		}
 	}
 
-	return imageNames, nil
+	return criticalFailures, mustGatherFailures, nil
 }
 
 func isInvalidImageStatus(imageStatus *models.ContainerImageAvailability) bool {
@@ -1310,7 +1521,8 @@ func (v *validator) importedClusterHasManagedNetworking(cluster *common.Cluster)
 // DNS in advance, so we disable DNS validations while installing or adding
 // workers to managed networking clusters.
 //
-// If our SNO dnsmaq hack is enabled (ENABLE_SINGLE_NODE_DNSMASQ), then day-1
+// If our SNO dnsmaq hack is enabled (ENABLE_SINGLE_NODE_DNSMASQ)
+// or UnifiedClusterManagedDNSAndLB FeatureGate is enabled, then day-1
 // SNO clusters are an exception to the rule above. Our dnsmasq hack is enabled
 // for OCP and disabled for OKD.
 func (v *validator) shouldValidateDNSResolution(cluster *common.Cluster, domainName, target string) (bool, ValidationStatus, string) {
@@ -1351,6 +1563,11 @@ func (v *validator) shouldValidateDNSResolution(cluster *common.Cluster, domainN
 		// for the SNO dnsmasq hack that is leveraged by the day-1 cluster.
 	} else {
 		// This is a day-1, user-managed-networking cluster
+		clusterManagedDNS, err := installcfg.UsesClusterManagedDNS(cluster)
+		if err != nil {
+			return false, ValidationError, fmt.Sprintf("DNS configuration is invalid: %v", err)
+		}
+
 		networkCfg, err := network.NewConfig()
 		if err != nil {
 			// This should never happen, so the values chosen here are arbitrary
@@ -1358,10 +1575,11 @@ func (v *validator) shouldValidateDNSResolution(cluster *common.Cluster, domainN
 			return false, ValidationSuccess, fmt.Sprintf("Domain name resolution for the %s domain was successful or not required", domainName)
 		}
 
-		if common.IsSingleNodeCluster(cluster) && networkCfg.EnableSingleNodeDnsmasq {
+		if clusterManagedDNS || (common.IsSingleNodeCluster(cluster) && networkCfg.EnableSingleNodeDnsmasq) {
 			// day-1 SNO clusters don't need to perform DNS validation when our
-			// dnsmasq hack is enabled, as it takes care of having the required DNS
-			// entries automatically configured within the host
+			// dnsmasq hack or UnifiedClusterManagedDNSAndLB FeatureGate are enabled,
+			// as it takes care of having the required DNS entries automatically
+			// configured within the host
 			return false, ValidationSuccess, fmt.Sprintf("Domain name resolution for the %s domain was successful or not required", domainName)
 		}
 	}
@@ -1474,7 +1692,7 @@ func getFirstMatchingResolution(c *validationContext, domainName string) (*model
 
 	for _, domain := range response.Resolutions {
 		if domain.DomainName != nil && *domain.DomainName == domainName {
-			if len(domain.IPV4Addresses) != 0 || len(domain.IPV6Addresses) != 0 {
+			if len(domain.IPV4Addresses) != 0 || len(domain.IPV6Addresses) != 0 || len(domain.Cnames) > 0 {
 				return domain, nil
 			}
 		}
@@ -1546,22 +1764,23 @@ func checkUnexpectedDomain(c *validationContext, response *models.DomainResoluti
 		return ValidationError, "Internal error - DNS wildcard check cannot be performed because the DNS validation result doesn't contain the wildcard domain"
 	}
 
-	if len(domainResolution.IPV4Addresses) == 0 && len(domainResolution.IPV6Addresses) == 0 {
+	if len(domainResolution.IPV4Addresses) == 0 && len(domainResolution.IPV6Addresses) == 0 && len(domainResolution.Cnames) == 0 {
 		return ValidationSuccess, "DNS wildcard check was successful"
 	}
 
-	// Compile a list of IP addresses that the bad wildcard domain resolves to
+	// Compile a list of IP addresses and cnames that the bad wildcard domain resolves to
 	// so they can be included in the message. This might help users understand
 	// where the bad wildcard record is coming from.
-	addressStrings := []string{}
+	resolutionStrings := []string{}
 	for _, ipv4Address := range domainResolution.IPV4Addresses {
-		addressStrings = append(addressStrings, string(ipv4Address))
+		resolutionStrings = append(resolutionStrings, string(ipv4Address))
 	}
 	for _, ipv6Address := range domainResolution.IPV6Addresses {
-		addressStrings = append(addressStrings, string(ipv6Address))
+		resolutionStrings = append(resolutionStrings, string(ipv6Address))
 	}
+	resolutionStrings = append(resolutionStrings, domainResolution.Cnames...)
 
-	return ValidationFailure, fmt.Sprintf(messageFormat, c.cluster.Name, c.cluster.BaseDNSDomain, strings.Join(addressStrings, ", "))
+	return ValidationFailure, fmt.Sprintf(messageFormat, c.cluster.Name, c.cluster.BaseDNSDomain, strings.Join(resolutionStrings, ", "))
 }
 
 func (v *validator) isDNSWildcardNotConfigured(c *validationContext) (ValidationStatus, string) {
@@ -1580,10 +1799,10 @@ func (v *validator) isDNSWildcardNotConfigured(c *validationContext) (Validation
 	}
 
 	status, message := checkUnexpectedDomain(c, response, dottedDomainNameToResolve(c, constants.DNSWildcardFalseDomainName),
-		"DNS wildcard configuration was detected for domain *.%s.%s - the installation will not be able to complete while this record exists. Please remove it to proceed. The domain resolves to addresses %s")
+		"DNS wildcard configuration was detected for domain *.%s.%s - the installation will not be able to complete while this record exists. Please remove it to proceed. The domain resolves to %s")
 	if status == ValidationSuccess {
 		status, message = checkUnexpectedDomain(c, response, domainNameToResolve(c, constants.DNSWildcardFalseDomainName),
-			"Unexpected domain name resolution was detected for the relative domain name with the sub-domain *.%s.%s despite the fact that no resolution exists for a Fully Qualified Domain Name (FQDN) with same sub-domain. This is usually a sign of DHCP-provided domain-search configuration. The installation will not be able to complete with this configuration in place. Please remove it to proceed. The relative domain name resolves to addresses %s")
+			"Unexpected domain name resolution was detected for the relative domain name with the sub-domain *.%s.%s despite the fact that no resolution exists for a Fully Qualified Domain Name (FQDN) with same sub-domain. This is usually a sign of DHCP-provided domain-search configuration. The installation will not be able to complete with this configuration in place. Please remove it to proceed. The relative domain name resolves to %s")
 	}
 	return status, message
 }
@@ -1678,7 +1897,10 @@ func (v *validator) isVSphereDiskUUIDEnabled(c *validationContext) (ValidationSt
 		// if any of them doesn't have that flag, it's likely because the user has forgotten to
 		// enable `disk.EnableUUID` for this virtual machine
 		// See https://access.redhat.com/solutions/4606201
-		if v.hwValidator.IsValidStorageDeviceType(disk, c.inventory.CPU.Architecture, "", false) && !disk.HasUUID {
+		// Additionally checking if the disk is eligible for installation before verifying the UUID flag
+		if disk.InstallationEligibility.Eligible &&
+			v.hwValidator.IsValidStorageDeviceType(disk, c.inventory.CPU.Architecture, "") &&
+			!disk.HasUUID {
 			return ValidationFailure, "VSphere disk.EnableUUID isn't enabled for this virtual machine, it's necessary for disks to be mounted properly"
 		}
 	}
@@ -1769,7 +1991,7 @@ func (v *validator) noIPCollisionsInNetwork(c *validationContext) (ValidationSta
 	err := json.Unmarshal([]byte(c.cluster.IPCollisions), &ipCollisions)
 	if err != nil {
 		message := "Unable to unmarshall ip collision report for cluster"
-		v.log.Errorf(message)
+		v.log.Error(message)
 		return ValidationError, message
 	}
 
@@ -1779,13 +2001,13 @@ func (v *validator) noIPCollisionsInNetwork(c *validationContext) (ValidationSta
 		hasIP, err := v.inventoryHasIP(c.inventory, ip)
 		if err != nil {
 			message := fmt.Sprintf("inventory of host %s contains bad CIDR: %s", c.host.ID, err.Error())
-			v.log.Errorf(message)
+			v.log.Error(message)
 			return ValidationError, message
 		}
 		if hasIP {
 			hasCollisions = true
 			message := fmt.Sprintf("Collisions detected for host ID %s, IP address: %s Mac addresses: %s", c.host.ID, ip, strings.Join(macs[:], ","))
-			v.log.Errorf(message)
+			v.log.Error(message)
 			collisionValidationText += fmt.Sprintf("%s\n", message)
 		}
 	}
@@ -1814,4 +2036,83 @@ func (v *validator) inventoryHasIP(inventory *models.Inventory, ipAddress string
 		}
 	}
 	return false, nil
+}
+
+func (v *validator) noIscsiNicBelongsToMachineCidr(c *validationContext) (ValidationStatus, string) {
+	if c.cluster == nil {
+		return ValidationSuccessSuppressOutput, ""
+	}
+
+	if swag.BoolValue(c.cluster.UserManagedNetworking) && !common.IsSingleNodeCluster(c.cluster) {
+		// We don't expect users to select machine network in case of
+		// UMN with compact and multi-node clusters
+		return ValidationSuccessSuppressOutput, ""
+	}
+
+	if common.IsImportedCluster(c.cluster) || common.IsDay2Cluster(c.cluster) {
+		// Machine networks and network type (UMN or CNM) is not known
+		// for imported and day2 clusters
+		// We will skip this check in these cases
+		return ValidationSuccessSuppressOutput, ""
+	}
+
+	installationDisk, err := hostutil.GetHostInstallationDisk(c.host)
+	if err != nil || installationDisk == nil {
+		return ValidationSuccessSuppressOutput, ""
+	}
+
+	if c.inventory == nil || !network.IsMachineCidrAvailable(c.cluster) {
+		return ValidationPending, "Missing inventory or machine network CIDR"
+	}
+
+	if installationDisk.DriveType == models.DriveTypeISCSI {
+		return v.standaloneiSCSI(c, installationDisk)
+	} else if installationDisk.DriveType == models.DriveTypeMultipath {
+		return v.multipathiSCSI(c, installationDisk)
+	} else {
+		// Validation is not relevant in this case
+		return ValidationSuccessSuppressOutput, ""
+	}
+}
+
+// standaloneiSCSI - Related to the noIscsiNicBelongsToMachineCidr validation. This is executed when the installation disk is an iSCSI disk.
+func (v *validator) standaloneiSCSI(c *validationContext, installationDisk *models.Disk) (ValidationStatus, string) {
+	if installationDisk.Iscsi == nil {
+		// If this is nil, the disk shouldn't have passed the eligilibily test in the first place
+		v.log.Warn("iSCSI disk is missing host IP address")
+		return ValidationError, "iSCSI disk is missing host IP address"
+	}
+
+	nic, err := network.FindInterfaceByIPString(installationDisk.Iscsi.HostIPAddress, c.inventory.Interfaces)
+	if err != nil {
+		v.log.WithError(err).Warn("Cannot find network interface associated to iSCSI host IP address")
+		return ValidationError, "Cannot find network interface associated to iSCSI host IP address"
+	}
+
+	found := network.IsInterfaceInPrimaryMachineNetCidr(v.log, c.cluster, nic)
+	if found {
+		return ValidationFailure, "Network interface connected to iSCSI disk cannot belong to machine network CIDRs"
+	}
+
+	return ValidationSuccess, "Network interface connected to iSCSI disk does not belong to machine network CIDRs"
+}
+
+// multipathiSCSI - Related to the noIscsiNicBelongsToMachineCidr validation. This is executed when the installation disk is a multipath disk serving as a holder for iSCSI drives.
+func (v *validator) multipathiSCSI(c *validationContext, installationDisk *models.Disk) (ValidationStatus, string) {
+	var status ValidationStatus
+	msg := ""
+	var iSCSIDisksWithErrors []string
+	iSCSIDisks := hostutil.GetDisksOfHolderByType(c.inventory.Disks, installationDisk, models.DriveTypeISCSI)
+	for _, iscsiDisk := range iSCSIDisks {
+		status, msg = v.standaloneiSCSI(c, iscsiDisk)
+		if status == ValidationError {
+			return ValidationError, msg
+		} else if status == ValidationFailure {
+			iSCSIDisksWithErrors = append(iSCSIDisksWithErrors, iscsiDisk.Name)
+		}
+	}
+	if len(iSCSIDisksWithErrors) > 0 {
+		return ValidationFailure, fmt.Sprintf("%s: Network interface connected to iSCSI disk (%s) cannot belong to machine network CIDRs", hardware.ErrsInIscsiDisableMultipathInstallation, strings.Join(iSCSIDisksWithErrors, ", "))
+	}
+	return ValidationSuccess, msg
 }

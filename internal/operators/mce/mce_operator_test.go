@@ -34,20 +34,17 @@ var _ = Describe("MCE Operator", func() {
 	)
 
 	Context("GetHostRequirements", func() {
-		fullHaMode := models.ClusterHighAvailabilityModeFull
-		snoMode := models.ClusterHighAvailabilityModeNone
-
 		table.DescribeTable("get host requirements when ", func(cluster *common.Cluster, host *models.Host, expectedResult *models.ClusterHostRequirementsDetails) {
 			res, _ := operator.GetHostRequirements(ctx, cluster, host)
 			Expect(res).Should(Equal(expectedResult))
 		},
 			table.Entry("on a multinode cluster",
-				&common.Cluster{Cluster: models.Cluster{HighAvailabilityMode: &fullHaMode, OpenshiftVersion: "4.13.0", Hosts: []*models.Host{hostWithSufficientResources}}},
+				&common.Cluster{Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode, OpenshiftVersion: "4.13.0", Hosts: []*models.Host{hostWithSufficientResources}}},
 				hostWithSufficientResources,
 				&models.ClusterHostRequirementsDetails{CPUCores: MinimumCPU, RAMMib: conversions.GibToMib(MinimumMemory)},
 			),
 			table.Entry("on an SNO cluster",
-				&common.Cluster{Cluster: models.Cluster{HighAvailabilityMode: &snoMode, OpenshiftVersion: "4.13.0", Hosts: []*models.Host{hostWithSufficientResources}}},
+				&common.Cluster{Cluster: models.Cluster{ControlPlaneCount: 1, OpenshiftVersion: "4.13.0", Hosts: []*models.Host{hostWithSufficientResources}}},
 				hostWithSufficientResources,
 				&models.ClusterHostRequirementsDetails{CPUCores: SNOMinimumCpu, RAMMib: conversions.GibToMib(SNOMinimumMemory)},
 			),
@@ -56,7 +53,7 @@ var _ = Describe("MCE Operator", func() {
 
 	Context("ValidateHost", func() {
 		table.DescribeTable("validate host when ", func(cluster *common.Cluster, host *models.Host, expectedResult api.ValidationResult) {
-			res, _ := operator.ValidateHost(ctx, cluster, host)
+			res, _ := operator.ValidateHost(ctx, cluster, host, nil)
 			Expect(res).Should(Equal(expectedResult))
 		},
 			table.Entry("host with no inventory",
@@ -67,7 +64,7 @@ var _ = Describe("MCE Operator", func() {
 			table.Entry("host with insufficient memory",
 				&common.Cluster{Cluster: models.Cluster{Hosts: []*models.Host{hostWithInsufficientResources}}},
 				hostWithInsufficientResources,
-				api.ValidationResult{Status: api.Failure, ValidationId: operator.GetHostValidationID(), Reasons: []string{"Insufficient memory to deploy multicluster engine. Required memory is 16384 MiB but found 8192 MiB"}},
+				api.ValidationResult{Status: api.Failure, ValidationId: operator.GetHostValidationID(), Reasons: []string{"Insufficient memory to deploy multicluster engine on the worker role, requires an additional 16384 MiB (included in the total required for the worker role) but found 8192 MiB."}},
 			),
 
 			table.Entry("master with sufficient resources",
@@ -78,18 +75,33 @@ var _ = Describe("MCE Operator", func() {
 		)
 	})
 	Context("ValidateCluster", func() {
-		table.DescribeTable("validate cluster when ", func(cluster *common.Cluster, expectedResult api.ValidationResult) {
+		table.DescribeTable("validate cluster when ", func(cluster *common.Cluster, expectedResult []api.ValidationResult) {
 			res, _ := operator.ValidateCluster(ctx, cluster)
 			Expect(res).Should(Equal(expectedResult))
 		},
 			table.Entry("Openshift version less than minimal",
 				&common.Cluster{Cluster: models.Cluster{Hosts: []*models.Host{hostWithSufficientResources}, OpenshiftVersion: "4.9.0"}},
-				api.ValidationResult{Status: api.Failure, ValidationId: operator.GetHostValidationID(), Reasons: []string{fmt.Sprintf("multicluster engine is only supported for openshift versions %s and above", MceMinOpenshiftVersion)}},
+				[]api.ValidationResult{{Status: api.Failure, ValidationId: operator.GetHostValidationID(), Reasons: []string{fmt.Sprintf("multicluster engine is only supported for openshift versions %s and above", MceMinOpenshiftVersion)}}},
 			),
 			table.Entry("Openshift version more than minimal",
 				&common.Cluster{Cluster: models.Cluster{Hosts: []*models.Host{hostWithSufficientResources}, OpenshiftVersion: MceMinOpenshiftVersion}},
-				api.ValidationResult{Status: api.Success, ValidationId: operator.GetHostValidationID()},
+				[]api.ValidationResult{{Status: api.Success, ValidationId: operator.GetHostValidationID()}},
 			),
 		)
+	})
+})
+
+var _ = Describe("GetMinDiskSizeGB", func() {
+	It("should return the sum of all required PVCs when cluster is SNO", func() {
+		cluster := &models.Cluster{ControlPlaneCount: 1}
+		minDiskSize := GetMinDiskSizeGB(cluster)
+		expectedMinDiskSize := int64(70)
+		Expect(expectedMinDiskSize).To(Equal(minDiskSize))
+	})
+	It("should return the maximum value of any required PVCs when cluster is HA", func() {
+		cluster := &models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode}
+		minDiskSize := GetMinDiskSizeGB(cluster)
+		expectedMinDiskSize := int64(50)
+		Expect(expectedMinDiskSize).To(Equal(minDiskSize))
 	})
 })

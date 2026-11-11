@@ -1,155 +1,470 @@
 package installercache
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
+	"github.com/go-openapi/strfmt"
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	eventsapi "github.com/openshift/assisted-service/internal/events/api"
+	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/oc"
+	"github.com/openshift/assisted-service/models"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/mock/gomock"
 )
 
-var _ = Describe("installer cache", func() {
+var _ = Describe("release event", func() {
+
 	var (
-		ctrl        *gomock.Controller
-		mockRelease *oc.MockRelease
-		manager     *Installers
-		cacheDir    string
+		ctx           context.Context
+		ctrl          *gomock.Controller
+		eventsHandler *eventsapi.MockHandler
 	)
 
 	BeforeEach(func() {
-		DeleteGracePeriod = 1 * time.Millisecond
-
+		ctx = context.TODO()
 		ctrl = gomock.NewController(GinkgoT())
-		mockRelease = oc.NewMockRelease(ctrl)
+		eventsHandler = eventsapi.NewMockHandler(ctrl)
+	})
 
+	It("should send correct fields when release event is sent", func() {
+		startTime, err := time.Parse(time.RFC3339, "2025-01-07T16:51:10Z")
+		Expect(err).ToNot(HaveOccurred())
+		clusterID := strfmt.UUID(uuid.NewString())
+		releaseID := "quay.io/openshift-release-dev/ocp-release:4.16.28-x86_64"
+		r := &Release{
+			eventsHandler:   eventsHandler,
+			startTime:       startTime,
+			clusterID:       clusterID,
+			releaseID:       releaseID,
+			cached:          false,
+			extractDuration: 19.5,
+			cleanup: func() error {
+				return nil
+			},
+		}
+		eventsHandler.EXPECT().V2AddMetricsEvent(
+			ctx, &clusterID, nil, nil, "", models.EventSeverityInfo, metricEventInstallerCacheRelease, gomock.Any(),
+			"release_id", r.releaseID,
+			"start_time", "2025-01-07T16:51:10Z",
+			"end_time", gomock.Any(),
+			"cached", r.cached,
+			"extract_duration", r.extractDuration,
+		).Times(1)
+		Expect(r.Cleanup(ctx)).To(Succeed())
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+})
+
+var _ = Describe("installer cache", func() {
+	var (
+		ctrl            *gomock.Controller
+		mockRelease     *oc.MockRelease
+		manager         *Installers
+		cacheDir        string
+		eventsHandler   *eventsapi.MockHandler
+		metricsAPI      *metrics.MockAPI
+		ctx             context.Context
+		diskStatsHelper metrics.DiskStatsHelper
+	)
+
+	var getInstallerCacheConfig = func(maxCapacity int64, maxReleaseSize int64) Config {
+		return Config{
+			CacheDir:                  cacheDir,
+			MaxCapacity:               Size(maxCapacity),
+			MaxReleaseSize:            Size(maxReleaseSize),
+			ReleaseFetchRetryInterval: 1 * time.Microsecond,
+		}
+	}
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		diskStatsHelper = metrics.NewOSDiskStatsHelper(logrus.New())
+		mockRelease = oc.NewMockRelease(ctrl)
+		eventsHandler = eventsapi.NewMockHandler(ctrl)
+		metricsAPI = metrics.NewMockAPI(ctrl)
 		var err error
 		cacheDir, err = os.MkdirTemp("/tmp", "cacheDir")
 		Expect(err).NotTo(HaveOccurred())
-		Expect(os.Mkdir(filepath.Join(cacheDir, "quay.io"), 0755)).To(Succeed())
-		Expect(os.Mkdir(filepath.Join(filepath.Join(cacheDir, "quay.io"), "release-dev"), 0755)).To(Succeed())
-		manager = New(cacheDir, 12, logrus.New())
+		manager, err = New(getInstallerCacheConfig(12, 5), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).NotTo(HaveOccurred())
+		ctx = context.TODO()
 	})
 
 	AfterEach(func() {
 		os.RemoveAll(cacheDir)
+		ctrl.Finish()
 	})
 
-	testGet := func(releaseID string) (string, string) {
-		workdir := filepath.Join(cacheDir, "quay.io", "release-dev")
+	expectEventsSent := func() {
+		eventsHandler.EXPECT().V2AddMetricsEvent(
+			ctx, gomock.Any(), nil, nil, "", models.EventSeverityInfo, metricEventInstallerCacheRelease, gomock.Any(),
+			gomock.Any(),
+		).AnyTimes()
+	}
+
+	mockReleaseCalls := func(releaseID string, version string) {
+		workdir := filepath.Join(manager.config.CacheDir, "quay.io", "release-dev")
 		fname := filepath.Join(workdir, releaseID)
 
-		mockRelease.EXPECT().GetReleaseBinaryPath(
-			gomock.Any(), gomock.Any()).
-			Return(workdir, releaseID, fname)
-		mockRelease.EXPECT().Extract(gomock.Any(), releaseID,
-			gomock.Any(), cacheDir, gomock.Any()).
-			DoAndReturn(func(log logrus.FieldLogger, releaseImage string, releaseImageMirror string, cacheDir string, pullSecret string) (string, error) {
-				err := os.WriteFile(fname, []byte("abcde"), 0600)
-				return "", err
-			})
-		l, err := manager.Get(releaseID, "mirror", "pull-secret", mockRelease)
-		Expect(err).ShouldNot(HaveOccurred())
+		writeMockedReleaseToDisk := func(log logrus.FieldLogger, releaseImage string, releaseImageMirror string, cacheDir string, pullSecret string, version string) (string, error) {
+			dir, _ := filepath.Split(fname)
+			err := os.MkdirAll(dir, 0700)
+			Expect(err).ToNot(HaveOccurred())
+			time.Sleep(10 * time.Millisecond) // Add a small amount of latency to simulate extraction
+			err = os.WriteFile(fname, []byte("abcde"), 0600)
+			return "", err
+		}
 
-		time.Sleep(1 * time.Second)
+		mockRelease.EXPECT().GetReleaseBinaryPath(
+			gomock.Any(), gomock.Any(), version).
+			Return(workdir, releaseID, fname, nil).AnyTimes()
+
+		mockRelease.EXPECT().Extract(gomock.Any(), releaseID,
+			gomock.Any(), manager.config.CacheDir, gomock.Any(), version).
+			DoAndReturn(writeMockedReleaseToDisk).AnyTimes()
+
+		metricsAPI.EXPECT().InstallerCacheReleaseEvicted(gomock.Any()).AnyTimes()
+
+	}
+
+	testGet := func(releaseID, version string, clusterID strfmt.UUID, expectCached bool, expectedMajorMinorVersion string) (string, string) {
+		workdir := filepath.Join(manager.config.CacheDir, "quay.io", "release-dev")
+		fname := filepath.Join(workdir, releaseID)
+		if !expectCached {
+			mockReleaseCalls(releaseID, version)
+		}
+		expectEventsSent()
+		mockReleaseCalls(releaseID, version)
+		expectEventsSent()
+		mockRelease.EXPECT().GetMajorMinorVersion(gomock.Any(), releaseID, gomock.Any(), gomock.Any()).Return(expectedMajorMinorVersion, nil).Times(1)
+		metricsAPI.EXPECT().InstallerCacheGetReleaseCached(expectedMajorMinorVersion, gomock.Any()).AnyTimes()
+		l, err := manager.Get(ctx, releaseID, "mirror", "pull-secret", mockRelease, version, clusterID)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(l.releaseID).To(Equal(releaseID))
+		Expect(l.clusterID).To(Equal(clusterID))
+		Expect(l.startTime).ShouldNot(BeZero())
+		Expect(l.cached).To(Equal(expectCached))
+		Expect(l.eventsHandler).To(Equal(eventsHandler))
+		if !expectCached {
+			Expect(l.extractDuration).ShouldNot(BeZero())
+		}
+		Expect(l.Path).ShouldNot(BeEmpty())
+		Expect(l.startTime.Before(time.Now())).To(BeTrue())
+		Expect(l.Cleanup(context.TODO())).To(Succeed())
 		return fname, l.Path
 	}
-	It("evicts the oldest file", func() {
-		r1, l1 := testGet("4.8")
-		r2, l2 := testGet("4.9")
-		r3, l3 := testGet("4.10")
 
-		By("verify that the oldest file was deleted")
-		_, err := os.Stat(r1)
-		Expect(os.IsNotExist(err)).To(BeTrue())
-		_, err = os.Stat(r2)
-		Expect(os.IsNotExist(err)).To(BeFalse())
-		_, err = os.Stat(r3)
-		Expect(os.IsNotExist(err)).To(BeFalse())
+	type test struct {
+		releaseID         string
+		version           string
+		clusterID         strfmt.UUID
+		majorMinorVersion string
+	}
 
-		By("verify that the links were purged")
-		manager.evict()
-		_, err = os.Stat(l1)
-		Expect(os.IsNotExist(err)).To(BeTrue())
-		_, err = os.Stat(l2)
-		Expect(os.IsNotExist(err)).To(BeTrue())
-		_, err = os.Stat(l3)
-		Expect(os.IsNotExist(err)).To(BeTrue())
+	getUsedBytesForDirectory := func(directory string) uint64 {
+		var totalBytes uint64
+		seenInodes := make(map[uint64]bool)
+		err := filepath.Walk(directory, func(path string, fileInfo os.FileInfo, err error) error {
+			if err != nil {
+				if _, ok := err.(*os.PathError); ok {
+					// Something deleted the file before we could walk it
+					// count this as zero bytes
+					return nil
+				}
+				return err
+			}
+			stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+			Expect(ok).To(BeTrue())
+			if !fileInfo.IsDir() && !seenInodes[stat.Ino] {
+				totalBytes += uint64(fileInfo.Size())
+				seenInodes[stat.Ino] = true
+			}
+			return nil
+		})
+		Expect(err).ToNot(HaveOccurred())
+		return totalBytes
+	}
+
+	runTest := func(t test, manager *Installers) (*Release, error) {
+		expectEventsSent()
+		mockReleaseCalls(t.releaseID, t.version)
+		mockRelease.EXPECT().GetMajorMinorVersion(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(t.majorMinorVersion, nil).AnyTimes()
+		metricsAPI.EXPECT().InstallerCacheGetReleaseCached(t.majorMinorVersion, gomock.Any()).AnyTimes()
+		return manager.Get(ctx, t.releaseID, "mirror", "pull-secret", mockRelease, t.version, t.clusterID)
+	}
+
+	cleanup := func(release *Release) {
+		if release != nil {
+			time.Sleep(2 * time.Millisecond)
+			Expect(release.Cleanup(ctx)).To(Succeed())
+		}
+	}
+
+	handleError := func(errMutex *sync.Mutex, err error, reportedError *error) {
+		if err != nil {
+			errMutex.Lock()
+			if reportedError == nil {
+				*reportedError = err
+			}
+			errMutex.Unlock()
+			return
+		}
+	}
+
+	getLogger := func() *logrus.Logger {
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+		return log
+	}
+
+	// runParallelTest launches installercache.Get tests in parallel
+	// releases are automatically cleaned up as they are gathered
+	// returns the first error encountered or nil if no error encountered.
+	runParallelTest := func(maxCapacity int64, maxReleaseSize int64, tests []test) error {
+		var err error
+		manager, err = New(getInstallerCacheConfig(maxCapacity, maxReleaseSize), eventsHandler, metricsAPI, diskStatsHelper, getLogger())
+		Expect(err).ToNot(HaveOccurred())
+		var wg sync.WaitGroup
+		var reportedError error
+		var errMutex sync.Mutex
+		for _, t := range tests {
+			t.clusterID = strfmt.UUID(uuid.NewString())
+			wg.Add(1)
+			go func(t test) {
+				defer wg.Done()
+				release, err := runTest(t, manager)
+				handleError(&errMutex, err, &reportedError)
+				cleanup(release)
+			}(t)
+		}
+		wg.Wait()
+		return reportedError
+	}
+
+	It("should correctly handle multiple requests for the same release at the same time", func() {
+		maxCapacity := int64(10)
+		maxReleaseSize := int64(5)
+		err := runParallelTest(maxCapacity, maxReleaseSize, []test{
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", maxCapacity))
 	})
 
-	It("exising files access time is updated", func() {
-		_, _ = testGet("4.8")
-		r2, _ := testGet("4.9")
-		r1, _ := testGet("4.8")
-		r3, _ := testGet("4.10")
-
-		By("verify that the oldest file was deleted")
-		_, err := os.Stat(r1)
-		Expect(os.IsNotExist(err)).To(BeFalse())
-		_, err = os.Stat(r2)
-		Expect(os.IsNotExist(err)).To(BeTrue())
-		_, err = os.Stat(r3)
-		Expect(os.IsNotExist(err)).To(BeFalse())
+	It("should consistently handle multiple requests for different releases at the same time", func() {
+		maxCapacity := int64(25)
+		maxReleaseSize := int64(5)
+		err := runParallelTest(maxCapacity, maxReleaseSize, []test{
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.18.11-x86_64", version: "4.18.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.19.11-x86_64", version: "4.19.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.20.11-x86_64", version: "4.20.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.21.11-x86_64", version: "4.21.11", majorMinorVersion: "4.17"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", maxCapacity))
 	})
 
-	It("when cache limit is not set eviction is skipped", func() {
-		manager.storageCapacity = 0
+	It("should stay within the cache limit where there is only sufficient space for one release", func() {
+		maxCapacity := int64(5)
+		maxReleaseSize := int64(5)
+		err := runParallelTest(maxCapacity, maxReleaseSize, []test{
+			{releaseID: "4.17.11-x86_64", version: "4.17.11", majorMinorVersion: "4.17"},
+			{releaseID: "4.18.11-x86_64", version: "4.18.11", majorMinorVersion: "4.18"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", maxCapacity))
 
-		r1, _ := testGet("4.8")
-		r2, _ := testGet("4.9")
-		r3, _ := testGet("4.10")
+		// Now assert that a retry would work, there should be enough space for another release
+		// use a brand new release ID to prove we are not hitting cache here.
+		err = runParallelTest(maxCapacity, maxReleaseSize, []test{
+			{releaseID: "4.19.11-x86_64", version: "4.19.11", majorMinorVersion: "4.19"},
+		})
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("Should raise error on construction if max release size is larger than cache and cache is enabled", func() {
+		_, err := New(getInstallerCacheConfig(5, 10), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Equal("config.MaxReleaseSize (10 bytes) must not be greater than config.MaxCapacity (5 bytes)"))
+	})
+
+	It("Should raise error on construction if max release size is zero and cache is enabled", func() {
+		_, err := New(getInstallerCacheConfig(5, 0), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Equal("config.MaxReleaseSize (0 bytes) must not be zero"))
+	})
+
+	It("Should not raise error on construction if max release size is larger than cache and cache eviction is disabled", func() {
+		_, err := New(getInstallerCacheConfig(0, 10), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("Should not raise error on construction if max release size is zero and cache eviction is disabled", func() {
+		_, err := New(getInstallerCacheConfig(0, 0), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("when cache limit is zero - eviction is skipped", func() {
+		var err error
+		manager, err = New(getInstallerCacheConfig(0, 5), eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).ToNot(HaveOccurred())
+		clusterId := strfmt.UUID(uuid.New().String())
+		r1, _ := testGet("4.8", "4.8.0", clusterId, false, "4.8")
+		r2, _ := testGet("4.9", "4.9.0", clusterId, false, "4.9")
+		r3, _ := testGet("4.10", "4.10.0", clusterId, false, "4.10")
 
 		By("verify that the no file was deleted")
-		_, err := os.Stat(r1)
+		_, err = os.Stat(r1)
 		Expect(os.IsNotExist(err)).To(BeFalse())
 		_, err = os.Stat(r2)
 		Expect(os.IsNotExist(err)).To(BeFalse())
 		_, err = os.Stat(r3)
 		Expect(os.IsNotExist(err)).To(BeFalse())
-
 	})
 
-	It("extracts from the mirror", func() {
-		releaseID := "4.10-orig"
-		releaseMirrorID := "4.10-mirror"
-		workdir := filepath.Join(cacheDir, "quay.io", "release-dev")
-		fname := filepath.Join(workdir, releaseID)
+	It("existing files access time is updated", func() {
+		clusterId := strfmt.UUID(uuid.New().String())
+		_, _ = testGet("4.8", "4.8.0", clusterId, false, "4.8")
+		r2, _ := testGet("4.9", "4.9.0", clusterId, false, "4.9")
+		r1, _ := testGet("4.8", "4.8.0", clusterId, true, "4.8")
+		r3, _ := testGet("4.10", "4.10.0", clusterId, false, "4.10")
 
-		mockRelease.EXPECT().GetReleaseBinaryPath(
-			releaseMirrorID, gomock.Any()).
-			Return(workdir, releaseID, fname)
-		mockRelease.EXPECT().Extract(gomock.Any(), releaseID,
-			gomock.Any(), cacheDir, gomock.Any()).
-			DoAndReturn(func(log logrus.FieldLogger, releaseImage string, releaseImageMirror string, cacheDir string, pullSecret string) (string, error) {
-				err := os.WriteFile(fname, []byte("abcde"), 0600)
-				return "", err
-			})
-		_, err := manager.Get(releaseID, releaseMirrorID, "pull-secret", mockRelease)
-		Expect(err).ShouldNot(HaveOccurred())
+		By("verify that the oldest file was deleted")
+		_, err := os.Stat(r1)
+		Expect(os.IsNotExist(err)).To(BeFalse())
+		_, err = os.Stat(r2)
+		Expect(os.IsNotExist(err)).To(BeTrue())
+		_, err = os.Stat(r3)
+		Expect(os.IsNotExist(err)).To(BeFalse())
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", manager.config.MaxCapacity))
 	})
 
-	It("extracts without a mirror", func() {
+	It("evicts the oldest file", func() {
+		clusterId := strfmt.UUID(uuid.New().String())
+		r1, _ := testGet("4.8", "4.8.0", clusterId, false, "4.8")
+		r2, _ := testGet("4.9", "4.9.0", clusterId, false, "4.9")
+		r3, _ := testGet("4.10", "4.10.0", clusterId, false, "4.10")
+
+		By("verify that the oldest file was deleted")
+		_, err := os.Stat(r1)
+		Expect(os.IsNotExist(err)).To(BeTrue())
+		_, err = os.Stat(r2)
+		Expect(os.IsNotExist(err)).To(BeFalse())
+		_, err = os.Stat(r3)
+		Expect(os.IsNotExist(err)).To(BeFalse())
+
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", manager.config.MaxCapacity))
+	})
+
+	It("extracts a release", func() {
 		releaseID := "4.10-orig"
 		releaseMirrorID := ""
-		workdir := filepath.Join(cacheDir, "quay.io", "release-dev")
-		fname := filepath.Join(workdir, releaseID)
-
-		mockRelease.EXPECT().GetReleaseBinaryPath(
-			releaseID, gomock.Any()).
-			Return(workdir, releaseID, fname)
-		mockRelease.EXPECT().Extract(gomock.Any(), releaseID,
-			gomock.Any(), cacheDir, gomock.Any()).
-			DoAndReturn(func(log logrus.FieldLogger, releaseImage string, releaseImageMirror string, cacheDir string, pullSecret string) (string, error) {
-				err := os.WriteFile(fname, []byte("abcde"), 0600)
-				return "", err
-			})
-		_, err := manager.Get(releaseID, releaseMirrorID, "pull-secret", mockRelease)
+		version := "4.10.0"
+		majorMinorVersion := "4.10"
+		clusterID := strfmt.UUID(uuid.NewString())
+		mockRelease.EXPECT().GetMajorMinorVersion(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(majorMinorVersion, nil).AnyTimes()
+		mockReleaseCalls(releaseID, version)
+		metricsAPI.EXPECT().InstallerCacheGetReleaseCached(majorMinorVersion, false)
+		l, err := manager.Get(ctx, releaseID, releaseMirrorID, "pull-secret", mockRelease, version, clusterID)
 		Expect(err).ShouldNot(HaveOccurred())
+		Expect(l.releaseID).To(Equal(releaseID))
+		Expect(l.clusterID).To(Equal(clusterID))
+		Expect(l.startTime).ShouldNot(BeZero())
+		Expect(l.cached).To(BeFalse())
+		Expect(l.extractDuration).ShouldNot(BeZero())
+		Expect(l.Path).ShouldNot(BeEmpty())
+		expectEventsSent()
+		Expect(l.Cleanup(ctx)).To(Succeed())
+		// Now measure disk usage, we should be under the cache size
+		Expect(getUsedBytesForDirectory(manager.config.CacheDir)).To(BeNumerically("<=", manager.config.MaxCapacity))
 	})
+
+	It("should reset the cache directory contents on construction", func() {
+		cacheConfig := getInstallerCacheConfig(10, 5)
+
+		Expect(os.MkdirAll(cacheConfig.CacheDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(cacheConfig.CacheDir, "test.txt"), []byte("test"), 0600)).To(Succeed())
+
+		_, err := New(cacheConfig, eventsHandler, metricsAPI, diskStatsHelper, logrus.New())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = os.Stat(filepath.Join(cacheConfig.CacheDir, "test.txt"))
+		Expect(os.IsNotExist(err)).To(BeTrue())
+	})
+})
+
+var _ = Describe("Size.Decode", func() {
+	const (
+		oneGiB int64 = 1024 * 1024 * 1024
+		oneGB  int64 = 1000 * 1000 * 1000
+	)
+
+	DescribeTable("accepts unambiguous strings",
+		func(input string, expected Size) {
+			var s Size
+			Expect(s.Decode(input)).To(Succeed())
+			Expect(s).To(Equal(expected))
+		},
+
+		Entry("gibibytes", "20GiB", Size(20*oneGiB)),
+		Entry("mebibytes", "512MiB", Size(512*1024*1024)),
+		Entry("gigabyte", "20GB", Size(20*oneGB)),
+		Entry("megabytes", "512MB", Size(512*1000*1000)),
+		Entry("zero", "0", Size(0)),
+		Entry("zero with unit", "0GiB", Size(0)),
+		Entry("space between magnitude and unit", "20 GiB", Size(20*oneGiB)),
+	)
+
+	It("does not equate decimal GB with binary GiB", func() {
+		var gb, gib Size
+		Expect(gb.Decode("20GB")).To(Succeed())
+		Expect(gib.Decode("20GiB")).To(Succeed())
+		Expect(gb).NotTo(Equal(gib))
+	})
+
+	DescribeTable("rejects non-canonical unit casing",
+		func(input string) {
+			var s Size
+			Expect(s.Decode(input)).NotTo(Succeed())
+		},
+		Entry("lowercase gb", "20gb"),
+		Entry("all-caps iB suffix", "20GIB"),
+		Entry("mixed Gib looks like giga-bit not gibibyte", "20Gib"),
+		Entry("bare G without B", "20G"),
+	)
+
+	DescribeTable("rejects invalid spellings",
+		func(input string) {
+			var s Size
+			Expect(s.Decode(input)).NotTo(Succeed())
+		},
+		Entry("unit only", "GiB"),
+		Entry("unknown suffix", "20XB"),
+	)
 })
 
 func TestInstallerCache(t *testing.T) {

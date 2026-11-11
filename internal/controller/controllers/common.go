@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	certtypes "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	bmh_v1alpha1 "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	configv1 "github.com/openshift/api/config/v1"
 	machinev1beta1 "github.com/openshift/api/machine/v1beta1"
@@ -20,6 +21,8 @@ import (
 	hiveext "github.com/openshift/assisted-service/api/hiveextension/v1beta1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	restclient "github.com/openshift/assisted-service/client"
+	"github.com/openshift/assisted-service/internal/bminventory"
+	clusterPkg "github.com/openshift/assisted-service/internal/cluster"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
@@ -43,14 +46,17 @@ import (
 )
 
 const (
-	mirrorRegistryRefCertKey         = "ca-bundle.crt"
+	caBundleKey                      = "ca-bundle.crt"
+	mirrorRegistryRefCertKey         = caBundleKey
 	mirrorRegistryRefRegistryConfKey = "registries.conf"
 	mirrorRegistryConfigVolume       = "mirror-registry-config"
+	mirrorRegistryCertBundleVolume   = "mirror-registry-ca-bundle"
 	WatchResourceLabel               = "agent-install.openshift.io/watch"
 	WatchResourceValue               = "true"
 	BackupLabel                      = "cluster.open-cluster-management.io/backup"
 	BackupLabelValue                 = "true"
 	InfraEnvLabel                    = "infraenvs.agent-install.openshift.io"
+	VeleroExcludeBackupLabel         = "velero.io/exclude-from-backup"
 )
 
 //go:generate mockgen --build_flags=--mod=mod -package=controllers -destination=mock_sub_resource_writer.go sigs.k8s.io/controller-runtime/pkg/client SubResourceWriter
@@ -65,13 +71,13 @@ func getSecret(ctx context.Context, c client.Client, r client.Reader, key types.
 	errorMessage := fmt.Sprintf("failed to get secret %s/%s from cache", key.Namespace, key.Name)
 	if err := c.Get(ctx, key, secret); err != nil {
 		if !k8serrors.IsNotFound(err) {
-			return nil, errors.Wrapf(err, errorMessage)
+			return nil, errors.Wrap(err, errorMessage)
 		}
 		// Secret not in cache; check API directly for unlabelled Secret
 		err = r.Get(ctx, key, secret)
 		if err != nil {
 			errorMessage = fmt.Sprintf("failed to get secret %s/%s from API", key.Namespace, key.Name)
-			return nil, errors.Wrapf(err, errorMessage)
+			return nil, errors.Wrap(err, errorMessage)
 		}
 	}
 	return secret, nil
@@ -90,7 +96,7 @@ func ensureSecretIsLabelled(ctx context.Context, c client.Client, secret *corev1
 		err := c.Update(ctx, secret)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for secret %s/%s", BackupLabel, BackupLabelValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 
@@ -100,7 +106,7 @@ func ensureSecretIsLabelled(ctx context.Context, c client.Client, secret *corev1
 		err := c.Update(ctx, secret)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for secret %s/%s", WatchResourceLabel, WatchResourceValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 	return nil
@@ -126,7 +132,7 @@ func ensureConfigMapIsLabelled(ctx context.Context, c client.Client, cm *corev1.
 		err := c.Update(ctx, cm)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for configmap %s/%s", BackupLabel, BackupLabelValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 
@@ -136,7 +142,7 @@ func ensureConfigMapIsLabelled(ctx context.Context, c client.Client, cm *corev1.
 		err := c.Update(ctx, cm)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for configmap %s/%s", WatchResourceLabel, WatchResourceValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 	return nil
@@ -233,6 +239,7 @@ func GetKubeClientSchemes() *runtime.Scheme {
 	utilruntime.Must(configv1.Install(schemes))
 	utilruntime.Must(metal3iov1alpha1.AddToScheme(schemes))
 	utilruntime.Must(apiextensionsv1.AddToScheme(schemes))
+	utilruntime.Must(certtypes.AddToScheme(schemes))
 	return schemes
 }
 
@@ -309,13 +316,19 @@ func checksumSecret(m map[string][]byte) (string, error) {
 
 func clusterNetworksArrayToEntries(networks []*models.ClusterNetwork) []hiveext.ClusterNetworkEntry {
 	return funk.Map(networks, func(net *models.ClusterNetwork) hiveext.ClusterNetworkEntry {
-		return hiveext.ClusterNetworkEntry{CIDR: string(net.Cidr), HostPrefix: int32(net.HostPrefix)}
+		return hiveext.ClusterNetworkEntry{CIDR: string(net.Cidr), HostPrefix: int32(net.HostPrefix)} // nolint: gosec
 	}).([]hiveext.ClusterNetworkEntry)
 }
 
 func clusterNetworksEntriesToArray(entries []hiveext.ClusterNetworkEntry) []*models.ClusterNetwork {
 	return funk.Map(entries, func(entry hiveext.ClusterNetworkEntry) *models.ClusterNetwork {
-		return &models.ClusterNetwork{Cidr: models.Subnet(entry.CIDR), HostPrefix: int64(entry.HostPrefix)}
+		cidr := models.Subnet(entry.CIDR)
+		if normalized, err := cidr.Normalize(); err == nil {
+			cidr = normalized
+		} else {
+			logrus.WithError(err).Warnf("failed to normalize cluster network CIDR %s", entry.CIDR)
+		}
+		return &models.ClusterNetwork{Cidr: cidr, HostPrefix: int64(entry.HostPrefix)}
 	}).([]*models.ClusterNetwork)
 }
 
@@ -327,7 +340,13 @@ func serviceNetworksArrayToStrings(networks []*models.ServiceNetwork) []string {
 
 func serviceNetworksEntriesToArray(entries []string) []*models.ServiceNetwork {
 	return funk.Map(entries, func(entry string) *models.ServiceNetwork {
-		return &models.ServiceNetwork{Cidr: models.Subnet(entry)}
+		cidr := models.Subnet(entry)
+		if normalized, err := cidr.Normalize(); err == nil {
+			cidr = normalized
+		} else {
+			logrus.WithError(err).Warnf("failed to normalize service network CIDR %s", entry)
+		}
+		return &models.ServiceNetwork{Cidr: cidr}
 	}).([]*models.ServiceNetwork)
 }
 
@@ -339,7 +358,13 @@ func machineNetworksArrayToEntries(networks []*models.MachineNetwork) []hiveext.
 
 func machineNetworksEntriesToArray(entries []hiveext.MachineNetworkEntry) []*models.MachineNetwork {
 	return funk.Map(entries, func(entry hiveext.MachineNetworkEntry) *models.MachineNetwork {
-		return &models.MachineNetwork{Cidr: models.Subnet(entry.CIDR)}
+		cidr := models.Subnet(entry.CIDR)
+		if normalized, err := cidr.Normalize(); err == nil {
+			cidr = normalized
+		} else {
+			logrus.WithError(err).Warnf("failed to normalize machine network CIDR %s", entry.CIDR)
+		}
+		return &models.MachineNetwork{Cidr: cidr}
 	}).([]*models.MachineNetwork)
 }
 
@@ -351,7 +376,13 @@ func ApiVipsArrayToStrings(vips []*models.APIVip) []string {
 
 func ApiVipsEntriesToArray(entries []string) []*models.APIVip {
 	return funk.Map(entries, func(entry string) *models.APIVip {
-		return &models.APIVip{IP: models.IP(entry)}
+		ip := models.IP(entry)
+		if normalized, err := ip.Normalize(); err == nil {
+			ip = normalized
+		} else {
+			logrus.WithError(err).Warnf("failed to normalize API VIP %s", entry)
+		}
+		return &models.APIVip{IP: ip}
 	}).([]*models.APIVip)
 }
 
@@ -363,7 +394,13 @@ func IngressVipsArrayToStrings(vips []*models.IngressVip) []string {
 
 func IngressVipsEntriesToArray(entries []string) []*models.IngressVip {
 	return funk.Map(entries, func(entry string) *models.IngressVip {
-		return &models.IngressVip{IP: models.IP(entry)}
+		ip := models.IP(entry)
+		if normalized, err := ip.Normalize(); err == nil {
+			ip = normalized
+		} else {
+			logrus.WithError(err).Warnf("failed to normalize Ingress VIP %s", entry)
+		}
+		return &models.IngressVip{IP: ip}
 	}).([]*models.IngressVip)
 }
 
@@ -404,21 +441,64 @@ func isNonePlatformCluster(ctx context.Context, client client.Client, cd *hivev1
 	return isUserManagedNetwork(&clusterInstall), false, nil
 }
 
-// We get first agent's cluster deployment and then we query if it belongs to none platform cluster
-func isAgentInNonePlatformCluster(ctx context.Context, client client.Client, agent *aiv1beta1.Agent) (isNone bool, err error) {
+// isBaremetalPlatformWithoutMAPI returns true if a cluster is baremetal platform and if its
+// capabilities specifies baremetal and doesn't specify MAPI
+func isBaremetalPlatformWithoutMAPI(ctx context.Context, client client.Client, installer bminventory.InstallerInternals, cd *hivev1.ClusterDeployment) (bool, error) {
+	isBaremetalPlatform, err := isBaremetalPlatform(ctx, client, cd)
+	if err != nil {
+		return false, err
+	}
+
+	if !isBaremetalPlatform {
+		return false, nil
+	}
+
+	cluster, getClusterErr := installer.GetClusterByKubeKey(types.NamespacedName{Name: cd.Name, Namespace: cd.Namespace})
+	if getClusterErr != nil {
+		return false, errors.Wrapf(err, "failed to get cluster from DB for ClusterDeployment %s/%s", cd.Namespace, cd.Name)
+	}
+
+	return clusterPkg.HasBaseCapabilities(cluster, configv1.ClusterVersionCapabilitySetNone) &&
+		clusterPkg.HasAdditionalCapabilities(cluster, []configv1.ClusterVersionCapability{configv1.ClusterVersionCapabilityBaremetal}) &&
+		!clusterPkg.HasAdditionalCapabilities(cluster, []configv1.ClusterVersionCapability{configv1.ClusterVersionCapabilityMachineAPI}), nil
+}
+
+func isBaremetalPlatform(ctx context.Context, client client.Client, cd *hivev1.ClusterDeployment) (bool, error) {
+	if cd.Spec.ClusterInstallRef == nil {
+		return false, errors.Errorf("Cluster Install Reference is null for cluster deployment ns=%s name=%s", cd.Namespace, cd.Name)
+	}
+	clusterInstall := hiveext.AgentClusterInstall{}
+	namespacedName := types.NamespacedName{
+		Namespace: cd.Namespace,
+		Name:      cd.Spec.ClusterInstallRef.Name,
+	}
+	if err := client.Get(ctx, namespacedName, &clusterInstall); err != nil {
+		return false, errors.Wrapf(err, "Could not get AgentClusterInstall %s for ClusterDeployment %s", cd.Spec.ClusterInstallRef.Name, cd.Name)
+	}
+	platform, err := getPlatform(clusterInstall.Spec)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get AgentClusterInstall %s platform", clusterInstall.Name)
+	}
+	if platform == nil {
+		return false, nil
+	}
+	return *platform.Type == models.PlatformTypeBaremetal, nil
+}
+
+// getClusterDeploymentFromAgent retrieves the ClusterDeployment that is referenced by the Agent from the Kube APIServer
+func getClusterDeploymentFromAgent(ctx context.Context, client client.Client, agent *aiv1beta1.Agent) (*hivev1.ClusterDeployment, error) {
 	var cd hivev1.ClusterDeployment
 	if agent.Spec.ClusterDeploymentName == nil {
-		return false, errors.Errorf("No cluster deployment for agent %s/%s", agent.Namespace, agent.Name)
+		return nil, errors.Errorf("No cluster deployment for agent %s/%s", agent.Namespace, agent.Name)
 	}
 	namespacedName := types.NamespacedName{
 		Namespace: agent.Spec.ClusterDeploymentName.Namespace,
 		Name:      agent.Spec.ClusterDeploymentName.Name,
 	}
-	if err = client.Get(ctx, namespacedName, &cd); err != nil {
-		return false, errors.Wrapf(err, "Failed to get cluster deployment %s/%s", namespacedName.Namespace, namespacedName.Name)
+	if err := client.Get(ctx, namespacedName, &cd); err != nil {
+		return nil, errors.Wrapf(err, "Failed to get cluster deployment %s/%s", namespacedName.Namespace, namespacedName.Name)
 	}
-	isNone, _, err = isNonePlatformCluster(ctx, client, &cd)
-	return
+	return &cd, nil
 }
 
 func setAnnotation(meta *metav1.ObjectMeta, key string, value string) {
@@ -457,4 +537,27 @@ func spokeKubeconfigSecret(ctx context.Context, log logrus.FieldLogger, c client
 	}
 
 	return secret, nil
+}
+
+func ensureVeleroExcludeBackupLabel(ctx context.Context, log logrus.FieldLogger, c client.Client, obj client.Object) error {
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	if val, ok := labels[VeleroExcludeBackupLabel]; ok && val == "true" {
+		return nil
+	}
+
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	labels[VeleroExcludeBackupLabel] = "true"
+	obj.SetLabels(labels)
+
+	if err := c.Patch(ctx, obj, patch); err != nil {
+		log.WithError(err).Errorf("failed to patch %s label on %s/%s", VeleroExcludeBackupLabel, obj.GetNamespace(), obj.GetName())
+		return err
+	}
+
+	log.Debugf("Set %s label on %s/%s", VeleroExcludeBackupLabel, obj.GetNamespace(), obj.GetName())
+	return nil
 }

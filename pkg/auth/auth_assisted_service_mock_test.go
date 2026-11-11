@@ -81,6 +81,10 @@ func (f fakeInventory) V2RegisterCluster(ctx context.Context, params installer.V
 	return installer.NewV2RegisterClusterCreated()
 }
 
+func (f fakeInventory) V2RegisterDisconnectedCluster(ctx context.Context, params installer.V2RegisterDisconnectedClusterParams) middleware.Responder {
+	return installer.NewV2RegisterDisconnectedClusterCreated()
+}
+
 func (f fakeInventory) V2ImportCluster(ctx context.Context, params installer.V2ImportClusterParams) middleware.Responder {
 	return installer.NewV2ImportClusterCreated()
 }
@@ -250,6 +254,10 @@ func (f fakeInventory) GetSupportedFeatures(ctx context.Context, params installe
 	return installer.NewGetSupportedFeaturesOK()
 }
 
+func (f fakeInventory) GetDetailedSupportedFeatures(ctx context.Context, params installer.GetDetailedSupportedFeaturesParams) middleware.Responder {
+	return installer.NewGetDetailedSupportedFeaturesOK()
+}
+
 func (f fakeInventory) GetSupportedArchitectures(ctx context.Context, params installer.GetSupportedArchitecturesParams) middleware.Responder {
 	return installer.NewGetSupportedArchitecturesOK()
 }
@@ -302,6 +310,18 @@ func (f fakeVersionsAPI) V2ListSupportedOpenshiftVersions(
 	_ context.Context,
 	_ versionsapi.V2ListSupportedOpenshiftVersionsParams) middleware.Responder {
 	return versionsapi.NewV2ListSupportedOpenshiftVersionsOK()
+}
+
+func (f fakeVersionsAPI) V2ListSupportedOfflineOpenshiftVersions(
+	_ context.Context,
+	_ versionsapi.V2ListSupportedOfflineOpenshiftVersionsParams) middleware.Responder {
+	return versionsapi.NewV2ListSupportedOfflineOpenshiftVersionsOK()
+}
+
+func (f fakeVersionsAPI) V2ListReleaseSources(
+	_ context.Context,
+	_ versionsapi.V2ListReleaseSourcesParams) middleware.Responder {
+	return versionsapi.NewV2ListReleaseSourcesOK()
 }
 
 type fakeManagedDomainsAPI struct{}

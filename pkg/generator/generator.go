@@ -6,61 +6,64 @@ import (
 	"path/filepath"
 
 	"github.com/openshift/assisted-service/internal/common"
+	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/ignition"
-	"github.com/openshift/assisted-service/internal/operators"
+	"github.com/openshift/assisted-service/internal/installercache"
+	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
 	"github.com/openshift/assisted-service/internal/provider/registry"
-	"github.com/openshift/assisted-service/pkg/auth"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	"github.com/sirupsen/logrus"
 )
 
+//go:generate mockgen --build_flags=--mod=mod -package generator -destination mock_install_config.go . InstallConfigGenerator
 type InstallConfigGenerator interface {
-	GenerateInstallConfig(ctx context.Context, cluster common.Cluster, cfg []byte, releaseImage, installerReleaseImageOverride string) error
-}
-
-//go:generate mockgen --build_flags=--mod=mod -package generator -destination mock_install_config.go . ISOInstallConfigGenerator
-type ISOInstallConfigGenerator interface {
-	InstallConfigGenerator
+	GenerateInstallConfig(ctx context.Context, cluster common.Cluster, cfg []byte, releaseImage, installerReleaseImageOverride string, forceInsecurePolicyJson bool) error
 }
 
 type Config struct {
-	ServiceCACertPath      string `envconfig:"SERVICE_CA_CERT_PATH" default:""`
-	ServiceIPs             string `envconfig:"SERVICE_IPS" default:""`
-	ReleaseImageMirror     string
-	DummyIgnition          bool   `envconfig:"DUMMY_IGNITION"`
-	InstallInvoker         string `envconfig:"INSTALL_INVOKER" default:"assisted-installer"`
-	ServiceBaseURL         string `envconfig:"SERVICE_BASE_URL"`
-	InstallerCacheCapacity int64  `envconfig:"INSTALLER_CACHE_CAPACITY"`
+	WorkDir            string `envconfig:"WORK_DIR" default:"/data/"`
+	ServiceCACertPath  string `envconfig:"SERVICE_CA_CERT_PATH" default:""`
+	ReleaseImageMirror string `envconfig:"OPENSHIFT_INSTALL_RELEASE_IMAGE_MIRROR" default:""`
+	DummyIgnition      bool   `envconfig:"DUMMY_IGNITION"`
+	InstallInvoker     string `envconfig:"INSTALL_INVOKER" default:"assisted-installer"`
+
+	// Directory containing pre-generated TLS certs/keys for the ephemeral installer
+	ClusterTLSCertOverrideDir string `envconfig:"EPHEMERAL_INSTALLER_CLUSTER_TLS_CERTS_OVERRIDE_DIR" default:""`
 }
 
 type installGenerator struct {
 	Config
-	authHandler               auth.Authenticator
-	log                       logrus.FieldLogger
-	s3Client                  s3wrapper.API
-	operatorsApi              operators.API
-	workDir                   string
-	providerRegistry          registry.ProviderRegistry
-	clusterTLSCertOverrideDir string
+	log              logrus.FieldLogger
+	s3Client         s3wrapper.API
+	workDir          string
+	providerRegistry registry.ProviderRegistry
+	manifestApi      manifestsapi.ManifestsAPI
+	eventsHandler    eventsapi.Handler
+	installerCache   *installercache.Installers
 }
 
-func New(log logrus.FieldLogger, s3Client s3wrapper.API, cfg Config, workDir string, operatorsApi operators.API,
-	providerRegistry registry.ProviderRegistry, clusterTLSCertOverrideDir string, auth auth.Authenticator) *installGenerator {
+// GetWorkingDirectory determines the working directory path for the generator.
+func (c *Config) GetWorkingDirectory() string {
+	return filepath.Join(c.WorkDir, "install-config-generate")
+}
+
+func New(log logrus.FieldLogger, s3Client s3wrapper.API, cfg Config,
+	providerRegistry registry.ProviderRegistry, manifestApi manifestsapi.ManifestsAPI, eventsHandler eventsapi.Handler, installerCache *installercache.Installers) *installGenerator {
 	return &installGenerator{
-		Config:                    cfg,
-		authHandler:               auth,
-		log:                       log,
-		s3Client:                  s3Client,
-		operatorsApi:              operatorsApi,
-		workDir:                   filepath.Join(workDir, "install-config-generate"),
-		providerRegistry:          providerRegistry,
-		clusterTLSCertOverrideDir: clusterTLSCertOverrideDir,
+		Config:           cfg,
+		log:              log,
+		s3Client:         s3Client,
+		workDir:          cfg.GetWorkingDirectory(),
+		providerRegistry: providerRegistry,
+		manifestApi:      manifestApi,
+		eventsHandler:    eventsHandler,
+		installerCache:   installerCache,
 	}
 }
 
 // GenerateInstallConfig creates install config and ignition files
-func (k *installGenerator) GenerateInstallConfig(ctx context.Context, cluster common.Cluster, cfg []byte, releaseImage, installerReleaseImageOverride string) error {
+func (k *installGenerator) GenerateInstallConfig(ctx context.Context, cluster common.Cluster, cfg []byte, releaseImage, installerReleaseImageOverride string, forceInsecurePolicyJson bool) error {
 	log := logutil.FromContext(ctx, k.log)
 	err := os.MkdirAll(k.workDir, 0o755)
 	if err != nil {
@@ -70,48 +73,23 @@ func (k *installGenerator) GenerateInstallConfig(ctx context.Context, cluster co
 	if err != nil {
 		return err
 	}
-	installerCacheDir := filepath.Join(k.workDir, "installercache")
 	defer func() {
-		// keep results in case of failure so a human can debug
-		if err != nil {
-			debugPath := filepath.Join(k.workDir, cluster.ID.String()+"-failed")
-			// remove any prior failed results
-			err2 := os.RemoveAll(debugPath)
-			if err2 != nil && !os.IsNotExist(err2) {
-				log.WithError(err).Errorf("Could not remove previous directory with failed config results: %s", debugPath)
-				return
-			}
-			err2 = os.Rename(clusterWorkDir, debugPath)
-			if err2 != nil {
-				log.WithError(err).Errorf("Could not rename %s to %s", clusterWorkDir, debugPath)
-				return
-			}
-			return
-		}
-		err2 := os.RemoveAll(clusterWorkDir)
-		if err2 != nil {
-			log.WithError(err).Error("Failed to clean up generated ignition directory")
+		if removeError := os.RemoveAll(clusterWorkDir); removeError != nil {
+			log.WithError(removeError).Error("Failed to clean up generated ignition directory")
 		}
 	}()
 
 	// runs openshift-install to generate ignition files, then modifies them as necessary
 	var generator ignition.Generator
 	if k.Config.DummyIgnition {
-		generator = ignition.NewDummyGenerator(k.ServiceBaseURL, clusterWorkDir, &cluster, k.s3Client, log)
+		generator = ignition.NewDummyGenerator(clusterWorkDir, &cluster, k.s3Client, log)
 	} else {
-		generator = ignition.NewGenerator(k.ServiceBaseURL, clusterWorkDir, installerCacheDir, &cluster, releaseImage, k.Config.ReleaseImageMirror,
-			k.Config.ServiceCACertPath, k.Config.InstallInvoker, k.s3Client, log, k.operatorsApi, k.providerRegistry, installerReleaseImageOverride, k.clusterTLSCertOverrideDir, k.InstallerCacheCapacity)
+		generator = ignition.NewGenerator(clusterWorkDir, &cluster, releaseImage, k.Config.ReleaseImageMirror,
+			k.Config.ServiceCACertPath, k.Config.InstallInvoker, k.s3Client, log, k.providerRegistry, installerReleaseImageOverride, k.Config.ClusterTLSCertOverrideDir, k.manifestApi, k.eventsHandler, k.installerCache)
 	}
-	err = generator.Generate(ctx, cfg, k.authHandler.AuthType())
+	err = generator.Generate(ctx, cfg, forceInsecurePolicyJson)
 	if err != nil {
 		return err
-	}
-
-	if k.Config.ServiceIPs != "" {
-		err = generator.UpdateEtcHosts(k.Config.ServiceIPs)
-		if err != nil {
-			return err
-		}
 	}
 
 	// upload files to S3

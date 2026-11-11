@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/nmstate/nmstate/rust/src/go/nmstate"
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/ini.v1"
 	"gopkg.in/yaml.v2"
@@ -28,20 +30,147 @@ type StaticNetworkConfigData struct {
 //go:generate mockgen -source=generator.go -package=staticnetworkconfig -destination=mock_generator.go
 type StaticNetworkConfig interface {
 	GenerateStaticNetworkConfigData(ctx context.Context, hostsYAMLS string) ([]StaticNetworkConfigData, error)
+	GenerateStaticNetworkConfigDataYAML(staticNetworkConfigStr string) ([]StaticNetworkConfigData, error)
 	FormatStaticNetworkConfigForDB(staticNetworkConfig []*models.HostStaticNetworkConfig) (string, error)
-	ValidateStaticConfigParams(staticNetworkConfig []*models.HostStaticNetworkConfig) error
+	ValidateStaticConfigParamsYAML(staticNetworkConfig []*models.HostStaticNetworkConfig) error
+	ShouldUseNmstateService(openshiftVersion string) (bool, error)
 }
 
 type StaticNetworkConfigGenerator struct {
 	log     logrus.FieldLogger
 	nmstate *nmstate.Nmstate
+	config  Config
 }
 
-func New(log logrus.FieldLogger) StaticNetworkConfig {
+func New(log logrus.FieldLogger, config Config) StaticNetworkConfig {
 	return &StaticNetworkConfigGenerator{
 		log:     log,
 		nmstate: nmstate.New(),
+		config:  config,
 	}
+}
+
+// TODO: Temporary workaround until the nmstate team resolves and deploys the following issue - https://issues.redhat.com/browse/RHEL-59935
+func (s *StaticNetworkConfigGenerator) injectIPV4V6FieldsIfNeeded(networkYaml string) (string, error) {
+	var config map[string]interface{}
+
+	// Unmarshal the YAML string into the config struct
+	err := yaml.Unmarshal([]byte(networkYaml), &config)
+	if err != nil {
+		s.log.WithError(err).Errorf("Error unmarshalling yaml")
+		return "", err
+	}
+	interfaces, exists := config["interfaces"]
+	if !exists || interfaces == nil {
+		return "", nil
+	}
+	interfacesSlice, ok := interfaces.([]interface{})
+	if !ok {
+		return "", nil
+	}
+	for _, iface := range interfacesSlice {
+		nic := iface.(map[interface{}]interface{})
+		if val, exists := nic["ipv4"].(map[interface{}]interface{}); exists {
+			if _, exists := val["dhcp"]; !exists {
+				val["dhcp"] = false
+			}
+		}
+		if val, exists := nic["ipv6"].(map[interface{}]interface{}); exists {
+			if _, exists := val["dhcp"]; !exists {
+				val["dhcp"] = false
+			}
+			if _, exists := val["autoconf"]; !exists {
+				val["autoconf"] = false
+			}
+		}
+	}
+	// Marshal the updated config back into YAML format
+	updatedYaml, err := yaml.Marshal(&config)
+	if err != nil {
+		s.log.WithError(err).Errorf("Error marshalling yaml")
+		return "", err
+	}
+	return string(updatedYaml), nil
+}
+
+func (s *StaticNetworkConfigGenerator) injectNMPolicyCaptures(hostConfig *models.HostStaticNetworkConfig) (string, error) {
+
+	interfacesWithCaptures, err := normalizeYAML(hostConfig.NetworkYaml)
+	if err != nil {
+		s.log.WithError(err)
+	}
+
+	var captureSection []string
+
+	for j, mac := range hostConfig.MacInterfaceMap {
+		macAddress := mac.MacAddress
+		interfaceName := mac.LogicalNicName
+
+		// Generate capture section
+		captureSection = append(captureSection, fmt.Sprintf("  iface%d: interfaces.mac-address == \"%s\"", j, strings.ToUpper(macAddress)))
+
+		// Replace logical names with capture values.
+		var modifiedInterfaceConfig string
+		re := regexp.MustCompile(fmt.Sprintf(`(?m)(^[^:]*: )(%s)$`, interfaceName))
+
+		modifiedInterfaceConfig = re.ReplaceAllString(interfacesWithCaptures, fmt.Sprintf("${1}\"{{ capture.iface%d.interfaces.0.name }}\"", j))
+
+		re = regexp.MustCompile(fmt.Sprintf(`(?m)(^[\s]*- )(%s)$`, interfaceName))
+
+		modifiedInterfaceConfig = re.ReplaceAllString(modifiedInterfaceConfig, fmt.Sprintf("${1}\"{{ capture.iface%d.interfaces.0.name }}\"", j))
+
+		// Add indentation
+		var indentedConfig []string
+		for _, line := range strings.Split(modifiedInterfaceConfig, "\n") {
+			// Check if line is non-empty and add indentation
+			if strings.TrimSpace(line) != "" {
+				indentedConfig = append(indentedConfig, "  "+line)
+			}
+		}
+		interfacesWithCaptures = strings.Join(indentedConfig, "\n")
+	}
+	// Generate desiredState section
+	desiredStateSection := "\ndesiredState:\n"
+
+	// Combine the sections
+	finalOutput := "capture:\n" + strings.Join(captureSection, "\n") + desiredStateSection + interfacesWithCaptures
+	return finalOutput, nil
+}
+
+func (s *StaticNetworkConfigGenerator) GenerateStaticNetworkConfigDataYAML(staticNetworkConfigStr string) ([]StaticNetworkConfigData, error) {
+	var filesList []StaticNetworkConfigData
+	staticNetworkConfig, err := s.decodeStaticNetworkConfig(staticNetworkConfigStr)
+	if err != nil {
+		s.log.WithError(err).Errorf("Failed to decode static network config")
+		return nil, err
+	}
+
+	for i, hostConfig := range staticNetworkConfig {
+		modifiedYaml, err := s.injectIPV4V6FieldsIfNeeded(hostConfig.NetworkYaml)
+		if err != nil {
+			return nil, err
+		}
+		hostConfig.NetworkYaml = modifiedYaml
+
+		nmpolicy, err := s.injectNMPolicyCaptures(hostConfig)
+		if err != nil {
+			return nil, err
+		}
+
+		macInterfaceMapping := s.formatMacInterfaceMap(hostConfig.MacInterfaceMap)
+		mapConfigData := StaticNetworkConfigData{
+			FilePath:     filepath.Join(fmt.Sprintf("host%d", i), "mac_interface.ini"),
+			FileContents: macInterfaceMapping,
+		}
+		filesList = append(filesList, mapConfigData)
+
+		newFile := StaticNetworkConfigData{
+			FilePath:     filepath.Join(filepath.Join(fmt.Sprintf("host%d", i), fmt.Sprintf("ymlFile%d.yml", i))),
+			FileContents: nmpolicy,
+		}
+		filesList = append(filesList, newFile)
+	}
+	return filesList, nil
 }
 
 func (s *StaticNetworkConfigGenerator) GenerateStaticNetworkConfigData(ctx context.Context, staticNetworkConfigStr string) ([]StaticNetworkConfigData, error) {
@@ -119,6 +248,7 @@ func (s *StaticNetworkConfigGenerator) createNMConnectionFiles(nmstateOutput, ho
 	if len(connectionsList) == 0 {
 		return nil, errors.Errorf("nmstate generated an empty NetworkManager config file content")
 	}
+
 	for _, connection := range connectionsList {
 		connectionElems := connection.([]interface{})
 		fileName := connectionElems[0].(string)
@@ -126,13 +256,23 @@ func (s *StaticNetworkConfigGenerator) createNMConnectionFiles(nmstateOutput, ho
 		if err != nil {
 			return nil, err
 		}
-		s.log.Infof("Adding NMConnection file <%s>", fileName)
+
 		newFile := StaticNetworkConfigData{
 			FilePath:     filepath.Join(hostDir, fileName),
 			FileContents: fileContents,
 		}
+
 		filesList = append(filesList, newFile)
 	}
+
+	if len(filesList) > 0 {
+		s.log.Infof("Adding NMConnection files: <%s>",
+			strings.Join(lo.Map(filesList, func(f StaticNetworkConfigData, _ int) string {
+				return filepath.Base(f.FilePath)
+			}), ">, <"),
+		)
+	}
+
 	return filesList, nil
 }
 
@@ -164,18 +304,104 @@ func (s *StaticNetworkConfigGenerator) formatNMConnection(nmConnection string) (
 	return buf.String(), nil
 }
 
-func (s *StaticNetworkConfigGenerator) ValidateStaticConfigParams(staticNetworkConfig []*models.HostStaticNetworkConfig) error {
+func (s *StaticNetworkConfigGenerator) validateInterfaceNamesExistenceYAML(macInterfaceMap models.MacInterfaceMap, networksYaml string) error {
+	interfaceNames := lo.Map(macInterfaceMap, func(m *models.MacInterfaceMapItems0, _ int) string { return m.LogicalNicName })
+
+	var config map[string]interface{}
+
+	// Unmarshal the YAML string into the config struct
+	err := yaml.Unmarshal([]byte(networksYaml), &config)
+	if err != nil {
+		s.log.WithError(err).Errorf("Error unmarshalling yaml")
+		return err
+	}
+
+	// See 'man systemd.net-naming-scheme' for interface naming protocol
+	predicatableIfaceNamePattern := regexp.MustCompile("^en[PsvxXbucaipod]")
+	interfaceWithmacIdentifier := make(map[string]struct{})
+
+	interfaces, exists := config["interfaces"]
+	if !exists || interfaces == nil {
+		return nil
+	}
+	interfacesSlice, ok := interfaces.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	for _, iface := range interfacesSlice {
+		nic := iface.(map[interface{}]interface{})
+		interfaceName, exists := nic["name"]
+		if !exists {
+			return errors.Errorf("interface name not found in networks configuration")
+		}
+
+		identifier, exists := nic["identifier"]
+		if exists && identifier == "mac-address" {
+			interfaceWithmacIdentifier[interfaceName.(string)] = struct{}{}
+		}
+	}
+	for _, iface := range interfacesSlice {
+		nic := iface.(map[interface{}]interface{})
+		interfaceName, exists := nic["name"]
+		if !exists {
+			return errors.Errorf("interface name not found in networks configuration")
+		}
+
+		identifier, exists := nic["identifier"]
+		isMacAddressIdentifier := exists && identifier == "mac-address"
+
+		interfaceType := nic["type"]
+		switch interfaceType {
+		case "802-3-ethernet", "ethernet":
+			if !lo.Contains(interfaceNames, interfaceName.(string)) {
+				if isMacAddressIdentifier {
+					s.log.Infof("Interface %s has no mac-interface mapping but has a mac-identifier", interfaceName)
+				} else if !predicatableIfaceNamePattern.MatchString(interfaceName.(string)) {
+					return errors.Errorf("mac-interface mapping for interface %s is missing and not a physical interface", interfaceName)
+				} else {
+					s.log.Infof("Interface %s has no mac-interface mapping but matches a physical interface", interfaceName)
+				}
+			}
+		case "bond":
+			if val, exists := nic["link-aggregation"].(map[interface{}]interface{}); exists {
+				if ports, exists := val["port"].([]interface{}); exists {
+					for _, port := range ports {
+						if !lo.Contains(interfaceNames, port.(string)) {
+							if _, exists := interfaceWithmacIdentifier[port.(string)]; exists {
+								continue
+							} else if !predicatableIfaceNamePattern.MatchString(port.(string)) {
+								return errors.Errorf("mac-interface mapping for interface %s is missing and not a physical interface", interfaceName)
+							} else {
+								s.log.Infof("Interface %s in bond %s has no mac-interface mapping but matches a physical interface", port.(string), interfaceName)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *StaticNetworkConfigGenerator) ValidateStaticConfigParamsYAML(staticNetworkConfig []*models.HostStaticNetworkConfig) error {
 	var err *multierror.Error
 	for i, hostConfig := range staticNetworkConfig {
 		err = multierror.Append(err, s.validateMacInterfaceName(i, hostConfig.MacInterfaceMap))
-		if validateErr := s.validateNMStateYaml(hostConfig.NetworkYaml); validateErr != nil {
+		_, validateErr := s.generateConfiguration(hostConfig.NetworkYaml)
+		if validateErr != nil {
 			err = multierror.Append(err, fmt.Errorf("failed to validate network yaml for host %d, %s", i, validateErr))
+			return err.ErrorOrNil()
 		}
+		err = multierror.Append(err, s.validateInterfaceNamesExistenceYAML(hostConfig.MacInterfaceMap, hostConfig.NetworkYaml))
 	}
 	return err.ErrorOrNil()
 }
 
 func (s *StaticNetworkConfigGenerator) validateMacInterfaceName(hostIdx int, macInterfaceMap models.MacInterfaceMap) error {
+	if len(macInterfaceMap) == 0 {
+		return fmt.Errorf("at least one interface for host %d must be provided", hostIdx)
+	}
 	interfaceCheck := make(map[string]struct{}, len(macInterfaceMap))
 	macCheck := make(map[string]struct{}, len(macInterfaceMap))
 	for _, macInterface := range macInterfaceMap {
@@ -186,18 +412,6 @@ func (s *StaticNetworkConfigGenerator) validateMacInterfaceName(hostIdx int, mac
 		return fmt.Errorf("MACs and Interfaces for host %d must be unique", hostIdx)
 	}
 	return nil
-}
-
-func (s *StaticNetworkConfigGenerator) validateNMStateYaml(networkYaml string) error {
-	result, err := s.generateConfiguration(networkYaml)
-	if err != nil {
-		return err
-	}
-
-	// Check that the file content can be created
-	// This doesn't write anything to the local filesystem
-	_, err = s.createNMConnectionFiles(result, "temphostdir")
-	return err
 }
 
 func compareMapInterfaces(intf1, intf2 *models.MacInterfaceMapItems0) bool {
@@ -294,4 +508,22 @@ func GenerateStaticNetworkConfigArchive(files []StaticNetworkConfigData) (*bytes
 		return nil, err
 	}
 	return buffer, nil
+}
+
+func normalizeYAML(yamlData string) (string, error) {
+	var config map[string]interface{}
+
+	// Unmarshal the YAML string into the config struct
+	err := yaml.Unmarshal([]byte(yamlData), &config)
+	if err != nil {
+		return "", err
+	}
+
+	// Marshal the updated config back into YAML format
+	marshalYAML, err := yaml.Marshal(&config)
+	if err != nil {
+		return "", err
+	}
+
+	return string(marshalYAML), nil
 }

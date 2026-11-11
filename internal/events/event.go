@@ -192,6 +192,47 @@ var eventLimits = map[string]time.Duration{
 	commonevents.UpgradeAgentStartedEventName:  time.Hour,
 }
 
+// InitializeEventLimits parses the EVENT_RATE_LIMITS JSON and merges custom limits with hardcoded defaults.
+// Custom limits override defaults. Returns an error if JSON is invalid or duration format is incorrect.
+// Format: {"event_name": "duration"}, e.g., {"upgrade_agent_failed": "2h", "infra_env_deregister_failed": "30m"}
+func InitializeEventLimits(eventRateLimitsJSON string, log logrus.FieldLogger) error {
+	if eventRateLimitsJSON == "" {
+		logCurrentLimits(log)
+		return nil
+	}
+
+	var customLimits map[string]string
+	if err := json.Unmarshal([]byte(eventRateLimitsJSON), &customLimits); err != nil {
+		return fmt.Errorf("failed to parse EVENT_RATE_LIMITS json %s: %w", eventRateLimitsJSON, err)
+	}
+
+	// Merge custom limits into existing eventLimits (overriding defaults)
+	for eventName, durationStr := range customLimits {
+		duration, err := time.ParseDuration(durationStr)
+		if err != nil {
+			return fmt.Errorf("invalid duration for event '%s' in EVENT_RATE_LIMITS: %s: %w", eventName, durationStr, err)
+		}
+		eventLimits[eventName] = duration
+	}
+
+	logCurrentLimits(log)
+	return nil
+}
+
+// logCurrentLimits logs all configured event rate limits at Debug level
+func logCurrentLimits(log logrus.FieldLogger) {
+	if len(eventLimits) == 0 {
+		log.Debug("No event rate limits configured")
+		return
+	}
+
+	fields := logrus.Fields{}
+	for eventName, duration := range eventLimits {
+		fields[eventName] = duration.String()
+	}
+	log.WithFields(fields).Debug("Event rate limits configured")
+}
+
 func (e *Events) SendClusterEvent(ctx context.Context, event eventsapi.ClusterEvent) {
 	e.SendClusterEventAtTime(ctx, event, time.Now())
 }
@@ -277,7 +318,7 @@ func filterEvents(tx *gorm.DB, clusterID *strfmt.UUID, hostIds []strfmt.UUID, in
 	}
 
 	if hostIds != nil {
-		return tx.Where("events.host_id IN (?)", hostsUUIDsToStrings(hostIds))
+		tx = tx.Where("events.host_id IN (?)", hostsUUIDsToStrings(hostIds))
 	}
 
 	if infraEnvID != nil {
@@ -355,14 +396,13 @@ func (e Events) prepareEventsTable(ctx context.Context, tx *gorm.DB, clusterID *
 	//host bound to a cluster or registered to a bound infra-env) check the access permission
 	//relative to the cluster ownership
 	if clusterBoundEvents() {
-		tx = tx.Model(&common.Cluster{}).
-			Select("events.*, clusters.user_name, clusters.org_id").
-			Joins("INNER JOIN events ON clusters.id = events.cluster_id")
+		tx = tx.Model(&common.Event{}).Select("events.*, clusters.user_name, clusters.org_id").
+			Joins("INNER JOIN clusters ON clusters.id = events.cluster_id")
 
 		// if deleted hosts flag is true, we need to add 'deleted_at' to know whether events are related to a deleted host
 		if swag.BoolValue(deletedHosts) {
-			tx = tx.Select("events.*, clusters.user_name, clusters.org_id, hosts.deleted_at").
-				Joins("LEFT JOIN hosts ON events.host_id = hosts.id")
+			tx = tx.Select("events.*, clusters.user_name, clusters.org_id, hosts.deleted_at as host_deleted_at").
+				Joins("LEFT JOIN hosts ON hosts.id = events.host_id")
 		}
 		return tx
 	}
@@ -370,17 +410,17 @@ func (e Events) prepareEventsTable(ctx context.Context, tx *gorm.DB, clusterID *
 	//for unbound events that are searched with infra-env id (whether events on hosts or the
 	//infra-env level itself) check the access permission relative to the infra-env ownership
 	if nonBoundEvents() {
-		return tx.Model(&common.InfraEnv{}).
-			Select("events.*, infra_envs.user_name, infra_envs.org_id").
-			Joins("INNER JOIN events ON infra_envs.id = events.infra_env_id")
+		return tx.Model(&common.Event{}).Select("events.*, infra_envs.user_name, infra_envs.org_id").
+			Joins("INNER JOIN infra_envs ON infra_envs.id = events.infra_env_id")
 	}
 
-	//for query made on the host only check the permission relative to it's infra-env. since
-	//host table does not contain an org_id we can not perform a join on that table and has to go
-	//through the infra-env table which is good because authorization is done on the infra-level
+	// Events must be linked to the infra_envs table and then to the hosts table
+	// The hosts table does not hold an org_id, so permissions related fields must be supplied by the infra_env
 	if hostOnlyEvents() {
-		return tx.Model(&common.Host{}).Select("events.*, infra_envs.user_name, infra_envs.org_id").
-			Joins("INNER JOIN infra_envs ON hosts.infra_env_id = infra_envs.id").Joins("INNER JOIN events ON events.host_id = hosts.id")
+		return tx.Model(&common.Event{}).Select("events.*, infra_envs.user_name, infra_envs.org_id").
+			Joins("INNER JOIN infra_envs ON infra_envs.id = events.infra_env_id").
+			Joins("INNER JOIN hosts ON hosts.id = events.host_id"). // This join is here to ensure that only events for a host that exists are fetched
+			Where("hosts.deleted_at IS NULL")                       // Only interested in active hosts
 	}
 
 	//non supported option
@@ -428,11 +468,6 @@ func (e Events) queryEvents(ctx context.Context, params *common.V2GetEventsParam
 
 	events := []*common.Event{}
 
-	// add authorization check to query
-	if e.authz != nil {
-		tx = e.authz.OwnedBy(ctx, tx)
-	}
-
 	tx = e.prepareEventsTable(ctx, tx, params.ClusterID, params.HostIds, params.InfraEnvID, params.Severities, params.Message, params.DeletedHosts)
 	if tx == nil {
 		return make([]*common.Event, 0), &common.EventSeverityCount{}, swag.Int64(0), nil
@@ -469,6 +504,10 @@ func (e Events) queryEvents(ctx context.Context, params *common.V2GetEventsParam
 	params.Limit, params.Offset = preparePaginationParams(params.Limit, params.Offset)
 	if *params.Limit == 0 {
 		return make([]*common.Event, 0), eventSeverityCount, &eventCount, nil
+	}
+
+	if e.authz != nil && !e.authz.IsAdmin(ctx) {
+		tx = e.authz.OwnedBy(ctx, cleanQuery.Table("(?) as s", tx))
 	}
 
 	err = tx.Offset(int(*params.Offset)).Limit(int(*params.Limit)).Find(&events).Error

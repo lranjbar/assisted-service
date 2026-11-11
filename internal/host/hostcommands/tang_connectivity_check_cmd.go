@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 
 	ignition_types "github.com/coreos/ignition/v2/config/v3_2/types"
-	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/models"
@@ -66,14 +65,9 @@ func (c *tangConnectivityCheckCmd) getTangServersFromHostIgnition(host *models.H
 }
 
 func (c *tangConnectivityCheckCmd) shouldRunTangConnectivityCheck(cluster common.Cluster, host *models.Host) bool {
-	// Skip tangConnectivityCheck for cases where:
-	// 1. DiskEncryption not set or not enabled.
-	// 2. DiskEncryption mode is not tang based.
-	// 3. DiskEncryption is not enabled, for the host role.
-	if cluster.DiskEncryption == nil ||
-		swag.StringValue(cluster.DiskEncryption.EnableOn) == models.DiskEncryptionEnableOnNone ||
-		swag.StringValue(cluster.DiskEncryption.Mode) == models.DiskEncryptionModeTpmv2 ||
-		!hostutil.IsDiskEncryptionEnabledForRole(*cluster.DiskEncryption, common.GetEffectiveRole(host)) {
+	// Skip tangConnectivityCheck when Tang-based disk encryption is not required for this host.
+	if !common.IsSetWithTang(cluster.DiskEncryption) ||
+		!common.EnabledForRole(*cluster.DiskEncryption, common.GetEffectiveRole(host)) {
 		c.log.Debugf("skipping tangConnectivityCheck for host %s, cluster DiskEncryption config does not require validation here",
 			host.ID.String())
 		return false
@@ -97,18 +91,14 @@ func (c *tangConnectivityCheckCmd) getTangServersFromCluster(cluster common.Clus
 
 func (c *tangConnectivityCheckCmd) GetSteps(ctx context.Context, host *models.Host) ([]*models.Step, error) {
 	var (
-		cluster     common.Cluster
 		tangServers []byte
 		err         error
 	)
 
-	if err = c.db.First(&cluster, "id = ?", host.ClusterID).Error; err != nil {
-		c.log.WithError(err).Errorf("failed to fetch cluster %s", host.ClusterID)
-		return nil, err
-	}
-	if swag.BoolValue(cluster.Imported) { // Day 2 imported cluster
-		// In this case, it is assumed that the cluster was imported, and thus the DB will have no information
-		// about DiskEncryption settings. Therefore, try to read those settings from the host ignition.
+	if hostutil.IsDay2Host(host) {
+		// Whenever a host is being added after initial install the tang servers are taken from the host ignition. This is because
+		// the tang servers are not stored in the database for imported clusters and they may have changed on the cluster itself
+		// after the initial install.
 		if tangServers, err = c.getTangServersFromHostIgnition(host); err != nil {
 			return nil, err
 		}
@@ -119,6 +109,11 @@ func (c *tangConnectivityCheckCmd) GetSteps(ctx context.Context, host *models.Ho
 			return []*models.Step{}, nil
 		}
 	} else { // Day 1
+		var cluster common.Cluster
+		if err = c.db.First(&cluster, "id = ?", host.ClusterID).Error; err != nil {
+			c.log.WithError(err).Errorf("failed to fetch cluster %s", host.ClusterID)
+			return nil, err
+		}
 		if !c.shouldRunTangConnectivityCheck(cluster, host) {
 			return []*models.Step{}, nil
 		}

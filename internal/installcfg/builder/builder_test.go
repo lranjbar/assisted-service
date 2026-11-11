@@ -2,40 +2,56 @@ package builder
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	gomega_format "github.com/onsi/gomega/format"
+	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/installcfg"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/provider/registry"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/mirrorregistries"
+	"go.uber.org/mock/gomock"
 )
 
 var (
-	mockMirrorRegistriesConfigBuilder *mirrorregistries.MockMirrorRegistriesConfigBuilder
+	mockMirrorRegistriesConfigBuilder *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
 	providerRegistry                  registry.ProviderRegistry
 	ctrl                              *gomock.Controller
+	mockSystemInfo                    *system.MockSystemInfo
 )
 
 func createInstallConfigBuilder() *installConfigBuilder {
 	ctrl = gomock.NewController(GinkgoT())
 
-	mockMirrorRegistriesConfigBuilder = mirrorregistries.NewMockMirrorRegistriesConfigBuilder(ctrl)
+	mockMirrorRegistriesConfigBuilder = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(ctrl)
 	providerRegistry = registry.InitProviderRegistry(common.GetTestLog())
+	mockSystemInfo = system.NewMockSystemInfo(ctrl)
 	return &installConfigBuilder{
 		log:                     common.GetTestLog(),
 		mirrorRegistriesBuilder: mockMirrorRegistriesConfigBuilder,
-		providerRegistry:        providerRegistry}
+		providerRegistry:        providerRegistry,
+		systemInfo:              mockSystemInfo}
+}
+
+// createEphemeralInstallConfigBuilder returns a builder configured as the
+// agent-based installer, where the host's FIPS state describes the cluster.
+func createEphemeralInstallConfigBuilder() *installConfigBuilder {
+	b := createInstallConfigBuilder()
+	b.isEphemeral = true
+	return b
 }
 
 var _ = Describe("installcfg", func() {
@@ -105,6 +121,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 			Status:    swag.String(models.HostStatusKnown),
 			Role:      "master",
 			Inventory: getInventoryStr("hostname0", "bootMode", true, true),
+			Bootstrap: true,
 		}
 		id = strfmt.UUID(uuid.New().String())
 		host2 = models.Host{
@@ -135,6 +152,214 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		err = json.Unmarshal(data, &result)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.Arbiter).Should(BeNil())
+		Expect(result.FeatureSet).To(Equal(configv1.Default))
+		Expect(result.FeatureGates).To(HaveLen(0))
+		Expect(result.OSImageStream).To(BeEmpty())
+	})
+
+	It("sets osImageStream from cluster OsStream", func() {
+		cluster.OsStream = "rhel-10"
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.OSImageStream).To(Equal("rhel-10"))
+	})
+
+	It("create_configuration_with_all_hosts - TNA cluster TechPreview", func() {
+		id := strfmt.UUID(uuid.New().String())
+		host4 := models.Host{
+			ID:        &id,
+			ClusterID: cluster.ID,
+			Status:    swag.String(models.HostStatusKnown),
+			Role:      "arbiter",
+			Inventory: getInventoryStr("hostname4", "bootMode", true, true),
+		}
+		cluster.Hosts = []*models.Host{&host1, &host2, &host4}
+		cluster.OpenshiftVersion = common.MinimumVersionForArbiterClusters
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.Arbiter).Should(Not(BeNil()))
+		Expect(result.Arbiter.Replicas).To(Equal(1))
+		Expect(result.FeatureSet).To(Equal(configv1.TechPreviewNoUpgrade))
+		Expect(result.FeatureGates).To(HaveLen(0))
+	})
+
+	It("create_configuration_with_all_hosts - TNA cluster", func() {
+		id := strfmt.UUID(uuid.New().String())
+		host4 := models.Host{
+			ID:        &id,
+			ClusterID: cluster.ID,
+			Status:    swag.String(models.HostStatusKnown),
+			Role:      "arbiter",
+			Inventory: getInventoryStr("hostname4", "bootMode", true, true),
+		}
+		cluster.Hosts = []*models.Host{&host1, &host2, &host4}
+		cluster.OpenshiftVersion = "4.20"
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.Arbiter).Should(Not(BeNil()))
+		Expect(result.Arbiter.Replicas).To(Equal(1))
+	})
+
+	It("create_configuration_with_all_hosts - TNF cluster", func() {
+		certificateVerificationEnabled := installcfg.CertificateVerificationEnabled
+		certificateVerificationDisabled := installcfg.CertificateVerificationDisabled
+		fencingCredentials1 := models.FencingCredentialsParams{
+			Address:                 swag.String("https://address1.example.com"),
+			CertificateVerification: swag.String(string(certificateVerificationEnabled)),
+			Password:                swag.String("password"),
+			Username:                swag.String("username"),
+		}
+		fencingCredentials2 := models.FencingCredentialsParams{
+			Address:                 swag.String("https://address2.example.com"),
+			CertificateVerification: swag.String(string(certificateVerificationDisabled)),
+			Password:                swag.String("password"),
+			Username:                swag.String("username"),
+		}
+		fencingCredentialsHost1String, err := json.Marshal(fencingCredentials1)
+		Expect(err).ShouldNot(HaveOccurred())
+		fencingCredentialsHost2String, err := json.Marshal(fencingCredentials2)
+		Expect(err).ShouldNot(HaveOccurred())
+		host1.FencingCredentials = string(fencingCredentialsHost1String)
+		host1.Role = models.HostRoleMaster
+		host2.FencingCredentials = string(fencingCredentialsHost2String)
+		host2.Role = models.HostRoleMaster
+		cluster.Hosts = []*models.Host{&host1, &host2}
+		cluster.ControlPlaneCount = 2
+		cluster.OpenshiftVersion = common.MinimumVersionForTwoNodesWithFencing
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.ControlPlane.Fencing).Should(Not(BeNil()))
+		Expect(result.ControlPlane.Fencing.Credentials).To(HaveLen(2))
+		Expect(result.ControlPlane.Fencing.Credentials[0]).To(Equal(installcfg.FencingCredential{
+			Hostname:                hostutil.GetHostnameForMsg(&host1),
+			Address:                 *fencingCredentials1.Address,
+			Username:                *fencingCredentials1.Username,
+			Password:                *fencingCredentials1.Password,
+			CertificateVerification: &certificateVerificationEnabled,
+		}))
+		Expect(result.ControlPlane.Fencing.Credentials[1]).To(Equal(installcfg.FencingCredential{
+			Hostname:                hostutil.GetHostnameForMsg(&host2),
+			Address:                 *fencingCredentials2.Address,
+			Username:                *fencingCredentials2.Username,
+			Password:                *fencingCredentials2.Password,
+			CertificateVerification: &certificateVerificationDisabled,
+		}))
+		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.Arbiter).Should(BeNil())
+		Expect(result.FeatureSet).To(Equal(configv1.TechPreviewNoUpgrade))
+		Expect(result.FeatureGates).To(HaveLen(0))
+	})
+
+	It("create_configuration_with_all_hosts - TNF cluster GA", func() {
+		certificateVerificationEnabled := installcfg.CertificateVerificationEnabled
+		fencingCredentials1 := models.FencingCredentialsParams{
+			Address:                 swag.String("https://address1.example.com"),
+			CertificateVerification: swag.String(string(certificateVerificationEnabled)),
+			Password:                swag.String("password"),
+			Username:                swag.String("username"),
+		}
+		fencingCredentials2 := models.FencingCredentialsParams{
+			Address:  swag.String("https://address2.example.com"),
+			Password: swag.String("password"),
+			Username: swag.String("username"),
+		}
+		fencingCredentialsHost1String, err := json.Marshal(fencingCredentials1)
+		Expect(err).ShouldNot(HaveOccurred())
+		fencingCredentialsHost2String, err := json.Marshal(fencingCredentials2)
+		Expect(err).ShouldNot(HaveOccurred())
+		host1.FencingCredentials = string(fencingCredentialsHost1String)
+		host1.Role = models.HostRoleMaster
+		host2.FencingCredentials = string(fencingCredentialsHost2String)
+		host2.Role = models.HostRoleMaster
+		cluster.Hosts = []*models.Host{&host1, &host2}
+		cluster.ControlPlaneCount = 2
+		cluster.OpenshiftVersion = "4.22"
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.ControlPlane.Fencing).Should(Not(BeNil()))
+		Expect(result.ControlPlane.Fencing.Credentials).To(HaveLen(2))
+		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.Arbiter).Should(BeNil())
+		Expect(result.FeatureSet).To(Equal(configv1.Default))
+		Expect(result.FeatureGates).To(HaveLen(0))
+	})
+
+	It("create_configuration_with_all_hosts - TNF cluster with MAC-based fencing credentials", func() {
+		certificateVerificationDisabled := installcfg.CertificateVerificationDisabled
+		fencingCredentials1 := models.FencingCredentialsParams{
+			Address:    swag.String("https://address1.example.com"),
+			Password:   swag.String("password"),
+			Username:   swag.String("username"),
+			MacAddress: swag.String("aa:bb:cc:dd:ee:01"),
+		}
+		fencingCredentials2 := models.FencingCredentialsParams{
+			Address:                 swag.String("https://address2.example.com"),
+			CertificateVerification: swag.String(string(certificateVerificationDisabled)),
+			Password:                swag.String("password"),
+			Username:                swag.String("username"),
+			MacAddress:              swag.String("aa:bb:cc:dd:ee:02"),
+		}
+		fencingCredentialsHost1String, err := json.Marshal(fencingCredentials1)
+		Expect(err).ShouldNot(HaveOccurred())
+		fencingCredentialsHost2String, err := json.Marshal(fencingCredentials2)
+		Expect(err).ShouldNot(HaveOccurred())
+		host1.FencingCredentials = string(fencingCredentialsHost1String)
+		host1.Role = models.HostRoleMaster
+		host2.FencingCredentials = string(fencingCredentialsHost2String)
+		host2.Role = models.HostRoleMaster
+		cluster.Hosts = []*models.Host{&host1, &host2}
+		cluster.ControlPlaneCount = 2
+		cluster.OpenshiftVersion = "4.22"
+
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.ControlPlane.Fencing).Should(Not(BeNil()))
+		Expect(result.ControlPlane.Fencing.Credentials).To(HaveLen(2))
+		Expect(result.ControlPlane.Fencing.Credentials[0]).To(Equal(installcfg.FencingCredential{
+			MacAddress: "aa:bb:cc:dd:ee:01",
+			Address:    *fencingCredentials1.Address,
+			Username:   *fencingCredentials1.Username,
+			Password:   *fencingCredentials1.Password,
+		}))
+		Expect(result.ControlPlane.Fencing.Credentials[1]).To(Equal(installcfg.FencingCredential{
+			MacAddress:              "aa:bb:cc:dd:ee:02",
+			Address:                 *fencingCredentials2.Address,
+			Username:                *fencingCredentials2.Username,
+			Password:                *fencingCredentials2.Password,
+			CertificateVerification: &certificateVerificationDisabled,
+		}))
 	})
 
 	It("create_configuration_with_hostnames", func() {
@@ -149,6 +374,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 
 	It("create_configuration_with_mirror_registries", func() {
 		var result installcfg.InstallerConfigBaremetal
+		cluster.OpenshiftVersion = "4.14.0-0.0"
 		regData := []mirrorregistries.RegistriesConf{{Location: "location1", Mirror: []string{"mirror1"}}, {Location: "location2", Mirror: []string{"mirror2"}}}
 		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true).Times(2)
 		mockMirrorRegistriesConfigBuilder.EXPECT().ExtractLocationMirrorDataFromRegistries().Return(regData, nil).Times(1)
@@ -158,6 +384,37 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		err = json.Unmarshal(data, &result)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(result.Networking.NetworkType).To(Equal(models.ClusterNetworkTypeOpenShiftSDN))
+		Expect(result.ImageDigestSources).To(Equal([]installcfg.ImageDigestSource{
+			installcfg.ImageDigestSource{Source: "location1",
+				Mirrors: []string{"mirror1"},
+			},
+			installcfg.ImageDigestSource{Source: "location2",
+				Mirrors: []string{"mirror2"},
+			},
+		}))
+		Expect(result.DeprecatedImageContentSources).To(BeEmpty())
+	})
+
+	It("create_configuration_with_mirror_registries_idms_not_supported", func() {
+		var result installcfg.InstallerConfigBaremetal
+		cluster.OpenshiftVersion = "4.12.0-0.0"
+		regData := []mirrorregistries.RegistriesConf{{Location: "location1", Mirror: []string{"mirror1"}}, {Location: "location2", Mirror: []string{"mirror2"}}}
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true).Times(2)
+		mockMirrorRegistriesConfigBuilder.EXPECT().ExtractLocationMirrorDataFromRegistries().Return(regData, nil).Times(1)
+		mockMirrorRegistriesConfigBuilder.EXPECT().GetMirrorCA().Return([]byte("some sa data"), nil).Times(1)
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.ImageDigestSources).To(BeEmpty())
+		Expect(result.DeprecatedImageContentSources).To(Equal([]installcfg.ImageContentSource{
+			installcfg.ImageContentSource{Source: "location1",
+				Mirrors: []string{"mirror1"},
+			},
+			installcfg.ImageContentSource{Source: "location2",
+				Mirrors: []string{"mirror2"},
+			},
+		}))
 	})
 
 	It("create_configuration_with_proxy", func() {
@@ -225,6 +482,38 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		err = json.Unmarshal(data, &result)
 		Expect(err).ShouldNot(HaveOccurred())
 		assertVSphereCredentials(result)
+	})
+
+	nutanixInstallConfigOverrides := `{"platform":{"nutanix":{"prismCentral":{"endpoint":{"address":"prismcentral.openshift.com","port":9440},"username":"testUser","password":"testPassword"},"prismElements":[{"uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx","endpoint":{"address":"prism.openshift.com","port":9440}}],"subnetUUIDs":["yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"],"apiVIPs":["10.0.0.1"],"ingressVIPs":["10.0.0.2"]}}}`
+
+	It("Nutanix platform in overrides is decoded correctly - installConfig.applyConfigOverrides", func() {
+		var result installcfg.InstallerConfigBaremetal
+		overrides := nutanixInstallConfigOverrides
+		err := installConfig.applyConfigOverrides(overrides, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		assertNutanixPlatform(result)
+	})
+
+	It("Nutanix platform are unmarshalled correctly - installConfig.GetInstallConfig", func() {
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		cluster.InstallConfigOverrides = nutanixInstallConfigOverrides
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		assertNutanixPlatform(result)
+	})
+
+	It("Nutanix credentials are unmarshalled correctly - installConfig.GetInstallConfig", func() {
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		cluster.InstallConfigOverrides = nutanixInstallConfigOverrides
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		assertNutanixCredentials(result)
 	})
 
 	It("correctly applies cluster overrides", func() {
@@ -304,7 +593,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		cluster.InstallConfigOverrides = ""
 
 		mirrorCA := testBundle2
-		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false),
+		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1),
 			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true))
 		mockMirrorRegistriesConfigBuilder.EXPECT().GetMirrorCA().Return([]byte(mirrorCA), nil).Times(1)
 
@@ -361,7 +650,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		cluster.InstallConfigOverrides = ""
 
 		mirrorCA := testBundle2
-		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false),
+		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1),
 			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true))
 		mockMirrorRegistriesConfigBuilder.EXPECT().GetMirrorCA().Return([]byte(mirrorCA), nil).Times(1)
 
@@ -406,7 +695,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		ca := testBundle1
 		mirrorCA := testBundle2
 
-		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false),
+		gomock.InOrder(mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1),
 			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true))
 		mockMirrorRegistriesConfigBuilder.EXPECT().GetMirrorCA().Return([]byte(mirrorCA), nil).Times(1)
 		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, ca)
@@ -509,8 +798,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		cluster.InstallConfigOverrides = ""
 		cluster.UserManagedNetworking = swag.Bool(true)
 		cluster.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
-		mode := models.ClusterHighAvailabilityModeNone
-		cluster.HighAvailabilityMode = &mode
+		cluster.ControlPlaneCount = 1
 		cluster.Hosts[0].Bootstrap = true
 		cluster.Hosts[0].InstallationDiskPath = "/dev/test"
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}}
@@ -533,8 +821,7 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		cluster.InstallConfigOverrides = ""
 		cluster.UserManagedNetworking = swag.Bool(true)
 		cluster.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
-		mode := models.ClusterHighAvailabilityModeNone
-		cluster.HighAvailabilityMode = &mode
+		cluster.ControlPlaneCount = 1
 		cluster.NetworkType = nil
 		cluster.Hosts[0].Bootstrap = true
 		cluster.Hosts[0].InstallationDiskPath = "/dev/test"
@@ -594,32 +881,41 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		Expect(result.Networking.MachineNetwork[1].Cidr).Should(Equal(network.GetMachineCidrById(&cluster, 1)))
 	})
 
-	It("Hyperthreading config", func() {
-		cluster.Hyperthreading = "none"
+	DescribeTable("Hyperthreading config", func(clusterHyperthreading, controlPlaneHyperthreading, arbiterHyperthreading, computeHyperthreading string) {
+		cluster.Hyperthreading = clusterHyperthreading
+		if arbiterHyperthreading != "" {
+			cluster.Hosts[2].Role = models.HostRoleArbiter
+		}
 		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
 		data, err := installConfig.getBasicInstallConfig(&cluster)
 		Expect(err).ShouldNot(HaveOccurred())
-		Expect(data.ControlPlane.Hyperthreading).Should(Equal("Disabled"))
-		Expect(data.Compute[0].Hyperthreading).Should(Equal("Disabled"))
-		cluster.Hyperthreading = "all"
-		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
-		data, err = installConfig.getBasicInstallConfig(&cluster)
-		Expect(err).ShouldNot(HaveOccurred())
-		Expect(data.ControlPlane.Hyperthreading).Should(Equal("Enabled"))
-		Expect(data.Compute[0].Hyperthreading).Should(Equal("Enabled"))
-		cluster.Hyperthreading = "workers"
-		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
-		data, err = installConfig.getBasicInstallConfig(&cluster)
-		Expect(err).ShouldNot(HaveOccurred())
-		Expect(data.ControlPlane.Hyperthreading).Should(Equal("Disabled"))
-		Expect(data.Compute[0].Hyperthreading).Should(Equal("Enabled"))
-		cluster.Hyperthreading = "masters"
-		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
-		data, err = installConfig.getBasicInstallConfig(&cluster)
-		Expect(err).ShouldNot(HaveOccurred())
-		Expect(data.ControlPlane.Hyperthreading).Should(Equal("Enabled"))
-		Expect(data.Compute[0].Hyperthreading).Should(Equal("Disabled"))
-	})
+		Expect(data.ControlPlane.Hyperthreading).Should(Equal(controlPlaneHyperthreading))
+		if arbiterHyperthreading != "" {
+			Expect(data.Arbiter.Hyperthreading).Should(Equal(arbiterHyperthreading))
+		} else {
+			Expect(data.Arbiter).To(BeNil())
+		}
+		Expect(data.Compute[0].Hyperthreading).Should(Equal(computeHyperthreading))
+	},
+		Entry("all", models.ClusterHyperthreadingAll, "Enabled", "", "Enabled"),
+		Entry("all - TNA cluster", models.ClusterHyperthreadingAll, "Enabled", "Enabled", "Enabled"),
+		Entry("none", models.ClusterHyperthreadingNone, "Disabled", "", "Disabled"),
+		Entry("none - TNA cluster", models.ClusterHyperthreadingNone, "Disabled", "Disabled", "Disabled"),
+		Entry("masters", models.ClusterHyperthreadingMasters, "Enabled", "", "Disabled"),
+		Entry("masters - TNA cluster", models.ClusterHyperthreadingMasters, "Enabled", "Disabled", "Disabled"),
+		Entry("arbiters", models.ClusterHyperthreadingArbiters, "Disabled", "", "Disabled"),
+		Entry("arbiters - TNA cluster", models.ClusterHyperthreadingArbiters, "Disabled", "Enabled", "Disabled"),
+		Entry("workers", models.ClusterHyperthreadingWorkers, "Disabled", "", "Enabled"),
+		Entry("workers - TNA cluster", models.ClusterHyperthreadingWorkers, "Disabled", "Disabled", "Enabled"),
+		Entry("masters,arbiters", models.ClusterHyperthreadingMastersArbiters, "Enabled", "", "Disabled"),
+		Entry("masters,arbiters - TNA cluster", models.ClusterHyperthreadingMastersArbiters, "Enabled", "Enabled", "Disabled"),
+		Entry("masters,workers", models.ClusterHyperthreadingMastersWorkers, "Enabled", "", "Enabled"),
+		Entry("masters,workers - TNA cluster", models.ClusterHyperthreadingMastersWorkers, "Enabled", "Disabled", "Enabled"),
+		Entry("arbiters,workers", models.ClusterHyperthreadingArbitersWorkers, "Disabled", "", "Enabled"),
+		Entry("arbiters,workers - TNA cluster", models.ClusterHyperthreadingArbitersWorkers, "Disabled", "Enabled", "Enabled"),
+		Entry("masters,arbiters,workers", models.ClusterHyperthreadingMastersArbitersWorkers, "Enabled", "", "Enabled"),
+		Entry("masters,arbiters,workers - TNA cluster", models.ClusterHyperthreadingMastersArbitersWorkers, "Enabled", "Enabled", "Enabled"),
+	)
 
 	It("CPUPartitioningMode config overrides", func() {
 		var result installcfg.InstallerConfigBaremetal
@@ -633,16 +929,48 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 		Expect(string(result.CPUPartitioningMode)).Should(Equal("AllNodes"))
 	})
 
+	It("AdditionalTrustBundlePolicy config overrides", func() {
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		cluster.InstallConfigOverrides = `{"additionalTrustBundlePolicy":"Always"}`
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		// test that overrides worked
+		Expect(string(result.AdditionalTrustBundlePolicy)).Should(Equal("Always"))
+	})
+
 	It("Baremetal host BMC configuration overrides", func() {
-                var result installcfg.InstallerConfigBaremetal
-                mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
-                cluster.InstallConfigOverrides = `{"platform":{"baremetal":{"hosts":[{"name":"master-0","bmc":{"username":"admin","password":"pwd","address":"http://10.10.10.1:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:3b","hardwareProfile":""},{"name":"master-1","bmc":{"username":"admin2","password":"pwd2","address":"http://10.10.10.2:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:3f","hardwareProfile":""},{"name":"master-2","bmc":{"username":"admin3","password":"pwd3","address":"http://10.10.10.3:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:43","hardwareProfile":""}],"clusterProvisioningIP":"172.22.0.3","provisioningNetwork":"Managed","provisioningNetworkInterface":"enp1s0","provisioningNetworkCIDR":"172.22.0.0/24","provisioningDHCPRange":"172.22.0.10,172.22.0.254"}}}`
-                data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
-                Expect(err).ShouldNot(HaveOccurred())
-                err = json.Unmarshal(data, &result)
-                Expect(err).ShouldNot(HaveOccurred())
-                assertBaremetalHostBMCConfig(result)
-        })
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		cluster.InstallConfigOverrides = `{"platform":{"baremetal":{"hosts":[{"name":"master-0","bmc":{"username":"admin","password":"pwd","address":"http://10.10.10.1:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:3b","hardwareProfile":""},{"name":"master-1","bmc":{"username":"admin2","password":"pwd2","address":"http://10.10.10.2:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:3f","hardwareProfile":""},{"name":"master-2","bmc":{"username":"admin3","password":"pwd3","address":"http://10.10.10.3:8000/v1/Systems","disableCertificateVerification":false},"role":"","bootMACAddress":"00:65:0f:82:fd:43","hardwareProfile":""}],"clusterProvisioningIP":"172.22.0.3","provisioningNetwork":"Managed","provisioningNetworkInterface":"enp1s0","provisioningNetworkCIDR":"172.22.0.0/24","provisioningDHCPRange":"172.22.0.10,172.22.0.254"}}}`
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+		assertBaremetalHostBMCConfig(result)
+	})
+
+	It("cluster-managed load balancer should not move bootstrap host machine network to the first element", func() {
+		var result installcfg.InstallerConfigBaremetal
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+
+		cluster.MachineNetworks = []*models.MachineNetwork{
+			{Cidr: "1.2.4.0/24"},
+			{Cidr: "1.2.3.0/24"},
+		}
+		cluster.LoadBalancer = &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged}
+
+		data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+		Expect(err).ShouldNot(HaveOccurred())
+
+		err = json.Unmarshal(data, &result)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		Expect(result.Networking.MachineNetwork).To(HaveLen(2))
+		Expect(result.Networking.MachineNetwork[0].Cidr).To(Equal("1.2.4.0/24"))
+	})
 
 	Context("networking", func() {
 		It("Single network fields", func() {
@@ -692,6 +1020,116 @@ aEA8gNEmV+rb7h1v0r3EwDQYJKoZIhvcNAQELBQAwYTELMAkGA1UEBhMCaXMxCzAJBgNVBAgMAmRk
 			Expect(result.Networking.ClusterNetwork).To(HaveLen(2))
 			Expect(result.Networking.MachineNetwork).To(HaveLen(2))
 			Expect(result.Networking.ServiceNetwork).To(HaveLen(2))
+		})
+	})
+
+	Context("Mirror Registry", func() {
+
+		const (
+			mirrorRegistryCertificate = "-----BEGIN CERTIFICATE-----\n    certificate contents\n-----END CERTIFICATE------"
+			sourceRegistry            = "quay.io"
+			mirrorRegistry            = "example-user-registry.com"
+		)
+
+		getSecureRegistryToml := func() string {
+			return fmt.Sprintf(`
+[[registry]]
+location = "%s"
+
+[[registry.mirror]]
+location = "%s"
+`,
+				sourceRegistry,
+				mirrorRegistry,
+			)
+		}
+
+		getMirrorRegistryConfigurations := func(registriesToml, certificate string) (*common.MirrorRegistryConfiguration, []configv1.ImageDigestMirrors) {
+			imageDigestMirrors, imageTagMirrors, insecure, err := mirrorregistries.GetImageRegistries(registriesToml)
+			Expect(err).To(Not(HaveOccurred()))
+
+			mirrors := &common.MirrorRegistryConfiguration{
+				ImageDigestMirrors: imageDigestMirrors,
+				ImageTagMirrors:    imageTagMirrors,
+				Insecure:           insecure,
+				CaBundleCrt:        certificate,
+				RegistriesConf:     registriesToml,
+			}
+
+			return mirrors, imageDigestMirrors
+		}
+
+		It("service MirrorRegistriesConfig and cluster MirrorRegistryConfiguration are both set - only MirrorRegistryConfiguration applied", func() {
+			var result installcfg.InstallerConfigBaremetal
+			cluster.OpenshiftVersion = "4.16.0-0.0"
+
+			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(true).Times(1)
+			mockMirrorRegistriesConfigBuilder.EXPECT().GetMirrorCA().Return([]byte("service-ca-data"), nil).Times(1)
+
+			// Set cluster-level MirrorRegistryConfiguration
+			mirrors, imageDigestMirrors := getMirrorRegistryConfigurations(getSecureRegistryToml(), mirrorRegistryCertificate)
+			cluster.SetMirrorRegistryConfiguration(mirrors)
+
+			// Generate install config
+			data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = json.Unmarshal(data, &result)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Ensure only one mirror registry source is applied
+			Expect(len(result.ImageDigestSources)).To(Equal(len(imageDigestMirrors)))
+			Expect(len(result.ImageDigestSources)).To(Equal(1))
+			Expect(result.ImageDigestSources[0].Source).To(Equal(imageDigestMirrors[0].Source))
+			Expect(len(result.ImageDigestSources[0].Mirrors)).To(Equal(len(imageDigestMirrors[0].Mirrors)))
+			Expect(result.ImageDigestSources[0].Mirrors[0]).To(Equal(string(imageDigestMirrors[0].Mirrors[0])))
+
+			// Validate trust bundle concatenation
+			Expect(result.AdditionalTrustBundle).To(Equal(fmt.Sprintf("%s\n%s", "service-ca-data", mirrorRegistryCertificate)))
+		})
+
+		It("success - cluster holds mirror registry configurations", func() {
+			var result installcfg.InstallerConfigBaremetal
+			cluster.OpenshiftVersion = "4.16.0-0.0"
+			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
+
+			mirrors, imageDigestMirrors := getMirrorRegistryConfigurations(getSecureRegistryToml(), mirrorRegistryCertificate)
+			cluster.SetMirrorRegistryConfiguration(mirrors)
+			data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = json.Unmarshal(data, &result)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			Expect(len(result.ImageDigestSources)).To(Equal(len(imageDigestMirrors)))
+			Expect(len(result.ImageDigestSources)).To(Equal(1))
+			Expect(result.ImageDigestSources[0].Source).To(Equal(imageDigestMirrors[0].Source))
+			Expect(len(result.ImageDigestSources[0].Mirrors)).To(Equal(len(imageDigestMirrors[0].Mirrors)))
+			Expect(result.ImageDigestSources[0].Mirrors[0]).To(Equal(string(imageDigestMirrors[0].Mirrors[0])))
+
+			Expect(result.DeprecatedImageContentSources).To(BeEmpty())
+		})
+
+		It("success - cluster and infraenvs holds mirror registry configurations", func() {
+			var result installcfg.InstallerConfigBaremetal
+			cluster.OpenshiftVersion = "4.16.0-0.0"
+			mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(1)
+
+			mirrors, _ := getMirrorRegistryConfigurations(getSecureRegistryToml(), mirrorRegistryCertificate)
+			cluster.SetMirrorRegistryConfiguration(mirrors)
+			testBundles := []string{testBundle1, testBundle2, testBundle3}
+			for i := 0; i < 3; i++ {
+				infraenv := &common.InfraEnv{InfraEnv: models.InfraEnv{}}
+				mirrors.CaBundleCrt = testBundles[i]
+				infraenv.SetMirrorRegistryConfiguration(mirrors)
+				clusterInfraenvs = append(clusterInfraenvs, infraenv)
+			}
+			data, err := installConfig.GetInstallConfig(&cluster, clusterInfraenvs, "")
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = json.Unmarshal(data, &result)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(result.AdditionalTrustBundle).Should(Equal(fmt.Sprintf("%s\n%s\n%s\n%s", mirrorRegistryCertificate, testBundle1, testBundle2, testBundle3)))
 		})
 	})
 
@@ -755,8 +1193,19 @@ var _ = Describe("ValidateInstallConfigPatch", func() {
 		s := `{"apiVersion": "v3", "baseDomain": "example.com", "metadata": {"name": "things"}}`
 		cluster.UserManagedNetworking = swag.Bool(true)
 		cluster.Platform = &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeNone)}
-		mode := models.ClusterHighAvailabilityModeNone
-		cluster.HighAvailabilityMode = &mode
+		cluster.ControlPlaneCount = 1
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
+		err := installConfig.ValidateInstallConfigPatch(cluster, clusterInfraenvs, s)
+		Expect(err).ShouldNot(HaveOccurred())
+	})
+
+	It("user-managed load balancer without bootstrap host should not fail validation", func() {
+		s := `{"apiVersion": "v3", "baseDomain": "example.com", "metadata": {"name": "things"}}`
+		cluster.LoadBalancer = &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged}
+		cluster.MachineNetworks = []*models.MachineNetwork{
+			{Cidr: "1.2.3.0/24"},
+			{Cidr: "1.2.4.0/24"},
+		}
 		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).Times(2)
 		err := installConfig.ValidateInstallConfigPatch(cluster, clusterInfraenvs, s)
 		Expect(err).ShouldNot(HaveOccurred())
@@ -782,28 +1231,46 @@ func assertVSphereCredentials(result installcfg.InstallerConfigBaremetal) {
 	Expect(result.Platform.Vsphere.FailureDomains[0].Topology.Folder).Should(Equal("/testDatacenter/vm/testFolder"))
 }
 
+// asserts platform values against nutanixInstallConfigOverrides
+func assertNutanixPlatform(result installcfg.InstallerConfigBaremetal) {
+	Expect(len(result.Platform.Nutanix.APIVIPs)).Should(Equal(1))
+	Expect(len(result.Platform.Nutanix.IngressVIPs)).Should(Equal(1))
+	Expect(result.Platform.Nutanix.PrismCentral.Endpoint.Address).Should(Equal("prismcentral.openshift.com"))
+	Expect(result.Platform.Nutanix.PrismCentral.Endpoint.Port).Should(Equal(int32(9440)))
+	Expect(string(result.Platform.Nutanix.PrismElements[0].UUID)).Should(Equal("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"))
+	Expect(result.Platform.Nutanix.PrismElements[0].Endpoint.Address).Should(Equal("prism.openshift.com"))
+	Expect(result.Platform.Nutanix.PrismElements[0].Endpoint.Port).Should(Equal(int32(9440)))
+	Expect(len(result.Platform.Nutanix.SubnetUUIDs)).Should(Equal(1))
+}
+
+// asserts platform values against nutanixInstallConfigOverrides
+func assertNutanixCredentials(result installcfg.InstallerConfigBaremetal) {
+	Expect(result.Platform.Nutanix.PrismCentral.Username).Should(Equal("testUser"))
+	Expect(string(result.Platform.Nutanix.PrismCentral.Password)).Should(Equal("testPassword"))
+}
+
 // asserts Baremetal Host BMC Configuration set by InstallConfigOverrides
 func assertBaremetalHostBMCConfig(result installcfg.InstallerConfigBaremetal) {
-        Expect(result.Platform.Baremetal.Hosts[0].Name).Should(Equal("master-0"))
-        Expect(result.Platform.Baremetal.Hosts[0].BMC.Username).Should(Equal("admin"))
-        Expect(result.Platform.Baremetal.Hosts[0].BMC.Password).Should(Equal("pwd"))
-        Expect(result.Platform.Baremetal.Hosts[0].BMC.Address).Should(Equal("http://10.10.10.1:8000/v1/Systems"))
-        Expect(result.Platform.Baremetal.Hosts[0].BMC.DisableCertificateVerification).Should(Equal(false))
-        Expect(result.Platform.Baremetal.Hosts[1].Name).Should(Equal("master-1"))
-        Expect(result.Platform.Baremetal.Hosts[1].BMC.Username).Should(Equal("admin2"))
-        Expect(result.Platform.Baremetal.Hosts[1].BMC.Password).Should(Equal("pwd2"))
-        Expect(result.Platform.Baremetal.Hosts[1].BMC.Address).Should(Equal("http://10.10.10.2:8000/v1/Systems"))
-        Expect(result.Platform.Baremetal.Hosts[1].BMC.DisableCertificateVerification).Should(Equal(false))
-        Expect(result.Platform.Baremetal.Hosts[2].Name).Should(Equal("master-2"))
-        Expect(result.Platform.Baremetal.Hosts[2].BMC.Username).Should(Equal("admin3"))
-        Expect(result.Platform.Baremetal.Hosts[2].BMC.Password).Should(Equal("pwd3"))
-        Expect(result.Platform.Baremetal.Hosts[2].BMC.Address).Should(Equal("http://10.10.10.3:8000/v1/Systems"))
-        Expect(result.Platform.Baremetal.Hosts[2].BMC.DisableCertificateVerification).Should(Equal(false))
-        Expect(result.Platform.Baremetal.ClusterProvisioningIP).Should(Equal("172.22.0.3"))
-        Expect(result.Platform.Baremetal.ProvisioningNetwork).Should(Equal("Managed"))
-        Expect(result.Platform.Baremetal.ProvisioningNetworkInterface).Should(Equal("enp1s0"))
-        Expect(*result.Platform.Baremetal.ProvisioningNetworkCIDR).Should(Equal("172.22.0.0/24"))
-        Expect(result.Platform.Baremetal.ProvisioningDHCPRange).Should(Equal("172.22.0.10,172.22.0.254"))
+	Expect(result.Platform.Baremetal.Hosts[0].Name).Should(Equal("master-0"))
+	Expect(result.Platform.Baremetal.Hosts[0].BMC.Username).Should(Equal("admin"))
+	Expect(result.Platform.Baremetal.Hosts[0].BMC.Password).Should(Equal("pwd"))
+	Expect(result.Platform.Baremetal.Hosts[0].BMC.Address).Should(Equal("http://10.10.10.1:8000/v1/Systems"))
+	Expect(result.Platform.Baremetal.Hosts[0].BMC.DisableCertificateVerification).Should(Equal(false))
+	Expect(result.Platform.Baremetal.Hosts[1].Name).Should(Equal("master-1"))
+	Expect(result.Platform.Baremetal.Hosts[1].BMC.Username).Should(Equal("admin2"))
+	Expect(result.Platform.Baremetal.Hosts[1].BMC.Password).Should(Equal("pwd2"))
+	Expect(result.Platform.Baremetal.Hosts[1].BMC.Address).Should(Equal("http://10.10.10.2:8000/v1/Systems"))
+	Expect(result.Platform.Baremetal.Hosts[1].BMC.DisableCertificateVerification).Should(Equal(false))
+	Expect(result.Platform.Baremetal.Hosts[2].Name).Should(Equal("master-2"))
+	Expect(result.Platform.Baremetal.Hosts[2].BMC.Username).Should(Equal("admin3"))
+	Expect(result.Platform.Baremetal.Hosts[2].BMC.Password).Should(Equal("pwd3"))
+	Expect(result.Platform.Baremetal.Hosts[2].BMC.Address).Should(Equal("http://10.10.10.3:8000/v1/Systems"))
+	Expect(result.Platform.Baremetal.Hosts[2].BMC.DisableCertificateVerification).Should(Equal(false))
+	Expect(result.Platform.Baremetal.ClusterProvisioningIP).Should(Equal("172.22.0.3"))
+	Expect(result.Platform.Baremetal.ProvisioningNetwork).Should(Equal("Managed"))
+	Expect(result.Platform.Baremetal.ProvisioningNetworkInterface).Should(Equal("enp1s0"))
+	Expect(*result.Platform.Baremetal.ProvisioningNetworkCIDR).Should(Equal("172.22.0.0/24"))
+	Expect(result.Platform.Baremetal.ProvisioningDHCPRange).Should(Equal("172.22.0.10,172.22.0.254"))
 }
 
 func getInventoryStr(hostname, bootMode string, ipv4 bool, ipv6 bool) string {
@@ -873,3 +1340,92 @@ func TestBuilder(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "installcfg tests")
 }
+
+var _ = Describe("FIPS auto-detection", func() {
+	var (
+		cluster       common.Cluster
+		installConfig *installConfigBuilder
+	)
+
+	BeforeEach(func() {
+		installConfig = createInstallConfigBuilder()
+		mockMirrorRegistriesConfigBuilder.EXPECT().IsMirrorRegistriesConfigured().Return(false).AnyTimes()
+
+		id := strfmt.UUID(uuid.New().String())
+		cluster = common.Cluster{Cluster: models.Cluster{
+			ID:               &id,
+			OpenshiftVersion: "4.19",
+			BaseDNSDomain:    "example.com",
+			APIVips:          []*models.APIVip{{IP: "102.345.34.34", ClusterID: id}},
+			IngressVips:      []*models.IngressVip{{IP: "22.334.454.4", ClusterID: id}},
+			ImageInfo:        &models.ImageInfo{},
+			Platform:         &models.Platform{Type: common.PlatformTypePtr(models.PlatformTypeBaremetal)},
+			ClusterNetworks:  []*models.ClusterNetwork{{Cidr: "1.3.0.0/16", HostPrefix: 24}},
+			ServiceNetworks:  []*models.ServiceNetwork{{Cidr: "1.2.5.0/24"}},
+			MachineNetworks:  []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}},
+			NetworkType:      swag.String(models.ClusterNetworkTypeOVNKubernetes),
+		}}
+		cluster.Hosts = []*models.Host{{
+			Inventory: getInventoryStr("hostname0", "bootMode", true, false),
+			Role:      models.HostRoleMaster,
+		}}
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	It("sets fips when the agent-based installer runs on a FIPS host", func() {
+		installConfig.isEphemeral = true
+		mockSystemInfo.EXPECT().FIPSEnabled().Return(true, nil).Times(1)
+
+		result, err := installConfig.getBasicInstallConfig(&cluster)
+
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.FIPS).To(BeTrue())
+	})
+
+	It("does not set fips when the agent-based installer runs on a non-FIPS host", func() {
+		installConfig.isEphemeral = true
+		mockSystemInfo.EXPECT().FIPSEnabled().Return(false, nil).Times(1)
+
+		result, err := installConfig.getBasicInstallConfig(&cluster)
+
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.FIPS).To(BeFalse())
+	})
+
+	It("never inspects the host when not the agent-based installer", func() {
+		// On a FIPS-enabled MCE hub or in SaaS the host says nothing about the
+		// cluster being created. Detecting there would turn every spoke FIPS.
+		mockSystemInfo.EXPECT().FIPSEnabled().Times(0)
+
+		result, err := installConfig.getBasicInstallConfig(&cluster)
+
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.FIPS).To(BeFalse())
+	})
+
+	It("treats an unreadable fips_enabled as not enabled", func() {
+		installConfig.isEphemeral = true
+		mockSystemInfo.EXPECT().FIPSEnabled().Return(false, errors.New("permission denied")).Times(1)
+
+		result, err := installConfig.getBasicInstallConfig(&cluster)
+
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result.FIPS).To(BeFalse())
+	})
+
+	It("lets an explicit install-config override win over host detection", func() {
+		installConfig.isEphemeral = true
+		mockSystemInfo.EXPECT().FIPSEnabled().Return(true, nil).Times(1)
+		cluster.InstallConfigOverrides = `{"fips": false}`
+
+		data, err := installConfig.GetInstallConfig(&cluster, []*common.InfraEnv{}, "")
+
+		Expect(err).ShouldNot(HaveOccurred())
+		var result installcfg.InstallerConfigBaremetal
+		Expect(json.Unmarshal(data, &result)).ShouldNot(HaveOccurred())
+		Expect(result.FIPS).To(BeFalse())
+	})
+})

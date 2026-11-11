@@ -8,6 +8,11 @@ import (
 	"github.com/openshift/assisted-service/models"
 )
 
+const (
+	clusterValidationID = string(models.ClusterValidationIDLsoRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDLsoRequirementsSatisfied)
+)
+
 // lsOperator is an LSO OLM operator plugin; it implements api.Operator
 type lsOperator struct {
 }
@@ -35,27 +40,34 @@ func (l *lsOperator) GetFullName() string {
 }
 
 // GetDependencies provides a list of dependencies of the Operator
-func (l *lsOperator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	return make([]string, 0), nil
+func (l *lsOperator) GetDependencies(cluster *common.Cluster) []string {
+	return []string{}
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (l *lsOperator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDLsoRequirementsSatisfied)
+func (o *lsOperator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (l *lsOperator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (l *lsOperator) GetHostValidationID() string {
-	return string(models.HostValidationIDLsoRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster always return "valid" result
-func (l *lsOperator) ValidateCluster(_ context.Context, _ *common.Cluster) (api.ValidationResult, error) {
-	return api.ValidationResult{Status: api.Success, ValidationId: l.GetClusterValidationID(), Reasons: []string{}}, nil
+func (l *lsOperator) ValidateCluster(_ context.Context, _ *common.Cluster) ([]api.ValidationResult, error) {
+	return []api.ValidationResult{{
+		Status:       api.Success,
+		ValidationId: clusterValidationID,
+	}}, nil
 }
 
 // ValidateHost always return "valid" result
-func (l *lsOperator) ValidateHost(_ context.Context, _ *common.Cluster, _ *models.Host) (api.ValidationResult, error) {
+func (l *lsOperator) ValidateHost(_ context.Context, _ *common.Cluster, _ *models.Host, _ *models.ClusterHostRequirementsDetails) (api.ValidationResult, error) {
 	return api.ValidationResult{Status: api.Success, ValidationId: l.GetHostValidationID(), Reasons: []string{}}, nil
 }
 
@@ -81,14 +93,10 @@ func (l *lsOperator) GetHostRequirements(context.Context, *common.Cluster, *mode
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-func (l *lsOperator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error) {
-	dependecies, err := l.GetDependencies(cluster)
-	if err != nil {
-		return &models.OperatorHardwareRequirements{}, err
-	}
+func (l *lsOperator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
 	return &models.OperatorHardwareRequirements{
 		OperatorName: l.GetName(),
-		Dependencies: dependecies,
+		Dependencies: l.GetDependencies(cluster),
 		Requirements: &models.HostTypeHardwareRequirementsWrapper{
 			Master: &models.HostTypeHardwareRequirements{
 				Quantitative: &models.ClusterHostRequirementsDetails{},
@@ -97,9 +105,14 @@ func (l *lsOperator) GetPreflightRequirements(context context.Context, cluster *
 				Quantitative: &models.ClusterHostRequirementsDetails{},
 			},
 		},
-	}, nil
+	}
 }
 
 func (l *lsOperator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDLSO
+}
+
+// GetBundleLabels returns the bundle labels for the LSO operator
+func (l *lsOperator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	return []string(Operator.Bundles)
 }

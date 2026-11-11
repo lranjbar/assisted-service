@@ -13,6 +13,7 @@ import (
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
+	"github.com/openshift/assisted-service/internal/constants"
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/stream"
@@ -36,6 +37,9 @@ type transitionHandler struct {
 type TransitionHandler interface {
 	HasClusterError(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error)
 	HasInstallationInProgressTimedOut(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error)
+	HasPendingUserActionTimedOut(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error)
+	ClusterWouldSucceedWithoutHost(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error)
+	IsClusterPostInstallation(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error)
 	HasStatusTimedOut(timeout time.Duration) stateswitch.Condition
 	HostNotResponsiveWhilePreparingInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error)
 	IsDay2Host(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error)
@@ -60,6 +64,7 @@ type TransitionHandler interface {
 	PostRefreshReclaimTimeout(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	PostRegisterDuringInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	PostRegisterAfterInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
+	PostRegisterDuringPreparingForInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	PostRegisterDuringReboot(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	PostRegisterHost(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	PostResettingPendingUserAction(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
@@ -72,7 +77,7 @@ var resetLogsField = []interface{}{"logs_info", "", "logs_started_at", strfmt.Da
 var resetProgressFields = []interface{}{"progress_current_stage", "", "progress_installation_percentage", 0,
 	"progress_progress_info", "", "progress_stage_started_at", strfmt.DateTime(time.Time{}), "progress_stage_updated_at", strfmt.DateTime(time.Time{})}
 
-var resetFields = append(resetProgressFields, "inventory", "", "bootstrap", false, "images_status", "")
+var resetFields = append(resetProgressFields, "inventory", "", "bootstrap", false, "images_status", "", "validations_info", "")
 var restFieldsOnUnbind = append(append(resetProgressFields, resetLogsField...), "cluster_id", nil, "kind", swag.String(models.HostKindHost), "connectivity", "", "domain_name_resolutions", "",
 	"free_addresses", "", "images_status", "", "installation_disk_id", "", "installation_disk_path", "", "machine_config_pool_name", "",
 	"role", "auto-assign", "api_vip_connectivity", "", "suggested_role", "", "images_status", "",
@@ -111,16 +116,20 @@ func (th *transitionHandler) PostRegisterHost(sw stateswitch.StateSwitch, args s
 		// because in day2 it may be changed during re-registration
 		extra := append(resetFields[:], "discovery_agent_version", params.discoveryAgentVersion, "ntp_sources", "", "kind", hostParam.Kind)
 		extra = append(extra, resetLogsField...)
-		extra = append(extra, resetProgressFields...)
+
+		// Use the destination state determined by the state machine (could be discovering or discovering-unbound)
+		// The state machine calls SetState before PostTransition, so hostParam.Status is already set
+		dstStatus := swag.StringValue(hostParam.Status)
+		// Use statusInfoDiscovering for both bound and unbound hosts (the state machine has already set the correct status)
 		var dbHost *common.Host
 		if dbHost, err = hostutil.UpdateHostStatus(params.ctx, log, params.db, th.eventsHandler, th.stream, hostParam.InfraEnvID, *hostParam.ID, sHost.srcState,
-			swag.StringValue(hostParam.Status), statusInfoDiscovering, extra...); err != nil {
+			dstStatus, statusInfoDiscovering, extra...); err != nil {
 			return err
-		} else {
-			sHost.host = &dbHost.Host
-			return nil
 		}
+		sHost.host = &dbHost.Host
+		return nil
 	}
+	// For new hosts, the state machine has already set the correct status (discovering or discovering-unbound)
 	hostParam.StatusUpdatedAt = strfmt.DateTime(time.Now())
 	hostParam.StatusInfo = swag.String(statusInfoDiscovering)
 	hostToCreate := &common.Host{
@@ -167,7 +176,7 @@ func (th *transitionHandler) PostRegisterAfterInstallation(sw stateswitch.StateS
 	}
 
 	return common.NewApiError(
-		http.StatusForbidden,
+		http.StatusConflict,
 		errors.New(
 			"Host is trying to register after the cluster has already been installed. "+
 				"That most probably means that the host is booting from the "+
@@ -237,6 +246,80 @@ func (th *transitionHandler) PostRegisterDuringReboot(sw stateswitch.StateSwitch
 
 	messages = append(messages, fmt.Sprintf("(%s, %s)", installationDisk.Name, common.GetDeviceIdentifier(installationDisk)))
 	return th.updateTransitionHost(params.ctx, logutil.FromContext(params.ctx, th.log), params.db, sHost, strings.Join(messages, " "))
+}
+
+func (th *transitionHandler) PostRegisterDuringPreparingForInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
+	sHost, ok := sw.(*stateHost)
+	if !ok {
+		return errors.New("PostRegisterDuringPreparingForInstallation incompatible type of StateSwitch")
+	}
+	params, ok := args.(*TransitionArgsRegisterHost)
+	if !ok {
+		return errors.New("PostRegisterDuringPreparingForInstallation invalid argument")
+	}
+
+	log := logutil.FromContext(params.ctx, th.log)
+	hostParam := sHost.host
+
+	// Get existing host from DB
+	dbHost, err := common.GetHostFromDB(params.db, hostParam.InfraEnvID.String(), hostParam.ID.String())
+	if err != nil {
+		return err
+	}
+
+	// Reset LastInstallationPreparation to allow state machine to re-evaluate once all hosts are ready
+	// This is critical for the fix to work - if it fails, the cluster may not re-evaluate properly
+	// and could remain stuck in preparing-for-installation
+	// Note: We use raw GORM here instead of cluster.UpdateCluster to avoid import cycle (host package
+	// cannot import cluster package). This matches the pattern used in cluster.HandlePreInstallSuccess
+	// and cluster.HandlePreInstallError for updating LastInstallationPreparation fields.
+	if dbHost.ClusterID != nil {
+		log.Infof("Host %s re-registered during cluster %s preparation, resetting LastInstallationPreparation status",
+			hostParam.ID.String(), dbHost.ClusterID.String())
+		if err = params.db.Model(&models.Cluster{}).Where("id = ?", dbHost.ClusterID.String()).Updates(&models.Cluster{
+			LastInstallationPreparation: models.LastInstallationPreparation{
+				Status: models.LastInstallationPreparationStatusNotStarted,
+				Reason: constants.InstallationPreparationReasonNotPerformed,
+			},
+		}).Error; err != nil {
+			log.WithError(err).Errorf("Failed to reset LastInstallationPreparation for cluster %s - this may cause the cluster to remain stuck", dbHost.ClusterID.String())
+			return errors.Wrapf(err, "failed to reset LastInstallationPreparation for cluster %s", dbHost.ClusterID.String())
+		}
+	}
+
+	// Reset to 'known' instead of 'discovering' to avoid triggering UnPreparingtHostsExist condition
+	// which would move the cluster from preparing-for-installation to insufficient
+	// Preserve inventory and bootstrap flag so the host can continue with preparation
+	extra := append(resetFields[:], "discovery_agent_version", params.discoveryAgentVersion, "ntp_sources", "", "kind", hostParam.Kind)
+
+	// Filter out inventory and bootstrap fields that should be preserved during re-registration
+	// (inventory is required for host to transition to preparing-for-installation,
+	// bootstrap flag is critical for SNO clusters to identify the bootstrap host)
+	var filteredExtra []interface{}
+	for i := 0; i < len(extra); i += 2 {
+		fieldName := extra[i]
+		// Preserve inventory: required for host to transition to preparing-for-installation
+		if fieldName == "inventory" {
+			continue
+		}
+		// Preserve bootstrap: critical for SNO clusters to identify the bootstrap host
+		if fieldName == "bootstrap" {
+			continue
+		}
+		filteredExtra = append(filteredExtra, extra[i])
+		if i+1 < len(extra) {
+			filteredExtra = append(filteredExtra, extra[i+1])
+		}
+	}
+	extra = filteredExtra
+	extra = append(extra, resetLogsField...)
+
+	if dbHost, err = hostutil.UpdateHostStatus(params.ctx, log, params.db, th.eventsHandler, th.stream, hostParam.InfraEnvID, *hostParam.ID, sHost.srcState,
+		models.HostStatusKnown, statusInfoKnown, extra...); err != nil {
+		return err
+	}
+	sHost.host = &dbHost.Host
+	return nil
 }
 
 // //////////////////////////////////////////////////////////////////////////
@@ -510,7 +593,7 @@ func (th *transitionHandler) IsValidRoleForInstallation(sw stateswitch.StateSwit
 	if !ok {
 		return false, errors.New("IsValidRoleForInstallation incompatible type of StateSwitch")
 	}
-	validRoles := []string{string(models.HostRoleMaster), string(models.HostRoleWorker)}
+	validRoles := []string{string(models.HostRoleMaster), string(models.HostRoleArbiter), string(models.HostRoleWorker)}
 	if !funk.ContainsString(validRoles, string(sHost.host.Role)) {
 		return false, common.NewApiError(http.StatusConflict,
 			errors.Errorf("Can't install host %s due to invalid host role: %s, should be one of %s",
@@ -671,6 +754,61 @@ func (th *transitionHandler) HasInstallationInProgressTimedOut(sw stateswitch.St
 	return time.Since(time.Time(sHost.host.Progress.StageUpdatedAt)) > maxDuration, nil
 }
 
+func (th *transitionHandler) HasPendingUserActionTimedOut(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error) {
+	sHost, ok := sw.(*stateHost)
+	if !ok {
+		return false, errors.New("HasPendingUserActionTimedOut incompatible type of StateSwitch")
+	}
+	return time.Since(time.Time(sHost.host.StatusUpdatedAt)) > th.config.InstallingPendingUserActionTimeout, nil
+}
+
+func (th *transitionHandler) ClusterWouldSucceedWithoutHost(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error) {
+	sHost, ok := sw.(*stateHost)
+	if !ok {
+		return false, errors.New("ClusterWouldSucceedWithoutHost incompatible type of StateSwitch")
+	}
+	params, ok := args.(*TransitionArgsRefreshHost)
+	if !ok {
+		return false, errors.New("ClusterWouldSucceedWithoutHost invalid argument")
+	}
+
+	// Get the cluster with all hosts
+	if sHost.host.ClusterID == nil {
+		return false, errors.New("cluster ID must not be nil")
+	}
+	cluster, err := common.GetClusterFromDBWithHosts(params.db, *sHost.host.ClusterID)
+	if err != nil {
+		th.log.WithError(err).Errorf("failed to get cluster %s", sHost.host.ClusterID)
+		return false, err
+	}
+
+	return common.HasEnoughMastersAndWorkers(cluster, []string{models.HostStatusInstalled}), nil
+}
+
+func (th *transitionHandler) IsClusterPostInstallation(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error) {
+	sHost, ok := sw.(*stateHost)
+	if !ok {
+		return false, errors.New("IsClusterPostInstallation incompatible type of StateSwitch")
+	}
+	params, ok := args.(*TransitionArgsRefreshHost)
+	if !ok {
+		return false, errors.New("IsClusterPostInstallation invalid argument")
+	}
+
+	// Get the cluster status
+	if sHost.host.ClusterID == nil {
+		return false, errors.New("cluster ID must not be nil")
+	}
+	var cluster common.Cluster
+	err := params.db.Select("status").Take(&cluster, "id = ?", sHost.host.ClusterID.String()).Error
+	if err != nil {
+		return false, err
+	}
+
+	status := swag.StringValue(cluster.Status)
+	return status == models.ClusterStatusInstalled || status == models.ClusterStatusAddingHosts, nil
+}
+
 func (th *transitionHandler) PostHostPreparationTimeout() stateswitch.PostTransition {
 	ret := func(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
 		sHost, ok := sw.(*stateHost)
@@ -692,6 +830,8 @@ func (th *transitionHandler) PostHostPreparationTimeout() stateswitch.PostTransi
 			failingConditons = append(failingConditons, statusInfoPreparationTimeoutImageAvailability)
 		}
 		statusInfo := strings.Replace(statusInfoPreparationTimeout, "$FAILING_CONDITIONS", strings.Join(failingConditons, "\n"), 1)
+		statusInfo = hostutil.TruncateStatusInfo(statusInfo, th.log)
+
 		if sHost.srcState != swag.StringValue(sHost.host.Status) || swag.StringValue(sHost.host.StatusInfo) != statusInfo {
 			_, err = hostutil.UpdateHostStatus(params.ctx, logutil.FromContext(params.ctx, th.log), params.db,
 				th.eventsHandler, th.stream, sHost.host.InfraEnvID, *sHost.host.ID,
@@ -713,14 +853,17 @@ func IsInStages(stages ...models.HostStage) func(stateswitch.StateSwitch, states
 }
 
 func (th *transitionHandler) replaceMacros(template string, sHost *stateHost, params *TransitionArgsRefreshHost) string {
+	log := logutil.FromContext(params.ctx, th.log)
+
 	template = strings.Replace(template, "$STAGE", string(sHost.host.Progress.CurrentStage), 1)
 	maxTime := th.config.HostStageTimeout(sHost.host.Progress.CurrentStage)
 	template = strings.Replace(template, "$MAX_TIME", maxTime.String(), 1)
 	if strings.Contains(template, "$INSTALLATION_DISK") {
 		var installationDisk *models.Disk
 		installationDisk, err := hostutil.GetHostInstallationDisk(sHost.host)
-		if err != nil {
+		if err != nil || installationDisk == nil {
 			// in case we fail to parse the inventory replace $INSTALLATION_DISK with nothing
+			log.Warnf("Failed to get installation disk for host %s: %v", sHost.host.ID, err)
 			template = strings.Replace(template, "$INSTALLATION_DISK", "", 1)
 		} else {
 			template = strings.Replace(template, "$INSTALLATION_DISK", fmt.Sprintf("(%s, %s)", installationDisk.Name, common.GetDeviceIdentifier(installationDisk)), 1)
@@ -753,6 +896,7 @@ func (th *transitionHandler) PostRefreshHost(reason string) stateswitch.PostTran
 		)
 
 		statusInfo := th.replaceMacros(template, sHost, params)
+		statusInfo = hostutil.TruncateStatusInfo(statusInfo, th.log)
 
 		if sHost.srcState != swag.StringValue(sHost.host.Status) || swag.StringValue(sHost.host.StatusInfo) != statusInfo {
 			_, err = hostutil.UpdateHostStatus(params.ctx, logutil.FromContext(params.ctx, th.log), params.db,

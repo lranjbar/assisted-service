@@ -2,17 +2,19 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
+	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/host"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	"github.com/openshift/assisted-service/internal/usage"
 	"github.com/openshift/assisted-service/models"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 )
@@ -30,27 +32,39 @@ type stringer interface {
 }
 
 type refreshPreprocessor struct {
-	log          logrus.FieldLogger
-	validations  []validation
-	conditions   []condition
-	operatorsAPI operators.API
+	log                        logrus.FieldLogger
+	validations                []validation
+	conditions                 []condition
+	operatorsAPI               operators.API
+	usageAPI                   usage.API
+	eventsHandler              eventsapi.Handler
+	disabledClusterValidations DisabledClusterValidations
 }
 
-func newRefreshPreprocessor(log logrus.FieldLogger, hostAPI host.API, operatorsAPI operators.API) *refreshPreprocessor {
+func newRefreshPreprocessor(log logrus.FieldLogger, hostAPI host.API, operatorsAPI operators.API, usageAPI usage.API,
+	eventsHandler eventsapi.Handler, disabledClusterValidations DisabledClusterValidations) *refreshPreprocessor {
 	v := clusterValidator{
 		log:     log,
 		hostAPI: hostAPI,
 	}
 
 	return &refreshPreprocessor{
-		log:          log,
-		validations:  newValidations(&v),
-		conditions:   newConditions(&v),
-		operatorsAPI: operatorsAPI,
+		log:                        log,
+		validations:                newValidations(&v),
+		conditions:                 newConditions(&v),
+		operatorsAPI:               operatorsAPI,
+		usageAPI:                   usageAPI,
+		eventsHandler:              eventsHandler,
+		disabledClusterValidations: disabledClusterValidations,
 	}
 }
 
+const validationDisabledByConfiguration = "Validation disabled by configuration"
+
 func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreprocessContext) (map[string]bool, map[string][]ValidationResult, error) {
+	if c.cluster == nil {
+		return nil, nil, errors.New("cluster is nil")
+	}
 	stateMachineInput := make(map[string]bool)
 	validationsOutput := make(map[string][]ValidationResult)
 	checkValidationsInStatuses := []string{
@@ -58,10 +72,11 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreproce
 	}
 	var ignoredValidations []string
 	var err error
-	if c.cluster != nil {
+	hasPerClusterOverride := c.cluster.IgnoredClusterValidations != ""
+	if hasPerClusterOverride {
 		ignoredValidations, err = common.DeserializeJSONList(c.cluster.IgnoredClusterValidations)
 		if err != nil {
-			return nil, nil, errors.Wrap(err, fmt.Sprintf("Unable to deserialize ignored cluster validations for cluster %s", string(*c.cluster.ID)))
+			return nil, nil, fmt.Errorf("unable to deserialize ignored cluster validations for cluster %s: %w", c.cluster.ID.String(), err)
 		}
 	}
 
@@ -70,8 +85,16 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreproce
 		return stateMachineInput, validationsOutput, nil
 	}
 	for _, v := range r.validations {
-		st, message := v.condition(c)
-		stateMachineInput[v.id.String()] = st == ValidationSuccess
+		var st ValidationStatus
+		var message string
+		if !hasPerClusterOverride && r.disabledClusterValidations.IsDisabled(v.id) {
+			st = ValidationDisabled
+			message = validationDisabledByConfiguration
+			stateMachineInput[v.id.String()] = true
+		} else {
+			st, message = v.condition(c)
+			stateMachineInput[v.id.String()] = st == ValidationSuccess
+		}
 		var category string
 		category, err = v.id.Category()
 		if err != nil {
@@ -84,6 +107,7 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *clusterPreproce
 			Message: message,
 		})
 	}
+
 	// Validate operators
 	results, err := r.operatorsAPI.ValidateCluster(ctx, c.cluster)
 	if err != nil {
@@ -154,6 +178,10 @@ func newValidations(v *clusterValidator) []validation {
 			condition: v.isNetworkTypeValid,
 		},
 		{
+			id:        IsCustomManifestsRequirementsSatisfied,
+			condition: v.isCustomManifestsRequirementsSatisfied,
+		},
+		{
 			id:        AreIngressVipsDefined,
 			condition: v.areIngressVipsDefined,
 		},
@@ -167,7 +195,7 @@ func newValidations(v *clusterValidator) []validation {
 		},
 		{
 			id:        SufficientMastersCount,
-			condition: v.sufficientMastersCount,
+			condition: v.SufficientMastersCount,
 		},
 		{
 			id:        IsDNSDomainDefined,

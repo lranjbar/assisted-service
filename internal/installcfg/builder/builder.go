@@ -6,14 +6,19 @@ import (
 	"strings"
 
 	"github.com/go-openapi/swag"
+	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/installcfg"
 	"github.com/openshift/assisted-service/internal/provider/registry"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/mirrorregistries"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 )
+
+const minimalOpenShiftVersionForImageDigestSupport = "4.14.0-0.0"
 
 //go:generate mockgen -source=builder.go -package=builder -destination=mock_installcfg.go
 type InstallConfigBuilder interface {
@@ -23,19 +28,58 @@ type InstallConfigBuilder interface {
 
 type installConfigBuilder struct {
 	log                     logrus.FieldLogger
-	mirrorRegistriesBuilder mirrorregistries.MirrorRegistriesConfigBuilder
+	mirrorRegistriesBuilder mirrorregistries.ServiceMirrorRegistriesConfigBuilder
 	providerRegistry        registry.ProviderRegistry
+	systemInfo              system.SystemInfo
+	// isEphemeral is true when this service runs on the node being installed,
+	// i.e. the agent-based installer. Only then does the host's FIPS state
+	// describe the cluster being created.
+	isEphemeral bool
 }
 
 func NewInstallConfigBuilder(
 	log logrus.FieldLogger,
-	mirrorRegistriesBuilder mirrorregistries.MirrorRegistriesConfigBuilder,
-	providerRegistry registry.ProviderRegistry) InstallConfigBuilder {
+	mirrorRegistriesBuilder mirrorregistries.ServiceMirrorRegistriesConfigBuilder,
+	providerRegistry registry.ProviderRegistry,
+	systemInfo system.SystemInfo,
+	isEphemeral bool) InstallConfigBuilder {
 	return &installConfigBuilder{
 		log:                     log,
 		mirrorRegistriesBuilder: mirrorRegistriesBuilder,
 		providerRegistry:        providerRegistry,
+		systemInfo:              systemInfo,
+		isEphemeral:             isEphemeral,
 	}
+}
+
+// fipsEnabled reports whether the generated install-config should enable FIPS.
+//
+// For the agent-based installer the service runs on the node being installed,
+// which boots with fips=1 when a FIPS ISO was used, so the host's state is the
+// cluster's intended state. Elsewhere the service runs on a hub or in SaaS and
+// the host says nothing about the cluster being created, so this always
+// returns false; detecting there would silently turn every spoke cluster FIPS
+// on a FIPS-enabled hub.
+//
+// An unreadable /proc/sys/crypto/fips_enabled is logged and treated as not
+// enabled: the install-config is already being generated at this point, and
+// failing the install outright is worse than installing without FIPS.
+func (i *installConfigBuilder) fipsEnabled() bool {
+	if !i.isEphemeral {
+		return false
+	}
+
+	enabled, err := i.systemInfo.FIPSEnabled()
+	if err != nil {
+		i.log.WithError(err).Warn("Failed to determine host FIPS mode, continuing without FIPS")
+		return false
+	}
+
+	if enabled {
+		i.log.Info("Host is in FIPS mode, enabling FIPS in install-config")
+	}
+
+	return enabled
 }
 
 func (i *installConfigBuilder) countHostsByRole(cluster *common.Cluster, role models.HostRole) int {
@@ -90,25 +134,31 @@ func (i *installConfigBuilder) getBasicInstallConfig(cluster *common.Cluster) (*
 			Replicas       int    `json:"replicas"`
 		}{
 			{
-				Hyperthreading: i.getHypethreadingConfiguration(cluster, "worker"),
+				Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingWorkers),
 				Name:           string(models.HostRoleWorker),
 				Replicas:       i.countHostsByRole(cluster, models.HostRoleWorker),
 			},
 		},
 		ControlPlane: struct {
-			Hyperthreading string `json:"hyperthreading,omitempty"`
-			Name           string `json:"name"`
-			Replicas       int    `json:"replicas"`
+			Hyperthreading string              `json:"hyperthreading,omitempty"`
+			Name           string              `json:"name"`
+			Replicas       int                 `json:"replicas"`
+			Fencing        *installcfg.Fencing `json:"fencing,omitempty"`
 		}{
-			Hyperthreading: i.getHypethreadingConfiguration(cluster, "master"),
+			Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingMasters),
 			Name:           string(models.HostRoleMaster),
 			Replicas:       i.countHostsByRole(cluster, models.HostRoleMaster),
 		},
-		PullSecret: cluster.PullSecret,
-		SSHKey:     cluster.SSHPublicKey,
+		PullSecret:    cluster.PullSecret,
+		SSHKey:        cluster.SSHPublicKey,
+		OSImageStream: cluster.OsStream,
+		FIPS:          i.fipsEnabled(),
 	}
 
-	cfg.Networking.NetworkType = networkType
+	// For "None" network type, don't set networkType in install-config (user provides CNI manifests)
+	if networkType != models.ClusterNetworkTypeNone {
+		cfg.Networking.NetworkType = networkType
+	}
 
 	for _, network := range cluster.ClusterNetworks {
 		cfg.Networking.ClusterNetwork = append(cfg.Networking.ClusterNetwork,
@@ -130,27 +180,116 @@ func (i *installConfigBuilder) getBasicInstallConfig(cluster *common.Cluster) (*
 		}
 	}
 
-	if i.mirrorRegistriesBuilder.IsMirrorRegistriesConfigured() {
-		err := i.setImageDigestMirrorSet(cfg)
-		if err != nil {
-			return nil, err
+	if err := i.handleMirrorRegistry(cfg, cluster); err != nil {
+		return nil, err
+	}
+
+	if common.IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		cfg.Arbiter = &struct {
+			Hyperthreading string `json:"hyperthreading,omitempty"`
+			Name           string `json:"name"`
+			Replicas       int    `json:"replicas"`
+		}{
+			Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingArbiters),
+			Name:           string(models.HostRoleArbiter),
+			Replicas:       i.countHostsByRole(cluster, models.HostRoleArbiter),
 		}
+		// Arbiter is TechPreview in 4.19 and GA in greater versions
+		if is419, _ := common.BaseVersionEqual(common.MinimumVersionForArbiterClusters, cluster.OpenshiftVersion); is419 {
+			cfg.FeatureSet = configv1.TechPreviewNoUpgrade
+		}
+	}
+
+	if err := i.handleFencing(cfg, cluster); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
 }
 
-func (i *installConfigBuilder) setImageDigestMirrorSet(cfg *installcfg.InstallerConfigBaremetal) error {
-	mirrorRegistriesConfigs, err := i.mirrorRegistriesBuilder.ExtractLocationMirrorDataFromRegistries()
+func (i *installConfigBuilder) handleMirrorRegistry(cfg *installcfg.InstallerConfigBaremetal, cluster *common.Cluster) error {
+	isOpenShiftVersionRecentEnough, err := common.BaseVersionGreaterOrEqual(minimalOpenShiftVersionForImageDigestSupport, cluster.OpenshiftVersion)
 	if err != nil {
-		i.log.WithError(err).Errorf("Failed to get the mirror registries conf need for ImageDigestSources")
 		return err
 	}
-	imageDigestSourceList := make([]installcfg.ImageDigestSource, len(mirrorRegistriesConfigs))
-	for i, mirrorRegistriesConfig := range mirrorRegistriesConfigs {
-		imageDigestSourceList[i] = installcfg.ImageDigestSource{Source: mirrorRegistriesConfig.Location, Mirrors: mirrorRegistriesConfig.Mirror}
+	configuration, err := cluster.GetMirrorRegistryConfiguration()
+	if err != nil {
+		return err
 	}
+
+	i.log.Debugf("found OpenShift version %s, setting mirror registry %+v", cluster.OpenshiftVersion, configuration)
+	if isOpenShiftVersionRecentEnough {
+		if err = i.setImageDigestMirrorSet(cfg, configuration); err != nil {
+			return err
+		}
+	} else {
+		// If version does not support ImageDigestSources, set ImageContent
+		if err = i.setImageContentSources(cfg, configuration); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (i *installConfigBuilder) setImageDigestMirrorSet(cfg *installcfg.InstallerConfigBaremetal, configuration *common.MirrorRegistryConfiguration) error {
+	var imageDigestSourceList []installcfg.ImageDigestSource
+
+	// check if mirror registry is configured in the cluster config
+	if common.IsMirrorConfigurationSet(configuration) {
+		i.log.Infof("Found cluster mirror configuration, setting imageDigestSourceList with %+v", configuration.ImageDigestMirrors)
+		imageDigestSourceList = make([]installcfg.ImageDigestSource, len(configuration.ImageDigestMirrors))
+		for k, _registry := range configuration.ImageDigestMirrors {
+			mirrors := make([]string, len(_registry.Mirrors))
+			for j, mirror := range _registry.Mirrors {
+				mirrors[j] = string(mirror)
+			}
+			imageDigestSourceList[k] = installcfg.ImageDigestSource{Source: _registry.Source, Mirrors: mirrors}
+		}
+	} else if i.mirrorRegistriesBuilder.IsMirrorRegistriesConfigured() {
+		// check if mirror registry is configured for the entire env
+		i.log.Infof("Found service mirror configuration, setting imageDigestSourceList")
+		mirrorRegistriesConfigs, err := i.mirrorRegistriesBuilder.ExtractLocationMirrorDataFromRegistries()
+		if err != nil {
+			i.log.WithError(err).Errorf("Failed to get the mirror registries conf need for ImageDigestSources")
+			return err
+		}
+		imageDigestSourceList = make([]installcfg.ImageDigestSource, len(mirrorRegistriesConfigs))
+		for j, mirrorRegistriesConfig := range mirrorRegistriesConfigs {
+			imageDigestSourceList[j] = installcfg.ImageDigestSource{Source: mirrorRegistriesConfig.Location, Mirrors: mirrorRegistriesConfig.Mirror}
+		}
+	}
+
 	cfg.ImageDigestSources = imageDigestSourceList
+	return nil
+}
+
+func (i *installConfigBuilder) setImageContentSources(cfg *installcfg.InstallerConfigBaremetal, configuration *common.MirrorRegistryConfiguration) error {
+	var imageContentSourceList []installcfg.ImageContentSource
+
+	if common.IsMirrorConfigurationSet(configuration) {
+		i.log.Infof("Found cluster mirror configuration, setting imageContentSourceList with %+v", configuration.ImageDigestMirrors)
+		imageContentSourceList = make([]installcfg.ImageContentSource, len(configuration.ImageDigestMirrors))
+		for j, _registry := range configuration.ImageDigestMirrors {
+			mirrors := make([]string, len(_registry.Mirrors))
+			for k, mirror := range _registry.Mirrors {
+				mirrors[k] = string(mirror)
+			}
+			imageContentSourceList[j] = installcfg.ImageContentSource{Source: _registry.Source, Mirrors: mirrors}
+		}
+	} else if i.mirrorRegistriesBuilder.IsMirrorRegistriesConfigured() {
+		mirrorRegistriesConfigs, err := i.mirrorRegistriesBuilder.ExtractLocationMirrorDataFromRegistries()
+		if err != nil {
+			i.log.WithError(err).Errorf("Failed to get the mirror registries conf need for ImageContentSources")
+			return err
+		}
+		imageContentSourceList = make([]installcfg.ImageContentSource, len(mirrorRegistriesConfigs))
+		for j, mirrorRegistriesConfig := range mirrorRegistriesConfigs {
+			imageContentSourceList[j] = installcfg.ImageContentSource{Source: mirrorRegistriesConfig.Location, Mirrors: mirrorRegistriesConfig.Mirror}
+		}
+	}
+
+	cfg.DeprecatedImageContentSources = imageContentSourceList
 	return nil
 }
 
@@ -169,64 +308,60 @@ func (i *installConfigBuilder) applyConfigOverrides(overrides string, cfg *insta
 	return nil
 }
 
-func (i *installConfigBuilder) getInstallConfig(cluster *common.Cluster, clusterInfraenvs []*common.InfraEnv, rhRootCA string) (*installcfg.InstallerConfigBaremetal, error) {
+func (i *installConfigBuilder) buildInstallConfig(cluster *common.Cluster, clusterInfraenvs []*common.InfraEnv) (*installcfg.InstallerConfigBaremetal, error) {
 	cfg, err := i.getBasicInstallConfig(cluster)
 	if err != nil {
 		return nil, err
 	}
 
-	err = i.providerRegistry.AddPlatformToInstallConfig(cfg, cluster)
+	err = i.providerRegistry.AddPlatformToInstallConfig(cfg, cluster, clusterInfraenvs)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"error while adding Platfom %s to install config, error is: %w", common.PlatformTypeValue(cluster.Platform.Type), err)
-	}
-	err = i.applyConfigOverrides(cluster.InstallConfigOverrides, cfg)
-	if err != nil {
-		return nil, err
-	}
-	caContent := i.mergeAllCASources(cluster, clusterInfraenvs, rhRootCA, cfg.AdditionalTrustBundle)
-	if caContent != "" {
-		cfg.AdditionalTrustBundle = caContent
 	}
 
 	return cfg, nil
 }
 
 func (i *installConfigBuilder) GetInstallConfig(cluster *common.Cluster, clusterInfraenvs []*common.InfraEnv, rhRootCA string) ([]byte, error) {
-	cfg, err := i.getInstallConfig(cluster, clusterInfraenvs, rhRootCA)
+	cfg, err := i.buildInstallConfig(cluster, clusterInfraenvs)
 	if err != nil {
 		return nil, err
+	}
+
+	if err = i.applyConfigOverrides(cluster.InstallConfigOverrides, cfg); err != nil {
+		return nil, err
+	}
+
+	caContent := i.mergeAllCASources(cluster, clusterInfraenvs, rhRootCA, cfg.AdditionalTrustBundle)
+	if caContent != "" {
+		cfg.AdditionalTrustBundle = caContent
 	}
 
 	return json.Marshal(*cfg)
 }
 
 func (i *installConfigBuilder) ValidateInstallConfigPatch(cluster *common.Cluster, clusterInfraenvs []*common.InfraEnv, patch string) error {
-	config, err := i.getInstallConfig(cluster, clusterInfraenvs, "")
+	cfg, err := i.buildInstallConfig(cluster, clusterInfraenvs)
 	if err != nil {
 		return err
 	}
 
-	err = i.applyConfigOverrides(patch, config)
-	if err != nil {
+	if err = i.applyConfigOverrides(patch, cfg); err != nil {
 		return err
 	}
 
-	return config.Validate()
+	return cfg.Validate()
 }
 
-func (i *installConfigBuilder) getHypethreadingConfiguration(cluster *common.Cluster, machineType string) string {
-	switch cluster.Hyperthreading {
-	case models.ClusterHyperthreadingAll:
+func (i *installConfigBuilder) getHypethreadingConfiguration(cluster *common.Cluster, machineGroup string) string {
+	if cluster.Hyperthreading == models.ClusterHyperthreadingAll {
 		return "Enabled"
-	case models.ClusterHyperthreadingMasters:
-		if machineType == "master" {
-			return "Enabled"
-		}
-	case models.ClusterHyperthreadingWorkers:
-		if machineType == "worker" {
-			return "Enabled"
-		}
+	}
+
+	enabledGroups := strings.Split(cluster.Hyperthreading, ",")
+	if funk.ContainsString(enabledGroups, machineGroup) {
+		return "Enabled"
 	}
 	return "Disabled"
 }
@@ -256,12 +391,67 @@ func (i *installConfigBuilder) mergeAllCASources(cluster *common.Cluster,
 		}
 	}
 
+	mirrorConfiguration, _ := cluster.GetMirrorRegistryConfiguration()
+	if mirrorConfiguration != nil && mirrorConfiguration.CaBundleCrt != "" {
+		certs = append(certs, mirrorConfiguration.CaBundleCrt)
+	}
+
 	// Add CA trust bundles from host infraenvs
 	for _, infraenv := range clusterInfraenvs {
 		if infraenv.AdditionalTrustBundle != "" {
 			certs = append(certs, infraenv.AdditionalTrustBundle)
 		}
+
+		mirrorConfiguration, _ = infraenv.GetMirrorRegistryConfiguration()
+		if mirrorConfiguration != nil && mirrorConfiguration.CaBundleCrt != "" {
+			certs = append(certs, mirrorConfiguration.CaBundleCrt)
+		}
 	}
 
 	return strings.TrimSpace(strings.Join(certs, "\n"))
+}
+
+func (i *installConfigBuilder) handleFencing(cfg *installcfg.InstallerConfigBaremetal, cluster *common.Cluster) error {
+	if !common.IsClusterTopologyTwoNodesWithFencing(cluster) {
+		return nil
+	}
+
+	fencingCredentials := make([]installcfg.FencingCredential, common.AllowedNumberOfMasterHostsInTwoNodesWithFencing)
+	for index, master := range common.GetHostsByRole(cluster, models.HostRoleMaster) {
+		hostFencingCredentials := models.FencingCredentialsParams{}
+		if err := json.Unmarshal([]byte(master.FencingCredentials), &hostFencingCredentials); err != nil {
+			i.log.WithError(err).Errorf("failed to unmarshal the fencing credentials of host %s", master.ID.String())
+			return err
+		}
+
+		fc := installcfg.FencingCredential{
+			Address:  *hostFencingCredentials.Address,
+			Username: *hostFencingCredentials.Username,
+			Password: *hostFencingCredentials.Password,
+		}
+		if hostFencingCredentials.MacAddress != nil && *hostFencingCredentials.MacAddress != "" {
+			fc.MacAddress = *hostFencingCredentials.MacAddress
+		} else {
+			fc.Hostname = hostutil.GetHostnameForMsg(&master)
+		}
+
+		if hostFencingCredentials.CertificateVerification != nil && *hostFencingCredentials.CertificateVerification != "" {
+			certificateVerification := installcfg.CertificateVerification(*hostFencingCredentials.CertificateVerification)
+			fc.CertificateVerification = &certificateVerification
+		}
+		fencingCredentials[index] = fc
+	}
+
+	cfg.ControlPlane.Fencing = &installcfg.Fencing{Credentials: fencingCredentials}
+
+	// TNF is TechPreview in 4.20-4.21, GA from 4.22
+	isGA, err := common.BaseVersionGreaterOrEqual("4.22", cluster.OpenshiftVersion)
+	if err != nil {
+		return err
+	}
+	if !isGA {
+		cfg.FeatureSet = configv1.TechPreviewNoUpgrade
+	}
+
+	return nil
 }

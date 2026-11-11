@@ -30,6 +30,7 @@ import (
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
@@ -93,7 +94,7 @@ type API interface {
 	// auto assign host role
 	AutoAssignRole(ctx context.Context, h *models.Host, db *gorm.DB) (bool, error)
 	RefreshRole(ctx context.Context, h *models.Host, db *gorm.DB) error
-	IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *gorm.DB, log logrus.FieldLogger) (bool, error)
+	IsValidCandidate(h *models.Host, c *common.Cluster, role models.HostRole, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error)
 	SetUploadLogsAt(ctx context.Context, h *models.Host, db *gorm.DB) error
 	UpdateLogsProgress(ctx context.Context, h *models.Host, progress string) error
 	PermanentHostsDeletion(olderThan strfmt.DateTime) error
@@ -111,6 +112,7 @@ type API interface {
 	UpdateIgnitionEndpointHTTPHeaders(ctx context.Context, h *models.Host, nodeLabelsStr string, db *gorm.DB) error
 	UpdateNodeLabels(ctx context.Context, h *models.Host, nodeLabelsStr string, db *gorm.DB) error
 	UpdateNodeSkipDiskFormatting(ctx context.Context, h *models.Host, skipDiskFormatting string, db *gorm.DB) error
+	UpdateFencing(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error
 	UpdateInstallationDisk(ctx context.Context, db *gorm.DB, h *models.Host, installationDiskId string) error
 	UpdateKubeKeyNS(ctx context.Context, hostID, namespace string) error
 	GetHostValidDisks(role *models.Host) ([]*models.Disk, error)
@@ -185,13 +187,10 @@ func (m *Manager) RegisterHost(ctx context.Context, h *models.Host, db *gorm.DB)
 			return err
 		}
 
-		// Delete any previews record of the host if it was soft deleted from the cluster,
-		// no error will be returned if the host was not existed.
-		if err := db.Unscoped().Delete(&common.Host{}, "id = ? and infra_env_id = ?", *h.ID, h.InfraEnvID).Error; err != nil {
-			return errors.Wrapf(
-				err,
-				"error while trying to delete previews record from db (if exists) of host %s in infra env %s",
-				h.ID.String(), h.InfraEnvID.String())
+		// Delete any previous record of the host if it was soft deleted from the cluster,
+		// no error will be returned if the host did not exist.
+		if err := common.DeleteSoftDeletedHost(db, h.ID.String(), h.InfraEnvID.String()); err != nil {
+			return err
 		}
 
 		host = h
@@ -256,7 +255,7 @@ func (m *Manager) populateDisksEligibility(ctx context.Context, inventory *model
 		}
 
 		// Append to the existing reasons already filled in by the agent
-		reasons, err := m.hwValidator.DiskIsEligible(ctx, disk, infraEnv, cluster, host, inventory.CPU.Architecture, inventory.Disks)
+		reasons, err := m.hwValidator.DiskIsEligible(ctx, disk, infraEnv, cluster, host, inventory)
 		if err != nil {
 			return err
 		}
@@ -438,14 +437,13 @@ func (m *Manager) refreshRoleInternal(ctx context.Context, h *models.Host, db *g
 		//suggested role is already set
 		if h.Role == models.HostRoleAutoAssign &&
 			funk.ContainsString(hostStatusesBeforeInstallation[:], *h.Status) {
-			host := *h //must have a defensive copy becuase selectRole changes the host object
-			if suggestedRole, err = m.selectRole(ctx, &host, db); err == nil {
+			if suggestedRole, err = m.selectRole(ctx, h, db); err == nil {
 				m.log.Debugf("calculated role for host %s is %s (original suggested = %s)", hostutil.GetHostnameForMsg(h), suggestedRole, h.SuggestedRole)
 				if h.SuggestedRole != suggestedRole {
 					if err = updateRole(m.log, h, h.Role, suggestedRole, db, string(h.Role)); err == nil {
 						h.SuggestedRole = suggestedRole
 						m.log.Infof("suggested role for host %s is %s", *h.ID, suggestedRole)
-						eventgen.SendHostRoleUpdatedEvent(ctx, m.eventsHandler, *h.ID, h.InfraEnvID, hostutil.GetHostnameForMsg(h), string(suggestedRole))
+						eventgen.SendHostRoleUpdatedEvent(ctx, m.eventsHandler, h.ClusterID, *h.ID, h.InfraEnvID, hostutil.GetHostnameForMsg(h), string(suggestedRole))
 					}
 				}
 			}
@@ -861,6 +859,24 @@ func (m *Manager) UpdateNodeSkipDiskFormatting(ctx context.Context, h *models.Ho
 	return m.updateHost(ctx, cdb, h, updates).Error
 }
 
+func (m *Manager) UpdateFencing(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error {
+	hostStatus := swag.StringValue(h.Status)
+	if !funk.ContainsString(hostStatusesBeforeInstallationOrUnbound[:], hostStatus) {
+		return common.NewApiError(http.StatusBadRequest,
+			errors.Errorf("Host is in %s state, fencing credentials can be set only in one of %s states",
+				hostStatus, hostStatusesBeforeInstallation[:]))
+	}
+
+	h.FencingCredentials = fencingCredentials
+	cdb := m.db
+	if db != nil {
+		cdb = db
+	}
+	updates := map[string]interface{}{"fencing_credentials": h.FencingCredentials, "trigger_monitor_timestamp": time.Now()}
+
+	return m.updateHost(ctx, cdb, h, updates).Error
+}
+
 func (m *Manager) UpdateNTP(ctx context.Context, h *models.Host, ntpSources []*models.NtpSource, db *gorm.DB) error {
 	bytes, err := json.Marshal(ntpSources)
 	if err != nil {
@@ -1171,7 +1187,7 @@ func (m *Manager) reportValidationStatusChanged(ctx context.Context, vc *validat
 						hostutil.GetHostnameForMsg(h), v.ID.String())
 				} else if v.Status != previousStatus {
 					msg := fmt.Sprintf("Host %s: validation '%s' status changed from %s to %s", hostutil.GetHostnameForMsg(h), v.ID, previousStatus, v.Status)
-					log.Infof(msg)
+					log.Info(msg)
 					m.eventsHandler.NotifyInternalEvent(ctx, h.ClusterID, h.ID, &h.InfraEnvID, msg)
 				}
 			}
@@ -1229,71 +1245,117 @@ func (m *Manager) AutoAssignRole(ctx context.Context, h *models.Host, db *gorm.D
 	return false, nil
 }
 
-// This function recommends a role for a given host based on these criteria:
-//  1. if there are not enough masters and the host has enough capabilities to be
+// selectRole recommends a role for a given host based on these criteria:
+//   - if there are not enough masters and the host has enough capabilities to be
 //     a master the function select it to be a master
-//  2. if there are enough masters, or it is a day2 host, or it has not enough capabilities
-//     to be a master the function select it to be a  worker
-//  3. in case of missing inventory or an internal error the function returns auto-assign
+//   - if there are enough masters, or it is a day2 host, or it does not not have enough capabilities
+//     to be a master the function select it to be a worker
+//   - in case of missing inventory or an internal error the function returns auto-assign
 func (m *Manager) selectRole(ctx context.Context, h *models.Host, db *gorm.DB) (models.HostRole, error) {
 	var (
 		autoSelectedRole = models.HostRoleAutoAssign
 		log              = logutil.FromContext(ctx, m.log)
 		err              error
-		vc               *validationContext
 	)
 
 	if hostutil.IsDay2Host(h) {
 		return models.HostRoleWorker, nil
 	}
 
+	log = log.WithField("host", h.ID.String())
+	log.Debug("Selecting host's role")
+
 	if h.Inventory == "" {
 		return autoSelectedRole, errors.Errorf("host %s from cluster %s don't have hardware info",
 			h.ID.String(), h.ClusterID.String())
 	}
 
-	// count already existing masters or hosts with suggested role of master
-	// since aggregated functions can not run within a FOR UPDATE transaction
-	// we are now calculating the master count with SELECT query (Bug 2012570)
-	var masters []string
-	reply := db.Model(&models.Host{}).Where("cluster_id = ? and id != ? and (role = ? or suggested_role = ?)",
-		h.ClusterID, h.ID, models.HostRoleMaster, models.HostRoleMaster).Pluck("id", &masters)
-
-	if err = reply.Error; err != nil {
-		log.WithError(err).Errorf("failed to count masters in cluster %s", h.ClusterID.String())
-		return autoSelectedRole, err
+	if h.ClusterID == nil {
+		return autoSelectedRole, errors.Errorf("host %s is not bound to a cluster", h.ID.String())
 	}
 
-	if len(masters) < common.MinMasterHostsNeededForInstallation {
-		h.Role = models.HostRoleMaster
-		vc, err = newValidationContext(ctx, h, nil, nil, db, make(InventoryCache), m.hwValidator, m.kubeApiEnabled, m.objectHandler, m.softTimeoutsEnabled)
+	// We need to retrieve the cluster from the database to ensure we have up-to-date cluster host roles.
+	cluster, err := common.GetClusterFromDBWithHosts(db, *h.ClusterID)
+	if err != nil || cluster == nil {
+		return autoSelectedRole, errors.Wrapf(err, "failed fetching cluster with ID: %s from the DB", h.ClusterID.String())
+	}
+
+	masterCountNotIncludingHost := countNumberOfHostsInRoleNotIncludingHost(h, cluster, models.HostRoleMaster)
+	log.Debugf("Current master count not including the host: %d", masterCountNotIncludingHost)
+
+	expectedMasterCount := int(cluster.ControlPlaneCount)
+	log.Debugf("Current expected master count: %d", expectedMasterCount)
+
+	if masterCountNotIncludingHost < expectedMasterCount {
+		validMaster, err := m.IsValidCandidate(h, cluster, models.HostRoleMaster, db, log, true)
 		if err != nil {
-			log.WithError(err).Errorf("failed to create new validation context for host %s", h.ID.String())
-			return autoSelectedRole, err
+			return autoSelectedRole, errors.Wrapf(err, "error occurred while checking if host: %s is a valid master candidate", h.ID.String())
 		}
-		conditions, _, err := m.rp.preprocess(ctx, vc)
-		if err != nil {
-			log.WithError(err).Errorf("failed to run validations on host %s", h.ID.String())
-			return autoSelectedRole, err
-		}
-		if m.canBeMaster(conditions) {
+
+		if validMaster {
 			return models.HostRoleMaster, nil
+		}
+	}
+
+	if expectedMasterCount < common.MinMasterHostsNeededForInstallationInHaMode &&
+		expectedMasterCount >= common.MinMasterHostsNeededForInstallationInHaArbiterMode &&
+		countNumberOfHostsInRoleNotIncludingHost(h, cluster, models.HostRoleArbiter) == 0 {
+		validArbiter, err := m.IsValidCandidate(h, cluster, models.HostRoleArbiter, db, log, false)
+		if err != nil {
+			return autoSelectedRole, errors.Wrapf(err, "error occurred while checking if host: %s is a valid arbiter candidate", h.ID.String())
+		}
+
+		if validArbiter {
+			return models.HostRoleArbiter, nil
 		}
 	}
 
 	return models.HostRoleWorker, nil
 }
 
-func (m *Manager) IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *gorm.DB, log logrus.FieldLogger) (bool, error) {
-	if h.Role == models.HostRoleWorker {
+func countNumberOfHostsInRoleNotIncludingHost(h *models.Host, cluster *common.Cluster, role models.HostRole) int {
+	return lo.CountBy(cluster.Hosts, func(host *models.Host) bool {
+		return host.ID != nil && h.ID != nil &&
+			host.ID.String() != h.ID.String() &&
+			role == common.GetEffectiveRole(host)
+	})
+}
+
+func (m *Manager) IsValidCandidate(h *models.Host, c *common.Cluster, role models.HostRole, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error) {
+	// in general if the host already has a role that is different from the one we want to check, then we should return false
+	// but if the host's role is bootstrap and the role we want to check is master, then we should allow it since the bootstrap is a master
+	if h.Role != models.HostRoleAutoAssign && h.Role != role &&
+		!(role == models.HostRoleMaster && h.Role == models.HostRoleBootstrap) {
 		return false, nil
 	}
 
-	h.Role = models.HostRoleMaster
+	found := false
+
+	// struct copy
+	cluster := *c
+	// deep-copy the Hosts slice so mutations don’t leak out
+	cluster.Hosts = make([]*models.Host, len(c.Hosts))
+	for i, src := range c.Hosts {
+		dst := *src // copy the struct value
+		if src.ID != nil && h.ID != nil &&
+			src.ID.String() == h.ID.String() {
+			// point h at the copied host so we only mutate the copy
+			h = &dst
+			found = true
+		}
+		cluster.Hosts[i] = &dst
+	}
+
+	if !found {
+		return false, errors.New("host not found in cluster")
+	}
+
+	// update the copied host's role in order to run validations on it
+	h.Role = role
 
 	ctx := context.TODO()
 
-	vc, err := newValidationContext(ctx, h, c, nil, db, make(InventoryCache), m.hwValidator, m.kubeApiEnabled, m.objectHandler, m.softTimeoutsEnabled)
+	vc, err := newValidationContext(ctx, h, &cluster, nil, db, make(InventoryCache), m.hwValidator, m.kubeApiEnabled, m.objectHandler, m.softTimeoutsEnabled)
 	if err != nil {
 		log.WithError(err).Errorf("failed to create new validation context for host %s", h.ID.String())
 		return false, err
@@ -1305,20 +1367,21 @@ func (m *Manager) IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *
 		return false, err
 	}
 
-	if m.canBeMaster(conditions) {
-		return true, nil
-	}
-
-	return false, nil
+	return m.areRoleConditionsSatisfied(conditions, validateAgainstOperators, h, log), nil
 }
 
-func (m *Manager) canBeMaster(conditions map[string]bool) bool {
-	return conditions[HasCPUCoresForRole.String()] &&
-		conditions[HasMemoryForRole.String()] &&
-		conditions[AreLsoRequirementsSatisfied.String()] &&
-		conditions[AreOdfRequirementsSatisfied.String()] &&
-		conditions[AreCnvRequirementsSatisfied.String()] &&
-		conditions[AreLvmRequirementsSatisfied.String()]
+func (m *Manager) areRoleConditionsSatisfied(conditions map[string]bool, validateAgainstOperators bool, h *models.Host, log logrus.FieldLogger) bool {
+	satisfied := conditions[HasCPUCoresForRole.String()] &&
+		conditions[HasMemoryForRole.String()]
+
+	if validateAgainstOperators {
+		return satisfied && conditions[AreLsoRequirementsSatisfied.String()] &&
+			conditions[AreOdfRequirementsSatisfied.String()] &&
+			conditions[AreCnvRequirementsSatisfied.String()] &&
+			conditions[AreLvmRequirementsSatisfied.String()]
+	}
+
+	return satisfied
 }
 
 func (m *Manager) GetHostValidDisks(host *models.Host) ([]*models.Disk, error) {
@@ -1431,13 +1494,16 @@ type DisabledHostValidations map[string]struct{}
 
 func (d *DisabledHostValidations) Decode(value string) error {
 	disabledHostValidations := DisabledHostValidations{}
-	if len(strings.Trim(value, "")) == 0 {
-		*d = disabledHostValidations
-		return nil
+	if value == `""` {
+		value = ""
 	}
-	for _, element := range strings.Split(value, ",") {
-		if len(element) == 0 {
-			return fmt.Errorf("empty host validation ID found in '%s'", value)
+	validationIDs, err := common.ParseCommaSeparatedUniqueValues(value, "host validation ID")
+	if err != nil {
+		return err
+	}
+	for _, element := range validationIDs {
+		if err := models.HostValidationID(element).Validate(nil); err != nil {
+			return fmt.Errorf("disabled host validation ID '%s' is not a known host validation", element)
 		}
 		disabledHostValidations[element] = struct{}{}
 	}

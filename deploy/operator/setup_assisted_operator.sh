@@ -101,6 +101,9 @@ EOF
 }
 
 function install_from_catalog_source() {
+  # ensure that the necessary MCE CRDs are installed.
+  oc apply -f ${__root}/hack/crds/mce
+
   catalog_source_name="${1}"
   if [ "${ASSISTED_UPGRADE_OPERATOR}" = "true" ]; then
    catalog_source=${ASSISTED_SERVICE_OPERATOR_CATALOG}
@@ -110,7 +113,7 @@ function install_from_catalog_source() {
 
   if [ "${DISCONNECTED}" != "true" ]; then
     # In disconnected mode it should be applied already with a different image
-  tee << EOCR >(oc apply -f -)
+  tee << EOCR >(oc apply  -f -)
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:
@@ -124,7 +127,7 @@ spec:
 EOCR
   fi
 
-  tee << EOCR >(oc apply -f -)
+  tee << EOCR >(oc apply  -f -)
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -159,7 +162,7 @@ EOCR
 
   wait_for_crd "agentserviceconfigs.agent-install.openshift.io"
 
-  tee << EOCR >(oc apply -f -)
+  tee << EOCR >(oc apply  -f -)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -167,6 +170,7 @@ metadata:
   namespace: ${ASSISTED_NAMESPACE}
 data:
   LOG_LEVEL: "debug"
+  OPENSHIFT_INSTALL_EXPERIMENTAL_DISABLE_IMAGE_POLICY: "true"
 $(configmap_config)
 EOCR
 
@@ -174,7 +178,7 @@ EOCR
     deploy_mirror_config_map
   fi
 
-  tee << EOCR >(oc apply -f -)
+  tee << EOCR >(oc apply  -f -)
 apiVersion: agent-install.openshift.io/v1beta1
 kind: AgentServiceConfig
 metadata:
@@ -215,7 +219,7 @@ EOCR
   oc patch -n ${ASSISTED_NAMESPACE} agentserviceconfig agent --type merge -p '{"spec":{"osImages":'"${OS_IMAGES_CAMELCASE}"'}}'
 
   wait_for_operator "assisted-service-operator" "${ASSISTED_NAMESPACE}"
-  wait_for_condition "agentserviceconfigs/agent" "ReconcileCompleted" "5m"
+  wait_for_condition "agentserviceconfigs/agent" "condition=ReconcileCompleted" "5m"
   wait_for_deployment "assisted-service" "${ASSISTED_NAMESPACE}" "5m"
   wait_for_pod "assisted-image-service" "${ASSISTED_NAMESPACE}" "app=assisted-image-service"
 
@@ -278,17 +282,36 @@ data:
     $(registry_config "$(get_image_without_tag ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})")
     $(registry_config "$(get_image_without_tag ${cli_image})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})")
     $(registry_config "$(get_image_without_tag ${ironic_agent_image})" "${LOCAL_REGISTRY}/$(get_image_repository_only ${OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE})")
-    $(for row in $(kubectl get imagecontentsourcepolicy -o json |
-        jq -rc ".items[] | select(.metadata.name | test(\"${assisted_index_image}\")).spec.repositoryDigestMirrors[] | [.mirrors[0], .source]"); do
-      row=$(echo ${row} | tr -d '[]"');
-      source=$(echo ${row} | cut -d',' -f2);
-      mirror=$(echo ${row} | cut -d',' -f1);
-      registry_config ${source} ${mirror};
-    done)
+    $(registry_configs_for_os_image_stream_sources "${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE}" "${AUTHFILE:-${PULL_SECRET_FILE}}" "${LOCAL_REGISTRY}/$(get_image_repository_only ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" \
+      "$(get_image_without_tag ${ASSISTED_OPENSHIFT_INSTALL_RELEASE_IMAGE})" \
+      "$(get_image_without_tag ${cli_image})" \
+      "$(get_image_without_tag ${ironic_agent_image})")
+    $(
+      if kubectl get crd imagedigestmirrorsets.config.openshift.io &>/dev/null; then
+        for row in $(kubectl get imagedigestmirrorset -o json |
+          jq -rc ".items[] | select(.metadata.name | test(\"${assisted_index_image}\")).spec.imageDigestMirrors[] | [.mirrors[0], .source]"); do
+          row=$(echo ${row} | tr -d '[]"');
+          source=$(echo ${row} | cut -d',' -f2);
+          mirror=$(echo ${row} | cut -d',' -f1);
+          registry_config ${source} ${mirror};
+        done
+      fi
+    )
+    $(
+      if kubectl get crd imagecontentsourcepolicies.operator.openshift.io &>/dev/null; then
+        for row in $(kubectl get imagecontentsourcepolicy -o json |
+          jq -rc ".items[] | select(.metadata.name | test(\"${assisted_index_image}\")).spec.repositoryDigestMirrors[] | [.mirrors[0], .source]"); do
+          row=$(echo ${row} | tr -d '[]"');
+          source=$(echo ${row} | cut -d',' -f2);
+          mirror=$(echo ${row} | cut -d',' -f1);
+          registry_config ${source} ${mirror};
+        done
+      fi
+    )
 EOCR
 
   python ${__dir}/set_ca_bundle.py "${WORKING_DIR}/registry/certs/registry.2.crt" "./assisted-mirror-config"
-  tee < ./assisted-mirror-config >(oc apply -f -)
+  tee < ./assisted-mirror-config >(oc apply  -f -)
 }
 
 function from_index_image() {

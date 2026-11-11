@@ -9,7 +9,6 @@ import (
 	ignition_types "github.com/coreos/ignition/v2/config/v3_2/types"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -24,13 +23,17 @@ import (
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/metrics"
+	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/operators/api"
 	"github.com/openshift/assisted-service/internal/provider/registry"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
+	"github.com/openshift/assisted-service/pkg/s3wrapper"
+	"github.com/samber/lo"
 	"github.com/vincent-petithory/dataurl"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -84,7 +87,7 @@ var _ = Describe("Validations test", func() {
 
 	mockAndRefreshStatusWithoutEvents := func(h *models.Host) {
 		mockDefaultClusterHostRequirements(mockHwValidator)
-		mockHwValidator.EXPECT().IsValidStorageDeviceType(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true).AnyTimes()
+		mockHwValidator.EXPECT().IsValidStorageDeviceType(gomock.Any(), gomock.Any(), gomock.Any()).Return(true).AnyTimes()
 		mockHwValidator.EXPECT().ListEligibleDisks(gomock.Any()).Return([]*models.Disk{}).AnyTimes()
 		mockHwValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return("/dev/sda").AnyTimes()
 		mockOperators.EXPECT().ValidateHost(gomock.Any(), gomock.Any(), gomock.Any()).Return([]api.ValidationResult{
@@ -436,8 +439,9 @@ var _ = Describe("Validations test", func() {
 		Describe("Wildcard connectivity check is performed", func() {
 			successMessage := "DNS wildcard check was successful"
 			successMessageDay2 := "DNS wildcard check is not required for day2"
-			failureMessage := "DNS wildcard configuration was detected for domain *.test-cluster.example.com - the installation will not be able to complete while this record exists. Please remove it to proceed. The domain resolves to addresses 7.8.9.10/24, 1003:db8::40/120"
-			subDomainFailureMessage := "Unexpected domain name resolution was detected for the relative domain name with the sub-domain *.test-cluster.example.com despite the fact that no resolution exists for a Fully Qualified Domain Name (FQDN) with same sub-domain. This is usually a sign of DHCP-provided domain-search configuration. The installation will not be able to complete with this configuration in place. Please remove it to proceed. The relative domain name resolves to addresses 7.8.9.10/24, 1003:db8::40/120"
+			failureMessage := "DNS wildcard configuration was detected for domain *.test-cluster.example.com - the installation will not be able to complete while this record exists. Please remove it to proceed. The domain resolves to 7.8.9.10/24, 1003:db8::40/120"
+			failureMessageWithCname := "DNS wildcard configuration was detected for domain *.test-cluster.example.com - the installation will not be able to complete while this record exists. Please remove it to proceed. The domain resolves to a.test.com"
+			subDomainFailureMessage := "Unexpected domain name resolution was detected for the relative domain name with the sub-domain *.test-cluster.example.com despite the fact that no resolution exists for a Fully Qualified Domain Name (FQDN) with same sub-domain. This is usually a sign of DHCP-provided domain-search configuration. The installation will not be able to complete with this configuration in place. Please remove it to proceed. The relative domain name resolves to 7.8.9.10/24, 1003:db8::40/120"
 			errorMessage := "Error while parsing DNS resolution response"
 			pendingMessage := "DNS wildcard check cannot be performed yet because the host has not yet performed DNS resolution"
 
@@ -447,6 +451,7 @@ var _ = Describe("Validations test", func() {
 			var DNSResponseStateCorruptResponse DNSResponseState = "corrupt-response"
 			var DNSResponseStateDidntResolveIllegalWildcard DNSResponseState = "didnt-resolve-illegal-wildcard"
 			var DNSResponseStateResolvedIllegalWildcard DNSResponseState = "resolved-illegal-wildcard"
+			var DNSResponseStateResolvedIllegalWildcardWithCname DNSResponseState = "resolved-illegal-wildcard-with-cname"
 			var DNSSubDomainResponseStateResolvedIllegalWildcard DNSResponseState = "sub-domain-resolved-illegal-wildcard"
 
 			for _, dnsWildcardTestCase := range []struct {
@@ -476,6 +481,15 @@ var _ = Describe("Validations test", func() {
 
 					expectedValidationStatus: ValidationFailure,
 					expectedMessage:          failureMessage,
+				},
+				{
+					testCaseName: "day 1 cluster - wildcard resolved with cname",
+					isDay2:       false,
+
+					dnsResponse: DNSResponseStateResolvedIllegalWildcardWithCname,
+
+					expectedValidationStatus: ValidationFailure,
+					expectedMessage:          failureMessageWithCname,
 				},
 				{
 					testCaseName:             "day 1 cluster - sub domain resolved wildcard",
@@ -538,8 +552,6 @@ var _ = Describe("Validations test", func() {
 					expectedMessage:          successMessageDay2,
 				},
 			} {
-				dnsWildcardTestCase := dnsWildcardTestCase
-
 				createTestCluster := func() {
 					var testCluster *common.Cluster
 					if dnsWildcardTestCase.isDay2 {
@@ -566,6 +578,8 @@ var _ = Describe("Validations test", func() {
 						setHostDomainResolutions(testHost, common.TestDomainNameResolutionsSuccess)
 					case DNSResponseStateResolvedIllegalWildcard:
 						setHostDomainResolutions(testHost, common.TestDomainNameResolutionsWildcardResolved)
+					case DNSResponseStateResolvedIllegalWildcardWithCname:
+						setHostDomainResolutions(testHost, common.TestDomainNameResolutionsWildcardResolvedWithCname)
 					case DNSSubDomainResponseStateResolvedIllegalWildcard:
 						setHostDomainResolutions(testHost, common.TestSubDomainNameResolutionsWildcardResolved)
 					case DNSResponseStateCorruptResponse:
@@ -630,6 +644,7 @@ var _ = Describe("Validations test", func() {
 				testClusterDay2Parameters       *day2TestInfo
 				testClusterHasManagedNetworking bool
 				testHostResolvedDNS             bool
+				testHostResolvedDNSWithCname    bool
 				// whether the scenario requires the cluster to have a base
 				// domain set. This should be set to true for scenarios that
 				// actually try to validate DNS and don't give a fake "success"
@@ -648,6 +663,16 @@ var _ = Describe("Validations test", func() {
 					expectedMessage:                 successMessage,
 				},
 				{
+					testCaseName:                    "day 1 cluster - managed networking - valid DNS with CNAME",
+					testClusterDay2Parameters:       nil,
+					testClusterHasManagedNetworking: true,
+					testHostResolvedDNS:             true,
+					testHostResolvedDNSWithCname:    true,
+					requiresBaseDomain:              false,
+					expectedValidationStatus:        ValidationSuccess,
+					expectedMessage:                 successMessage,
+				},
+				{
 					testCaseName:                    "day 1 cluster - managed networking - invalid DNS",
 					testClusterDay2Parameters:       nil,
 					testClusterHasManagedNetworking: true,
@@ -661,6 +686,16 @@ var _ = Describe("Validations test", func() {
 					testClusterDay2Parameters:       nil,
 					testClusterHasManagedNetworking: false,
 					testHostResolvedDNS:             true,
+					requiresBaseDomain:              true,
+					expectedValidationStatus:        ValidationSuccess,
+					expectedMessage:                 successMessage,
+				},
+				{
+					testCaseName:                    "day 1 cluster - user managed networking - valid DNS with CNAME",
+					testClusterDay2Parameters:       nil,
+					testClusterHasManagedNetworking: false,
+					testHostResolvedDNS:             true,
+					testHostResolvedDNSWithCname:    true,
 					requiresBaseDomain:              true,
 					expectedValidationStatus:        ValidationSuccess,
 					expectedMessage:                 successMessage,
@@ -873,9 +908,9 @@ var _ = Describe("Validations test", func() {
 
 					domainType := domainType
 					dnsTestCase := dnsTestCase
-					withBaseDomain := withBaseDomain
 					It(fmt.Sprintf("%s - %s - %s", domainType.destination, dnsTestCase.testCaseName, withBaseDomainTestName), func() {
-						resolutions := common.TestDomainNameResolutionsSuccess
+						resolutions := lo.Ternary(dnsTestCase.testHostResolvedDNSWithCname, common.TestDomainNameResolutionsSuccessWithCname,
+							common.TestDomainNameResolutionsSuccess)
 						if !dnsTestCase.testHostResolvedDNS {
 							resolutions = common.TestDomainResolutionsAllEmpty
 						}
@@ -1094,6 +1129,7 @@ var _ = Describe("Validations test", func() {
 		It("auto-assigned role", func() {
 
 			c := hostutil.GenerateTestCluster(clusterID)
+			c.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaMode
 			c.DiskEncryption = &models.DiskEncryption{
 				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
 				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
@@ -1389,7 +1425,12 @@ var _ = Describe("Validations test", func() {
 		})
 
 		It("day2 host - disk encryption is available", func() {
-			createDay2Cluster()
+			c := generateDay2Cluster()
+			c.DiskEncryption = &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			}
+			Expect(db.Create(c).Error).ToNot(HaveOccurred())
 
 			h := getDay2Host() //explicit set the role to worker
 			h.Inventory = common.GenerateTestInventoryWithTpmVersion("")
@@ -1406,7 +1447,12 @@ var _ = Describe("Validations test", func() {
 		})
 
 		It("day2 host - pending on APIVipConnectivity response", func() {
-			createDay2Cluster()
+			c := generateDay2Cluster()
+			c.DiskEncryption = &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			}
+			Expect(db.Create(c).Error).ToNot(HaveOccurred())
 
 			h := getDay2Host()
 			h.Inventory = common.GenerateTestInventoryWithTpmVersion(models.InventoryTpmVersionNone)
@@ -1422,7 +1468,12 @@ var _ = Describe("Validations test", func() {
 		})
 
 		It("day2 host - LUKS in APIVipConnectivity response", func() {
-			createDay2Cluster()
+			c := generateDay2Cluster()
+			c.DiskEncryption = &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			}
+			Expect(db.Create(c).Error).ToNot(HaveOccurred())
 
 			h := getDay2Host()
 			h.Inventory = common.GenerateTestInventoryWithTpmVersion(models.InventoryTpmVersionNone)
@@ -1583,6 +1634,7 @@ var _ = Describe("Validations test", func() {
 			updateHostInventory(func(inventory *models.Inventory) {
 				for _, disk := range inventory.Disks {
 					disk.HasUUID = false
+					disk.InstallationEligibility.Eligible = true
 				}
 			})
 
@@ -1600,12 +1652,20 @@ var _ = Describe("Validations test", func() {
 				SizeBytes: conversions.GibToBytes(120),
 				DriveType: "CDROM",
 				HasUUID:   false,
+				InstallationEligibility: models.DiskInstallationEligibility{
+					Eligible:           true,
+					NotEligibleReasons: []string{},
+				},
 			}
 
 			HDD := &models.Disk{
 				SizeBytes: conversions.GibToBytes(120),
 				DriveType: "HDD",
 				HasUUID:   true,
+				InstallationEligibility: models.DiskInstallationEligibility{
+					Eligible:           true,
+					NotEligibleReasons: []string{},
+				},
 			}
 
 			updateHostInventory(func(inventory *models.Inventory) {
@@ -1615,7 +1675,7 @@ var _ = Describe("Validations test", func() {
 			updateClusterPlatform()
 			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
 
-			mockHwValidator.EXPECT().IsValidStorageDeviceType(CDROM, models.ClusterCPUArchitectureX8664, "", false).Return(false).Times(1)
+			mockHwValidator.EXPECT().IsValidStorageDeviceType(CDROM, models.ClusterCPUArchitectureX8664, "").Return(false).Times(1)
 			mockAndRefreshStatus(&host)
 			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
 			status, _, _ := getValidationResult(host.ValidationsInfo, hostUUIDValidation)
@@ -1783,7 +1843,6 @@ var _ = Describe("Validations test", func() {
 				expectedValidationMessage: successMessage,
 			},
 		} {
-			test := test
 			It(test.name, func() {
 				// Apply test inputs
 				host.InstallationDiskID = test.installationDisk
@@ -1938,7 +1997,6 @@ var _ = Describe("Validations test", func() {
 				expectedValidationMessage: successMessage,
 			},
 		} {
-			test := test
 			It(test.name, func() {
 				// Apply test inputs
 				host.SkipFormattingDisks = test.skipFormattingDisks
@@ -2301,6 +2359,1841 @@ var _ = Describe("Validations test", func() {
 			Expect(ok).To(BeTrue())
 			Expect(diskNotDetected).To(Equal(message))
 			Expect(ValidationError).To(Equal(status))
+		})
+	})
+	Context("Has Min Memory", func() {
+		var (
+			host    models.Host
+			cluster common.Cluster
+		)
+
+		const (
+			minRAMMibRequirement int64 = 8192 // 8 GiB minimum
+		)
+
+		BeforeEach(func() {
+			// Create a test cluster
+			cluster = hostutil.GenerateTestCluster(clusterID)
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+
+			// Create a test host
+			hostId, infraEnvId := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+			mockProviderRegistry.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
+			host = hostutil.GenerateTestHostByKind(hostId, infraEnvId, &clusterID, models.HostStatusDiscovering, models.HostKindHost, models.HostRoleMaster)
+			host.Inventory = hostutil.GenerateMasterInventory()
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+			mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(&models.ReleaseImage{URL: swag.String("quay.io/openshift/some-image::latest")}, nil).AnyTimes()
+		})
+
+		updateMemoryInventory := func(h *models.Host, physicalBytes int64, method models.MemoryMethod) {
+			var inventory models.Inventory
+			err := json.Unmarshal([]byte(h.Inventory), &inventory)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			inventory.Memory = &models.Memory{
+				PhysicalBytes:       physicalBytes,
+				UsableBytes:         physicalBytes,
+				PhysicalBytesMethod: method,
+			}
+
+			inventoryByte, _ := json.Marshal(inventory)
+			h.Inventory = string(inventoryByte)
+
+			Expect(db.Save(h).Error).ShouldNot(HaveOccurred())
+		}
+
+		It("Sufficient memory with dmidecode method", func() {
+			// Memory meets requirement with standard tolerance
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodDmidecode)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Insufficient memory with dmidecode method - below standard tolerance", func() {
+			// Memory is slightly below requirement minus standard tolerance (100 MiB)
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - 150)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodDmidecode)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(ContainSubstring("minimum required RAM"))
+		})
+
+		It("Memory within standard tolerance with dmidecode method", func() {
+			// Memory is within standard tolerance (100 MiB below requirement)
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - 50)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodDmidecode)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Sufficient memory with meminfo method", func() {
+			// Memory meets requirement with extended tolerance
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodMeminfo)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Memory within extended tolerance with meminfo method", func() {
+			// When using meminfo, tolerance = 100 MiB + (8192 / 50) = 100 + 163.84 = ~263.84 MiB
+			// Set memory to be within this extended tolerance but outside standard tolerance
+			// Memory = requirement - 200 MiB (within extended tolerance of ~264 MiB, but outside standard 100 MiB)
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - 200)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodMeminfo)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Insufficient memory with meminfo method - below extended tolerance", func() {
+			// When using meminfo, tolerance = 100 MiB + (8192 / 50) = 100 + 163.84 = ~263.84 MiB
+			// Set memory to be below this extended tolerance
+			// Memory = requirement - 300 MiB (below extended tolerance of ~264 MiB)
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - 300)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodMeminfo)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(ContainSubstring("minimum required RAM"))
+		})
+
+		It("Memory exactly at tolerance boundary with meminfo method", func() {
+			// Test the exact tolerance boundary: requirement - tolerance = minimum acceptable
+			// tolerance = 100 + (8192 / 50) = 100 + 163 (integer division) = 263 MiB
+			extraTolerance := minRAMMibRequirement / 50 // 163 MiB
+			totalTolerance := int64(100) + extraTolerance
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - totalTolerance)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodMeminfo)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Memory just below tolerance boundary with meminfo method", func() {
+			// Test just below the tolerance boundary
+			extraTolerance := minRAMMibRequirement / 50 // 163 MiB
+			totalTolerance := int64(100) + extraTolerance
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement-totalTolerance) - 1
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodMeminfo)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(message).To(ContainSubstring("minimum required RAM"))
+		})
+
+		It("Memory with ghw method uses standard tolerance", func() {
+			// ghw is another physical memory detection method, should use standard tolerance
+			// Memory within standard tolerance (100 MiB below requirement)
+			physicalBytes := conversions.MibToBytes(minRAMMibRequirement - 50)
+			updateMemoryInventory(&host, physicalBytes, models.MemoryMethodGhw)
+			mockAndRefreshStatus(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Sufficient minimum RAM"))
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("Missing inventory", func() {
+			host.Inventory = ""
+			Expect(db.Save(&host).Error).ShouldNot(HaveOccurred())
+			mockAndRefreshStatusWithoutEvents(&host)
+			host = hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(host.ValidationsInfo, HasMinMemory)
+			Expect(ok).To(BeTrue())
+			Expect(message).To(Equal("Missing inventory"))
+			Expect(status).To(Equal(ValidationPending))
+		})
+	})
+	Context("No iSCSI NIC belongs to machine networks", func() {
+		var (
+			cluster common.Cluster
+			host    models.Host
+		)
+
+		standaloneiSCSIDisks := func(iscsi *models.Iscsi) []*models.Disk {
+			return []*models.Disk{{ID: "install-disk", DriveType: models.DriveTypeISCSI, Iscsi: iscsi}}
+		}
+		multipathiSCSIDisks := func(iscsi *models.Iscsi) []*models.Disk {
+			return []*models.Disk{{ID: "install-disk", Name: "dm-0", DriveType: models.DriveTypeMultipath}, {Name: "sda", DriveType: models.DriveTypeISCSI, Holders: "dm-0", Iscsi: iscsi}, {Name: "sdb", DriveType: models.DriveTypeISCSI, Holders: "dm-0", Iscsi: iscsi}}
+		}
+
+		BeforeEach(func() {
+			cluster = hostutil.GenerateTestCluster(clusterID)
+			hostId, infraEnvId := strfmt.UUID(uuid.New().String()), strfmt.UUID(uuid.New().String())
+
+			mockProviderRegistry.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
+
+			host = hostutil.GenerateTestHostByKind(hostId, infraEnvId, &clusterID, models.HostStatusKnown, models.HostKindHost, models.HostRoleMaster)
+			host.Inventory = hostutil.GenerateMasterInventory()
+		})
+
+		It("No installation disk", func() {
+			var inventory models.Inventory
+			err := json.Unmarshal([]byte(host.Inventory), &inventory)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			host.InstallationDiskID = "not-foo"
+			inventory.Disks = []*models.Disk{
+				{ID: "foo", DriveType: models.DriveTypeSSD},
+			}
+
+			inventoryByte, _ := json.Marshal(inventory)
+			host.Inventory = string(inventoryByte)
+
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+			mockAndRefreshStatus(&host)
+
+			refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			_, _, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+			Expect(ok).To(BeFalse())
+		})
+		It("Not iSCSI/ Multipath iSCSI drives", func() {
+			var inventory models.Inventory
+			err := json.Unmarshal([]byte(host.Inventory), &inventory)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			host.InstallationDiskID = "install-disk"
+			inventory.Disks = []*models.Disk{
+				{ID: "install-disk", DriveType: models.DriveTypeSSD},
+			}
+
+			inventoryByte, _ := json.Marshal(inventory)
+			host.Inventory = string(inventoryByte)
+
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+			mockAndRefreshStatus(&host)
+
+			refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			_, _, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+			Expect(ok).To(BeFalse())
+		})
+		DescribeTable("iSCSI / Multipath iSCSI drive - no network interface set with host IP", func(disks []*models.Disk) {
+			var inventory models.Inventory
+			err := json.Unmarshal([]byte(host.Inventory), &inventory)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			host.InstallationDiskID = "install-disk"
+			inventory.Disks = disks
+
+			inventoryByte, _ := json.Marshal(inventory)
+			host.Inventory = string(inventoryByte)
+
+			Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+			Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+			mockAndRefreshStatus(&host)
+
+			refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+			status, message, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+			Expect(ok).To(BeTrue())
+			Expect(status).To(Equal(ValidationError))
+			Expect(message).To(Equal("Cannot find network interface associated to iSCSI host IP address"))
+		},
+			Entry("Standalone iSCSI", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "99.99.99.99"})),
+			Entry("Multipath iSCSI", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "99.99.99.99"})),
+		)
+		DescribeTable(
+			"iSCSI / Multipath iSCSI drive - malformed iSCSI properties",
+			func(disks []*models.Disk, expectedMessage string) {
+				var inventory models.Inventory
+				err := json.Unmarshal([]byte(host.Inventory), &inventory)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				host.InstallationDiskID = "install-disk"
+				inventory.Disks = disks
+
+				inventoryByte, _ := json.Marshal(inventory)
+				host.Inventory = string(inventoryByte)
+
+				Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+				Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+				mockAndRefreshStatus(&host)
+
+				refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+				status, message, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+				Expect(ok).To(BeTrue())
+				Expect(status).To(Equal(ValidationError))
+				Expect(message).To(Equal(expectedMessage))
+			},
+			Entry("Standalone iSCSI - iSCSI is nil", standaloneiSCSIDisks(nil), "iSCSI disk is missing host IP address"),
+			Entry("Multipath iSCSI - iSCSI is nil", multipathiSCSIDisks(nil), "iSCSI disk is missing host IP address"),
+			Entry("Standalone iSCSI - Host IP address is empty", standaloneiSCSIDisks(&models.Iscsi{}), "Cannot find network interface associated to iSCSI host IP address"),
+			Entry("Multipath iSCSI - Host IP address is empty", multipathiSCSIDisks(&models.Iscsi{}), "Cannot find network interface associated to iSCSI host IP address"),
+			Entry("Standalone iSCSI - Host IP address is invalid", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "invalid"}), "Cannot find network interface associated to iSCSI host IP address"),
+			Entry("Multipath iSCSI - Host IP address is invalid", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "invalid"}), "Cannot find network interface associated to iSCSI host IP address"),
+		)
+		DescribeTable(
+			"iSCSI / Multipath iSCSI drive - machine networks",
+			func(disks []*models.Disk, machineNetworks []*models.MachineNetwork, interfaces []*models.Interface, expectedStatus ValidationStatus, expectedMessage string) {
+				var inventory models.Inventory
+				err := json.Unmarshal([]byte(host.Inventory), &inventory)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				host.InstallationDiskID = "install-disk"
+				inventory.Disks = disks
+				inventory.Interfaces = interfaces
+
+				inventoryByte, _ := json.Marshal(inventory)
+				host.Inventory = string(inventoryByte)
+				cluster.MachineNetworks = machineNetworks
+				Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+				Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+				mockAndRefreshStatus(&host)
+
+				refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+				status, message, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+				Expect(ok).To(BeTrue())
+				Expect(message).To(Equal(expectedMessage))
+				Expect(status).To(Equal(expectedStatus))
+			},
+			Entry("Standalone iSCSI - Machine networks is nil", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}), nil, nil, ValidationPending, "Missing inventory or machine network CIDR"),
+			Entry("Multipath iSCSI - Machine networks is nil", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}), nil, nil, ValidationPending, "Missing inventory or machine network CIDR"),
+			Entry("Standalone iSCSI - Machine networks is empty", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}), []*models.MachineNetwork{}, nil, ValidationPending, "Missing inventory or machine network CIDR"),
+			Entry("Multipath iSCSI - Machine networks is empty", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}), []*models.MachineNetwork{}, nil, ValidationPending, "Missing inventory or machine network CIDR"),
+			Entry("Standalone iSCSI - Machine networks IPv4 overlaps with host IPv4 address", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.1.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+				},
+				ValidationFailure, "Network interface connected to iSCSI disk cannot belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv4 overlaps with host IPv4 address", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.1.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+				},
+				ValidationFailure, fmt.Sprintf("%s: Network interface connected to iSCSI disk (%s) cannot belong to machine network CIDRs", hardware.ErrsInIscsiDisableMultipathInstallation, "sda, sdb")),
+			Entry("Standalone iSCSI - Machine networks IPv6 overlaps with host IPv6 address", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "2001:0db8:85a3::8a2e:0370:7334"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, "Network interface connected to iSCSI disk cannot belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv6 overlaps with host IPv6 address", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "2001:0db8:85a3::8a2e:0370:7334"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, fmt.Sprintf("%s: Network interface connected to iSCSI disk (%s) cannot belong to machine network CIDRs", hardware.ErrsInIscsiDisableMultipathInstallation, "sda, sdb")),
+			Entry("Standalone iSCSI - Machine networks IPv6 uses the same interface as host IPv4 address", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, "Network interface connected to iSCSI disk cannot belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv6 uses the same interface as host IPv4 address", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, fmt.Sprintf("%s: Network interface connected to iSCSI disk (%s) cannot belong to machine network CIDRs", hardware.ErrsInIscsiDisableMultipathInstallation, "sda, sdb")),
+			Entry("Standalone iSCSI - Machine networks IPv4 uses the same interface as host IPv6 address", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "2001:0db8:85a3::8a2e:0370:7334"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.1.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, "Network interface connected to iSCSI disk cannot belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv4 uses the same interface as host IPv6 address", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "2001:0db8:85a3::8a2e:0370:7334"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.1.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationFailure, fmt.Sprintf("%s: Network interface connected to iSCSI disk (%s) cannot belong to machine network CIDRs", hardware.ErrsInIscsiDisableMultipathInstallation, "sda, sdb")),
+			Entry("Standalone iSCSI - Machine networks IPv4 and host IPv4 address use different interfaces", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.2.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+					{
+						IPV4Addresses: []string{"192.168.2.1/24"},
+					},
+				},
+				ValidationSuccess, "Network interface connected to iSCSI disk does not belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv4 and host IPv4 address use different interfaces", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.2.0/24",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+					{
+						IPV4Addresses: []string{"192.168.2.1/24"},
+					},
+				},
+				ValidationSuccess, "Network interface connected to iSCSI disk does not belong to machine network CIDRs"),
+			Entry("Standalone iSCSI - Machine networks IPv4/IPv6 and host IPv4 address use different interfaces", standaloneiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.2.0/24",
+						ClusterID: clusterID,
+					},
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+					{
+						IPV4Addresses: []string{"192.168.2.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationSuccess, "Network interface connected to iSCSI disk does not belong to machine network CIDRs"),
+			Entry("Multipath iSCSI - Machine networks IPv4/IPv6 and host IPv4 address use different interfaces", multipathiSCSIDisks(&models.Iscsi{HostIPAddress: "192.168.1.1"}),
+				[]*models.MachineNetwork{
+					{
+						Cidr:      "192.168.2.0/24",
+						ClusterID: clusterID,
+					},
+					{
+						Cidr:      "2001:0db8:85a3::/48",
+						ClusterID: clusterID,
+					},
+				},
+				[]*models.Interface{
+					{
+						IPV4Addresses: []string{"192.168.1.1/24"},
+					},
+					{
+						IPV4Addresses: []string{"192.168.2.1/24"},
+						IPV6Addresses: []string{"2001:0db8:85a3::8a2e:0370:7334/48"},
+					},
+				},
+				ValidationSuccess, "Network interface connected to iSCSI disk does not belong to machine network CIDRs"),
+		)
+		DescribeTable(
+			"Validation is skipped when cluster",
+			func(cluster *models.Cluster) {
+				Expect(db.Create(&cluster).Error).ToNot(HaveOccurred())
+				Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+				mockAndRefreshStatus(&host)
+
+				refreshedHost := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+
+				status, message, ok := getValidationResult(refreshedHost.ValidationsInfo, NoIscsiNicBelongsToMachineCidr)
+				Expect(ok).To(BeFalse(), fmt.Sprintf("%s %s", status, message))
+			},
+			Entry("is multi-mode with UMN", &models.Cluster{ID: &clusterID, ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode, UserManagedNetworking: swag.Bool(true)}),
+			Entry("is day 2", &models.Cluster{ID: &clusterID, Kind: swag.String(models.ClusterKindAddHostsCluster)}),
+			Entry("is imported", &models.Cluster{ID: &clusterID, Imported: swag.Bool(true)}),
+		)
+	})
+	Context("Is MTU Valid", func() {
+		var (
+			cluster *common.Cluster
+			host    *models.Host
+		)
+
+		mNet := []*models.MachineNetwork{
+			{
+				Cidr:      "1.2.3.0/24",
+				ClusterID: clusterID,
+			},
+		}
+
+		multipleMNets := []*models.MachineNetwork{
+			{
+				Cidr:      "1.2.3.0/24",
+				ClusterID: clusterID,
+			},
+			{
+				Cidr:      "1.2.4.0/24",
+				ClusterID: clusterID,
+			},
+		}
+		DescribeTable("MTU validations across CMN and UMN", func(mtuReports []*models.MtuReport, mNets []*models.MachineNetwork, validationStatus ValidationStatus, isUMN, isDay2 bool, inventory string) {
+			mockProviderRegistry.EXPECT().IsHostSupported(commontesting.EqPlatformType(models.PlatformTypeVsphere), gomock.Any()).Return(false, nil).AnyTimes()
+
+			if isDay2 {
+				cluster = generateDay2Cluster()
+				host = getDay2Host()
+			} else {
+				day1Cluster := hostutil.GenerateTestCluster(clusterID)
+				cluster = &day1Cluster
+
+				day1Host := hostutil.GenerateTestHostByKind(hostID, infraEnvID, &clusterID, models.HostStatusKnown, models.HostKindHost, models.HostRoleMaster)
+				host = &day1Host
+			}
+
+			cluster.UserManagedNetworking = &isUMN
+			cluster.MachineNetworks = mNets
+
+			connectivityReport := &models.ConnectivityReport{}
+			connectivityReport.RemoteHosts = append(connectivityReport.RemoteHosts, &models.ConnectivityRemoteHost{
+				HostID:    hostID,
+				MtuReport: mtuReports,
+			})
+			report, err := hostutil.MarshalConnectivityReport(connectivityReport)
+			Expect(err).To(BeNil())
+			host.Connectivity = report
+			if inventory != "" {
+				host.Inventory = inventory
+			}
+			Expect(db.Create(cluster).Error).ToNot(HaveOccurred())
+			Expect(db.Create(host).Error).ShouldNot(HaveOccurred())
+
+			mockAndRefreshStatus(host)
+
+			refreshedHost := &hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db).Host
+			status, _, ok := getValidationResult(refreshedHost.ValidationsInfo, IsMtuValid)
+			Expect(ok).To(BeTrue(), fmt.Sprintf("debuuging info: status %s, isOK: %t host: %#v cluster: %#v", status, ok, host, cluster))
+			Expect(status).To(Equal(validationStatus), fmt.Sprintf("debuuging info: host: %#v cluster: %#v", host, cluster))
+		},
+
+			Entry("isMtuValidInMachineNetwork (CMN) - Happy flow - all reports where both sourceIP and remoteIP are within the machine network are successful", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},  // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"}, // sourceIP in machine net, remoteIP not
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth1"}, // remoteIP in machine net, sourceIP not
+			}, mNet, ValidationSuccess, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Bad flow - at least one report where both sourceIP and remoteIP are within the machine network is unsuccessful", []*models.MtuReport{
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"}, // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},  // sourceIP in machine net, remoteIP not
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth1"},  // remoteIP in machine net, sourceIP not
+			}, mNet, ValidationFailure, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Happy flow - all reports where both sourceIP and remoteIP are within any of the machine networks are successful", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},  // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},  // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.5.5", OutgoingNic: "eth0"}, // sourceIP in machine net, remoteIP not
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth1"}, // remoteIP in machine net, sourceIP not
+			}, multipleMNets, ValidationSuccess, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Bad flow - at least one report where both sourceIP and remoteIP are within any of the machine networks is unsuccessful", []*models.MtuReport{
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"}, // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},  // sourceIP and remoteIP are in machine net
+			}, multipleMNets, ValidationFailure, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Happy flow - Dual stack", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1001:db8::11", OutgoingNic: "eth0"}, // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},      // sourceIP and remoteIP are in machine net
+			}, common.TestDualStackNetworking.MachineNetworks, ValidationSuccess, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Bad flow - Dual stack", []*models.MtuReport{
+				{MtuSuccessful: false, RemoteIPAddress: "1001:db8::11", OutgoingNic: "eth0"}, // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},       // sourceIP and remoteIP are in machine net
+			}, common.TestDualStackNetworking.MachineNetworks, ValidationFailure, false, false, ""),
+			Entry("isMtuValidInMachineNetwork (CMN) - Happy flow - Dual stack, source nic has IPv6 and IPv4, IPv4 in machine net, IPv6 isn't in machine net, remoteIP in machine network.", []*models.MtuReport{
+				{MtuSuccessful: false, RemoteIPAddress: "1001:db8::11", OutgoingNic: "eth1"}, // sourceIP and remoteIP are in machine net
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth1"},       // sourceIP and remoteIP are in machine net
+			}, common.TestDualStackNetworking.MachineNetworks, ValidationSuccess, false, false, common.GenerateHostInventoryInterfaceIPV4InMNetIPV6Doesnt(func(inventory *models.Inventory) {})),
+			Entry("isMtuValidAllInterfaces (UMN) - Happy flow - all reports successful", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},
+			}, mNet, ValidationSuccess, true, false, ""),
+			Entry("isMtuValidAllInterfaces (UMN) - Bad flow - at least one unsucessfull report", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.3.5", OutgoingNic: "eth0"},
+				{MtuSuccessful: false, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},
+			}, mNet, ValidationFailure, true, false, ""),
+			Entry("isMtuValidAllInterfaces (UMN) - Happy flow - Dual stack, all reports successful", []*models.MtuReport{
+				{MtuSuccessful: true, RemoteIPAddress: "1001:db8::11", OutgoingNic: "eth0"},
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},
+			}, common.TestDualStackNetworking.MachineNetworks, ValidationSuccess, true, false, ""),
+			Entry("isMtuValidAllInterfaces (UMN) - Bad flow - Dual stack, at least one unsucessfull report", []*models.MtuReport{
+				{MtuSuccessful: false, RemoteIPAddress: "1001:db9::11", OutgoingNic: "eth0"},
+				{MtuSuccessful: true, RemoteIPAddress: "1.2.4.5", OutgoingNic: "eth0"},
+			}, common.TestDualStackNetworking.MachineNetworks, ValidationFailure, true, false, ""),
+			Entry("Day 2 cluster - the validation should be skipped", []*models.MtuReport{}, mNet, ValidationSuccess, false, true, ""),
+		)
+	})
+
+	Context("belongsToL2MajorityGroup", func() {
+		var (
+			ctx                                  = context.Background()
+			kubeApiEnabled                       = false
+			softTimeoutsEnabled                  = false
+			infraenv            *common.InfraEnv = nil
+			s3wrapper           s3wrapper.API    = nil
+			validator                            = &validator{log: common.GetTestLog()}
+			inventoryCache                       = InventoryCache{}
+		)
+
+		BeforeEach(func() {
+			mockHwValidator.EXPECT().GetInfraEnvHostRequirements(gomock.Any(), gomock.Any()).Return(&models.ClusterHostRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetPreflightInfraEnvHardwareRequirements(gomock.Any(), gomock.Any()).Return(&models.PreflightHardwareRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetClusterHostRequirements(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(&models.ClusterHostRequirements{
+				Total: &models.ClusterHostRequirementsDetails{},
+			}, nil)
+			mockHwValidator.EXPECT().GetPreflightHardwareRequirements(gomock.Any(), gomock.Any()).AnyTimes().Return(&models.PreflightHardwareRequirements{
+				Ocp: &models.HostTypeHardwareRequirementsWrapper{
+					Worker: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+					Master: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+				},
+			}, nil)
+		})
+
+		It("should return validation success when all machine networks exist in the majority group", func() {
+			machineNetworks := []*models.MachineNetwork{
+				{
+					ClusterID: clusterID,
+					Cidr:      "192.168.127.0/24",
+				},
+			}
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: machineNetworks,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				},
+			}
+			majorityGroups := map[string][]strfmt.UUID{
+				"192.168.127.0/24": {*host.ID},
+			}
+
+			vc, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status := validator.belongsToL2MajorityGroup(vc, majorityGroups)
+			Expect(status).To(Equal(ValidationSuccess))
+		})
+
+		It("should return validation failure when machine network is not in the majority groups", func() {
+			machineNetworks := []*models.MachineNetwork{
+				{
+					ClusterID: clusterID,
+					Cidr:      "192.168.127.0/24",
+				},
+			}
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: machineNetworks,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				},
+			}
+			majorityGroups := map[string][]strfmt.UUID{
+				"192.168.128.0/24": {*host.ID},
+			}
+
+			vc, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status := validator.belongsToL2MajorityGroup(vc, majorityGroups)
+			Expect(status).To(Equal(ValidationFailure))
+		})
+
+		It("should return validation failure when one of the machine networs is not in the majority groups", func() {
+			machineNetworks := []*models.MachineNetwork{
+				{
+					ClusterID: clusterID,
+					Cidr:      "192.168.127.0/24",
+				},
+				{
+					ClusterID: clusterID,
+					Cidr:      "192.168.128.0/24",
+				},
+			}
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:              &clusterID,
+					MachineNetworks: machineNetworks,
+					LoadBalancer:    &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				},
+			}
+			majorityGroups := map[string][]strfmt.UUID{
+				"192.168.127.0/24": {*host.ID},
+			}
+
+			vc, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status := validator.belongsToL2MajorityGroup(vc, majorityGroups)
+			Expect(status).To(Equal(ValidationFailure))
+		})
+	})
+
+	Context("belongsToMajorityGroup", func() {
+		var (
+			ctx                                  = context.Background()
+			kubeApiEnabled                       = false
+			softTimeoutsEnabled                  = false
+			infraenv            *common.InfraEnv = nil
+			s3wrapper           s3wrapper.API    = nil
+			validator                            = &validator{log: common.GetTestLog()}
+			inventoryCache                       = InventoryCache{}
+		)
+
+		BeforeEach(func() {
+			infraenv = nil
+			mockHwValidator.EXPECT().GetInfraEnvHostRequirements(gomock.Any(), gomock.Any()).Return(&models.ClusterHostRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetPreflightInfraEnvHardwareRequirements(gomock.Any(), gomock.Any()).Return(&models.PreflightHardwareRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetClusterHostRequirements(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(&models.ClusterHostRequirements{
+				Total: &models.ClusterHostRequirementsDetails{},
+			}, nil)
+			mockHwValidator.EXPECT().GetPreflightHardwareRequirements(gomock.Any(), gomock.Any()).AnyTimes().Return(&models.PreflightHardwareRequirements{
+				Ocp: &models.HostTypeHardwareRequirementsWrapper{
+					Worker: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+					Master: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+				},
+			}, nil)
+		})
+
+		It("should return success without output when infraenv is not nil", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+				},
+			}
+			infraenv = &common.InfraEnv{
+				InfraEnv: models.InfraEnv{
+					ClusterID: clusterID,
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccessSuppressOutput))
+			Expect(msg).To(Equal(""))
+		})
+
+		It("should return success when host is day2", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Kind:      swag.String(models.HostKindAddToExistingClusterHost),
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Day2 host is not required to be connected to other hosts in the cluster"))
+		})
+
+		It("should return success when cluster is SNO", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                &clusterID,
+					ControlPlaneCount: 1,
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host has connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return pending when cluster is missing connectivity majority groups", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationPending))
+			Expect(msg).To(Equal("Machine Network CIDR or Connectivity Majority Groups missing"))
+		})
+
+		It("should return error when cluster connectivity majority groups field is not a valid json", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					ConnectivityMajorityGroups: "non-valid-json",
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationError))
+			Expect(msg).To(Equal("Parse error for connectivity majority group"))
+		})
+
+		It("should return success for L3 connected user-managed networking cluster", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.128.1"
+			host3IP := "192.168.129.1"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				L3ConnectedAddresses: map[strfmt.UUID][]string{
+					hostID1: {host1IP},
+					hostID2: {host2IP},
+					hostID3: {host3IP},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					UserManagedNetworking:      swag.Bool(true),
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host has connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return failure for L3 non-connected user-managed networking cluster", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.128.1"
+			host3IP := "192.168.129.1"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				L3ConnectedAddresses: map[strfmt.UUID][]string{
+					hostID2: {host2IP},
+					hostID3: {host3IP},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					UserManagedNetworking:      swag.Bool(true),
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(Equal("No connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return success for L3 connected user-managed load balancer", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.128.1"
+			host3IP := "192.168.129.1"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				L3ConnectedAddresses: map[strfmt.UUID][]string{
+					hostID1: {host1IP},
+					hostID2: {host2IP},
+					hostID3: {host3IP},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					LoadBalancer:               &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host has connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return failure for L3 non-connected user-managed load balancer cluster", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.128.1"
+			host3IP := "192.168.129.1"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				L3ConnectedAddresses: map[strfmt.UUID][]string{
+					hostID2: {host2IP},
+					hostID3: {host3IP},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					LoadBalancer:               &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(Equal("No connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return success for L2 connected cluster-managed load balancer cluster", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.127.2"
+			host3IP := "192.168.127.3"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				MajorityGroups: map[string][]strfmt.UUID{
+					"192.168.127.0/24": {hostID1, hostID2, hostID3},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					LoadBalancer:               &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host has connectivity to the majority of hosts in the cluster"))
+		})
+
+		It("should return failure for L2 non-connected cluster-managed load balancer cluster", func() {
+			hostID1 := strfmt.UUID(uuid.New().String())
+			hostID2 := strfmt.UUID(uuid.New().String())
+			hostID3 := strfmt.UUID(uuid.New().String())
+
+			host1IP := "192.168.127.1"
+			host2IP := "192.168.127.2"
+			host3IP := "192.168.127.3"
+
+			host1 := &models.Host{
+				ID:        &hostID1,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host1IP},
+				}),
+			}
+
+			host2 := &models.Host{
+				ID:        &hostID2,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host2IP},
+				}),
+			}
+
+			host3 := &models.Host{
+				ID:        &hostID3,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{host3IP},
+				}),
+			}
+
+			connectivity := network.Connectivity{
+				MajorityGroups: map[string][]strfmt.UUID{
+					"192.168.127.0/24": {hostID2, hostID3},
+				},
+			}
+			bytes, err := json.Marshal(connectivity)
+			Expect(err).NotTo(HaveOccurred())
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:                         &clusterID,
+					LoadBalancer:               &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+					ConnectivityMajorityGroups: string(bytes),
+					Hosts:                      []*models.Host{host1, host2, host3},
+					MachineNetworks: []*models.MachineNetwork{
+						{Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host1,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			status, msg := validator.belongsToMajorityGroup(validationContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(Equal("No connectivity to the majority of hosts in the cluster"))
+		})
+	})
+
+	Context("belongsToMachineCidr", func() {
+		var (
+			ctx                                  = context.Background()
+			kubeApiEnabled                       = false
+			softTimeoutsEnabled                  = false
+			infraenv            *common.InfraEnv = nil
+			s3wrapper           s3wrapper.API    = nil
+			validator                            = &validator{log: common.GetTestLog()}
+			inventoryCache                       = InventoryCache{}
+		)
+
+		BeforeEach(func() {
+			mockHwValidator.EXPECT().GetInfraEnvHostRequirements(gomock.Any(), gomock.Any()).Return(&models.ClusterHostRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetPreflightInfraEnvHardwareRequirements(gomock.Any(), gomock.Any()).Return(&models.PreflightHardwareRequirements{}, nil).AnyTimes()
+			mockHwValidator.EXPECT().GetClusterHostRequirements(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return(&models.ClusterHostRequirements{
+				Total: &models.ClusterHostRequirementsDetails{},
+			}, nil)
+			mockHwValidator.EXPECT().GetPreflightHardwareRequirements(gomock.Any(), gomock.Any()).AnyTimes().Return(&models.PreflightHardwareRequirements{
+				Ocp: &models.HostTypeHardwareRequirementsWrapper{
+					Worker: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+					Master: &models.HostTypeHardwareRequirements{
+						Quantitative: &models.ClusterHostRequirementsDetails{},
+					},
+				},
+			}, nil)
+		})
+
+		It("with user-managed networking, SNO, host is not bootstrap, there are machine networks", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					UserManagedNetworking: swag.Bool(true),
+					MachineNetworks: []*models.MachineNetwork{
+						{ClusterID: clusterID, Cidr: "192.168.127.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("No machine network CIDR validation needed: User Managed Networking"))
+		})
+
+		It("with user-managed networking, SNO, host is bootstrap, no machine networks", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Bootstrap: true,
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					UserManagedNetworking: swag.Bool(true),
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("No machine network CIDR validation needed: User Managed Networking"))
+		})
+
+		It("with day2 cluster", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					Kind: swag.String(models.ClusterKindAddHostsCluster),
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("No machine network CIDR validation needed: Day2 cluster"))
+		})
+
+		It("with host misses inventory", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationPending))
+			Expect(msg).To(Equal("Missing inventory or machine network CIDR"))
+		})
+
+		It("with host misses machine network", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventory(),
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationPending))
+			Expect(msg).To(Equal("Missing inventory or machine network CIDR"))
+		})
+
+		It("with cluster-managed load balancer, host belongs to all machine networks", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{"1.2.3.5/24"},
+				}),
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					MachineNetworks: []*models.MachineNetwork{
+						{ClusterID: clusterID, Cidr: "1.2.3.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host belongs to all machine network CIDRs"))
+		})
+
+		It("with cluster-managed load balancer, host doesn't belongs to all machine networks", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{"1.2.3.5/24"},
+				}),
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					MachineNetworks: []*models.MachineNetwork{
+						{ClusterID: clusterID, Cidr: "1.2.4.0/24"},
+					},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(Equal("Host does not belong to machine network CIDRs. Verify that the host belongs to every CIDR listed under machine networks"))
+		})
+
+		It("with user-managed load balancer, host belongs to some of the machine networks", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{"1.2.4.5/24"},
+				}),
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					MachineNetworks: []*models.MachineNetwork{
+						{ClusterID: clusterID, Cidr: "1.2.3.0/24"},
+						{ClusterID: clusterID, Cidr: "1.2.4.0/24"},
+					},
+					LoadBalancer: &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationSuccess))
+			Expect(msg).To(Equal("Host belongs to at least one machine network CIDR"))
+		})
+
+		It("with user-managed load balancer, host doesn't belongs to any machine network", func() {
+			host := &models.Host{
+				ID:        &hostID,
+				ClusterID: &clusterID,
+				Role:      models.HostRoleMaster,
+				Inventory: common.GenerateTestInventoryWithNetwork(common.NetAddress{
+					IPv4Address: []string{"1.2.5.5/24"},
+				}),
+			}
+
+			cluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID: &clusterID,
+					Hosts: []*models.Host{
+						host,
+					},
+					MachineNetworks: []*models.MachineNetwork{
+						{ClusterID: clusterID, Cidr: "1.2.3.0/24"},
+						{ClusterID: clusterID, Cidr: "1.2.4.0/24"},
+					},
+					LoadBalancer: &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				},
+			}
+
+			validationContext, err := newValidationContext(
+				ctx,
+				host,
+				cluster,
+				infraenv,
+				db,
+				inventoryCache,
+				mockHwValidator,
+				kubeApiEnabled,
+				s3wrapper,
+				softTimeoutsEnabled,
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			status, msg := validator.belongsToMachineCidr(validationContext)
+			Expect(status).To(Equal(ValidationFailure))
+			Expect(msg).To(Equal("Host does not belong to any machine network CIDR. Verify that the host belongs to at least one CIDR listed under machine networks"))
 		})
 	})
 })

@@ -1,121 +1,186 @@
 package spoke_k8s_client
 
 import (
-	context "context"
 	"fmt"
-	"io"
+	"net/http"
 
-	strfmt "github.com/go-openapi/strfmt"
-	"github.com/openshift/assisted-service/internal/constants"
-	s3wrapper "github.com/openshift/assisted-service/pkg/s3wrapper"
+	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/system"
+	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	client "sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 //go:generate mockgen --build_flags=--mod=mod -package=spoke_k8s_client -destination=mock_spoke_k8s_client_factory.go . SpokeK8sClientFactory
 type SpokeK8sClientFactory interface {
-	CreateFromSecret(secret *corev1.Secret) (SpokeK8sClient, error)
-	CreateFromRawKubeconfig(kubeconfig []byte) (SpokeK8sClient, error)
-	CreateFromStorageKubeconfig(ctx context.Context, clusterId *strfmt.UUID, objectHandler s3wrapper.API) (SpokeK8sClient, error)
-	ClientAndSetFromSecret(secret *corev1.Secret) (SpokeK8sClient, *kubernetes.Clientset, error)
+	CreateFromSecret(deployment *hivev1.ClusterDeployment, secret *corev1.Secret) (SpokeK8sClient, error)
+	ClientAndSetFromSecret(deployment *hivev1.ClusterDeployment, secret *corev1.Secret) (SpokeK8sClient, *kubernetes.Clientset, error)
 }
 
 type spokeK8sClientFactory struct {
-	log logrus.FieldLogger
+	logger           logrus.FieldLogger
+	transportWrapper func(http.RoundTripper) http.RoundTripper
+	sys              system.SystemInfo
 }
 
-func NewSpokeK8sClientFactory(log logrus.FieldLogger) SpokeK8sClientFactory {
-	return &spokeK8sClientFactory{
-		log: log,
+// NewFactory creates a spoke client factory. The logger and the hubClient are mandatory, the transport wrappers are
+// optional.
+func NewFactory(logger logrus.FieldLogger,
+	transportWrapper func(http.RoundTripper) http.RoundTripper, sys system.SystemInfo) (SpokeK8sClientFactory, error) {
+	// Check parameters:
+	if logger == nil {
+		return nil, errors.New("logger is mandatory")
 	}
+	if sys == nil {
+		return nil, errors.New("sys is mandatory")
+	}
+
+	// Create and populate the object:
+	result := &spokeK8sClientFactory{
+		logger:           logger,
+		transportWrapper: transportWrapper,
+		sys:              sys,
+	}
+	return result, nil
 }
 
-func (cf *spokeK8sClientFactory) CreateFromRawKubeconfig(kubeconfig []byte) (SpokeK8sClient, error) {
-	client, _, err := cf.clientAndSetForKubeconfig(kubeconfig)
+func (f *spokeK8sClientFactory) CreateFromSecret(deployment *hivev1.ClusterDeployment,
+	secret *corev1.Secret) (SpokeK8sClient, error) {
+	client, _, err := f.ClientAndSetFromSecret(deployment, secret)
 	return client, err
-
 }
 
-func (cf *spokeK8sClientFactory) CreateFromSecret(secret *corev1.Secret) (SpokeK8sClient, error) {
-	kubeconfigData, err := KubeconfigFromSecret(secret)
+func (f *spokeK8sClientFactory) ClientAndSetFromSecret(deployment *hivev1.ClusterDeployment,
+	secret *corev1.Secret) (SpokeK8sClient, *kubernetes.Clientset, error) {
+	// Create the REST configuration from the content of the secret:
+	restConfig, err := f.restConfigFromSecret(secret)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// If the cluster's API certificates were changed, the existing kubeconfig will receive certificate errors.
+	// So we merge the system CA bundle (created by the AgentServiceConfig controller) into the rest config.
+	if err = f.mergeSystemCABundleIntoRestConfig(restConfig); err != nil {
+		f.logger.WithError(err).Error("failed to merge system CA bundle with rest config")
+		return nil, nil, err
+	}
+
+	// If the secret is from a hosted cluster then the API server address can be replaced by a
+	// 'kube-apiserver.*.svc' address that uses the service network and therefore reduces the number of round trips
+	// and doesn't need to go via proxies.
+	if f.isHostedCluster(deployment) {
+		err = f.modifyRestConfigForHostedCluster(deployment, restConfig)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// Add the transport wrapper:
+	if f.transportWrapper != nil {
+		restConfig.Wrap(f.transportWrapper)
+	}
+
+	// Create the controller-runtime client:
+	client, err := f.clientFromRestConfig(restConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create the client-go client:
+	clientSet, err := f.clientSetFromRestConfig(restConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create and populate the object:
+	result := &spokeK8sClient{
+		logger:      f.logger,
+		Client:      client,
+		csrClient:   clientSet.CertificatesV1().CertificateSigningRequests(),
+		sarClient:   clientSet.AuthorizationV1().SelfSubjectAccessReviews(),
+		nodesClient: clientSet.CoreV1().Nodes(),
+	}
+	return result, clientSet, nil
+}
+
+func (f *spokeK8sClientFactory) mergeSystemCABundleIntoRestConfig(restConfig *rest.Config) error {
+	sysPEM, err := f.sys.GetSystemCABundle()
+	if err != nil {
+		return err
+	}
+
+	bundle := string(restConfig.CAData) + "\n" + string(sysPEM)
+	caBundle, _, err := common.RemoveDuplicatesFromCaBundle(bundle)
+	if err != nil {
+		return err
+	}
+	restConfig.CAData = []byte(caBundle)
+	return nil
+}
+
+func (f *spokeK8sClientFactory) restConfigFromSecret(secret *corev1.Secret) (*rest.Config, error) {
+	kubeConfig, err := f.kubeConfigFromSecret(secret)
 	if err != nil {
 		return nil, err
 	}
-	return cf.CreateFromRawKubeconfig(kubeconfigData)
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeConfig)
+	if err != nil {
+		return nil, err
+	}
+	return clientConfig.ClientConfig()
 }
 
-func (cf *spokeK8sClientFactory) CreateFromStorageKubeconfig(ctx context.Context, clusterId *strfmt.UUID, objectHandler s3wrapper.API) (SpokeK8sClient, error) {
-	kubeConfigReader, contentLength, err := objectHandler.Download(ctx, fmt.Sprintf("%s/%s", clusterId, constants.Kubeconfig))
-	if err != nil {
-		return nil, fmt.Errorf("could not load kubeconfig from internal storage with cluster id %s and filename %s: %w", clusterId, constants.Kubeconfig, err)
+func (f *spokeK8sClientFactory) kubeConfigFromSecret(secret *corev1.Secret) ([]byte, error) {
+	if len(secret.Data) == 0 {
+		err := errors.Errorf("secret '%s/%s' is empty", secret.Namespace, secret.Name)
+		return nil, err
 	}
-
-	kubeconfig := make([]byte, contentLength)
-	bytesRead, err := io.ReadAtLeast(kubeConfigReader, kubeconfig, int(contentLength))
-	if err != nil {
-		return nil, fmt.Errorf("could not read spoke cluster kubeconfig from internal storage with cluster id %s and filename %s: %w", clusterId, constants.Kubeconfig, err)
+	result, ok := secret.Data["kubeconfig"]
+	if !ok || len(result) == 0 {
+		err := errors.Errorf(
+			"secret '%s/%s' doesn't contain the 'kubeconfig' key",
+			secret.Namespace, secret.Name,
+		)
+		return nil, err
 	}
-	if bytesRead > int(contentLength) {
-		return nil, fmt.Errorf("too many bytes read when reading spoke cluster kubeconfig from internal storage with cluster id %s and filename %s", clusterId, constants.Kubeconfig)
-	}
-	return cf.CreateFromRawKubeconfig(kubeconfig)
+	return result, nil
 }
 
-func (cf *spokeK8sClientFactory) ClientAndSetFromSecret(secret *corev1.Secret) (SpokeK8sClient, *kubernetes.Clientset, error) {
-	kubeconfig, err := KubeconfigFromSecret(secret)
-	if err != nil {
-		cf.log.WithError(err).Error("failed to get kubeconfig from secret")
-		return nil, nil, err
-	}
-
-	return cf.clientAndSetForKubeconfig(kubeconfig)
-}
-
-func KubeconfigFromSecret(secret *corev1.Secret) ([]byte, error) {
-	if secret.Data == nil {
-		return nil, errors.Errorf("Secret %s/%s  does not contain any data", secret.Namespace, secret.Name)
-	}
-	kubeconfigData, ok := secret.Data["kubeconfig"]
-	if !ok || len(kubeconfigData) == 0 {
-		return nil, errors.Errorf("Secret data for %s/%s  does not contain kubeconfig", secret.Namespace, secret.Name)
-	}
-	return kubeconfigData, nil
-}
-
-func (cf *spokeK8sClientFactory) clientAndSetForKubeconfig(kubeconfig []byte) (SpokeK8sClient, *kubernetes.Clientset, error) {
-	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeconfig)
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to get clientconfig from kubeconfig data")
-	}
-
-	restConfig, err := clientConfig.ClientConfig()
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "failed to get restconfig for kube client")
-	}
-
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		cf.log.WithError(err).Warnf("Getting kuberenetes config for cluster")
-		return nil, nil, err
-	}
-
+func (f *spokeK8sClientFactory) clientFromRestConfig(restConfig *rest.Config) (ctrlclient.Client, error) {
 	schemes := GetKubeClientSchemes()
-	targetClient, err := client.New(restConfig, client.Options{Scheme: schemes})
-	if err != nil {
-		cf.log.WithError(err).Warnf("failed to get spoke kube client")
-		return nil, nil, err
+	return ctrlclient.New(restConfig, ctrlclient.Options{Scheme: schemes})
+}
+
+func (f *spokeK8sClientFactory) clientSetFromRestConfig(restConfig *rest.Config) (*kubernetes.Clientset, error) {
+	return kubernetes.NewForConfig(restConfig)
+}
+
+// isHostedCluster determines if the given cluster deployment belongs to a hosted cluster.
+func (f *spokeK8sClientFactory) isHostedCluster(deployment *hivev1.ClusterDeployment) bool {
+	// We assume that it isn't a hosted cluster if the caller didn't pass a cluster deployment:
+	if deployment == nil {
+		return false
 	}
 
-	spokeClient := &spokeK8sClient{
-		Client:      targetClient,
-		csrClient:   clientset.CertificatesV1().CertificateSigningRequests(),
-		sarClient:   clientset.AuthorizationV1().SelfSubjectAccessReviews(),
-		nodesClient: clientset.CoreV1().Nodes(),
-		log:         cf.log,
-	}
-	return spokeClient, clientset, nil
+	// We assume this is a hosted cluster if it has the 'agentClusterRef' label, no matter the value.
+	_, result := deployment.Labels["agentClusterRef"]
+	return result
+}
+
+func (f *spokeK8sClientFactory) modifyRestConfigForHostedCluster(deployment *hivev1.ClusterDeployment,
+	restConfig *rest.Config) error {
+	originalHost := restConfig.Host
+	restConfig.Host = fmt.Sprintf("https://kube-apiserver.%s.svc:6443", deployment.Namespace)
+	f.logger.WithFields(logrus.Fields{
+		"namespace": deployment.Namespace,
+		"name":      deployment.Name,
+		"original":  originalHost,
+		"modified":  restConfig.Host,
+	}).Info("Modified hosted cluster API server address to connect via the service network")
+	return nil
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -11,14 +13,16 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/thoas/go-funk"
+	"golang.org/x/sys/unix"
 	"gorm.io/gorm"
 )
 
 func IsDefaultRoute(r *models.Route) (bool, error) {
 	gw := net.ParseIP(r.Gateway)
 	if gw == nil {
-		return false, nil //gateway is empty for non default routes
+		return false, nil // gateway is empty for non default routes
 	}
 
 	dst := net.ParseIP(r.Destination)
@@ -27,6 +31,22 @@ func IsDefaultRoute(r *models.Route) (bool, error) {
 	}
 
 	return dst.IsUnspecified() && !gw.IsUnspecified(), nil
+}
+
+// Returns every IPv4 or IPv6 default route
+func GetDefaultRoutesByFamily(routes []*models.Route, ipv6 bool) []*models.Route {
+	family := unix.AF_INET
+	if ipv6 {
+		family = unix.AF_INET6
+	}
+
+	return lo.Filter(routes, func(r *models.Route, index int) bool {
+		if int(r.Family) == family {
+			isDefault, _ := IsDefaultRoute(r)
+			return isDefault
+		}
+		return false
+	})
 }
 
 // Obtains the IP addresses used by a host
@@ -83,7 +103,6 @@ func GetClusterAddressStack(hosts []*models.Host) (bool, bool, error) {
 // Get configured address families from cluster configuration based on the CIDRs (machine-network-cidr, cluster-network-cidr,
 // service-network-cidr)
 func GetConfiguredAddressFamilies(cluster *common.Cluster) (ipv4 bool, ipv6 bool, err error) {
-
 	for _, cidr := range common.GetNetworksCidrs(cluster) {
 		if cidr == nil || *cidr == "" {
 			continue
@@ -177,6 +196,15 @@ func DerefClusterNetworks(obj interface{}) []*models.ClusterNetwork {
 	}
 }
 
+func DerefClusterLoadBalancer(obj interface{}) *models.LoadBalancer {
+	switch v := obj.(type) {
+	case *models.LoadBalancer:
+		return v
+	default:
+		return nil
+	}
+}
+
 func GetMachineNetworkCidrs(cluster *common.Cluster) (ret []string) {
 	for _, n := range cluster.MachineNetworks {
 		ret = append(ret, string(n.Cidr))
@@ -202,7 +230,7 @@ func GetApiVips(cluster *common.Cluster) (ret []string) {
 	if cluster.APIVips == nil {
 		return nil
 	}
-	ret = funk.Map(cluster.APIVips, func(x *models.APIVip) string { return string(x.IP) }).([]string)
+	ret = lo.Map(cluster.APIVips, func(x *models.APIVip, index int) string { return string(x.IP) })
 	return
 }
 
@@ -210,7 +238,7 @@ func GetIngressVips(cluster *common.Cluster) (ret []string) {
 	if cluster.IngressVips == nil {
 		return nil
 	}
-	ret = funk.Map(cluster.IngressVips, func(x *models.IngressVip) string { return string(x.IP) }).([]string)
+	ret = lo.Map(cluster.IngressVips, func(x *models.IngressVip, index int) string { return string(x.IP) })
 	return
 }
 
@@ -335,7 +363,7 @@ func areListsEquivalent(len1, len2 int, areItemsEquivalent func(int, int) bool) 
 	var usedIndexes []int
 	containsEquivalentItem := func(index, length int) bool {
 		for i := 0; i != length; i++ {
-			if !funk.ContainsInt(usedIndexes, i) && areItemsEquivalent(index, i) {
+			if !lo.Contains(usedIndexes, i) && areItemsEquivalent(index, i) {
 				usedIndexes = append(usedIndexes, i)
 				return true
 			}
@@ -350,24 +378,205 @@ func areListsEquivalent(len1, len2 int, areItemsEquivalent func(int, int) bool) 
 	return true
 }
 
+// Helper function to check dual-stack for CIDR-based items
+func isDualStackCIDRItems(getCIDR func(int) string, length int) bool {
+	hasIPv4 := false
+	hasIPv6 := false
+
+	for i := 0; i < length; i++ {
+		cidr := getCIDR(i)
+		if IsIPV4CIDR(cidr) {
+			hasIPv4 = true
+		} else if IsIPv6CIDR(cidr) {
+			hasIPv6 = true
+		}
+		if hasIPv4 && hasIPv6 {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to check dual-stack for IP-based items
+func isDualStackIPItems(getIP func(int) string, length int) bool {
+	hasIPv4 := false
+	hasIPv6 := false
+
+	for i := 0; i < length; i++ {
+		ip := getIP(i)
+		if IsIPv4Addr(ip) {
+			hasIPv4 = true
+		} else if IsIPv6Addr(ip) {
+			hasIPv6 = true
+		}
+		if hasIPv4 && hasIPv6 {
+			return true
+		}
+	}
+	return false
+}
+
+// Generic function to check if a list of networks/VIPs is dual-stack
+func isDualStackItems(items interface{}) bool {
+	switch v := items.(type) {
+	case []*models.MachineNetwork:
+		return isDualStackCIDRItems(func(i int) string { return string(v[i].Cidr) }, len(v))
+	case []*models.ServiceNetwork:
+		return isDualStackCIDRItems(func(i int) string { return string(v[i].Cidr) }, len(v))
+	case []*models.ClusterNetwork:
+		return isDualStackCIDRItems(func(i int) string { return string(v[i].Cidr) }, len(v))
+	case []*models.APIVip:
+		return isDualStackIPItems(func(i int) string { return string(v[i].IP) }, len(v))
+	case []*models.IngressVip:
+		return isDualStackIPItems(func(i int) string { return string(v[i].IP) }, len(v))
+	default:
+		return false
+	}
+}
+
+// OrderNetworksByPrimaryStack is a single function to order any dual-stack network list by primary IP stack
+func OrderNetworksByPrimaryStack(items interface{}, primaryStack common.PrimaryIPStack) interface{} {
+	v := reflect.ValueOf(items)
+
+	// Check if it's a slice with exactly 2 elements
+	if v.Kind() != reflect.Slice || v.Len() != 2 {
+		return items
+	}
+
+	// Get IP strings from first and second items
+	firstIP := getIPFromNetworkItem(v.Index(0).Interface())
+	secondIP := getIPFromNetworkItem(v.Index(1).Interface())
+
+	// If we can't extract IPs, return as-is
+	if firstIP == "" || secondIP == "" {
+		return items
+	}
+
+	// Check if we need to swap
+	shouldSwap := false
+	if primaryStack == common.PrimaryIPStackV6 {
+		// Want IPv6 first: swap if first is IPv4 and second is IPv6
+		shouldSwap = (IsIPV4CIDR(firstIP) || IsIPv4Addr(firstIP)) && (IsIPv6CIDR(secondIP) || IsIPv6Addr(secondIP))
+	} else {
+		// Want IPv4 first: swap if first is IPv6 and second is IPv4
+		shouldSwap = (IsIPv6CIDR(firstIP) || IsIPv6Addr(firstIP)) && (IsIPV4CIDR(secondIP) || IsIPv4Addr(secondIP))
+	}
+
+	if shouldSwap {
+		// Create new slice with swapped elements
+		result := reflect.MakeSlice(v.Type(), 2, 2)
+		result.Index(0).Set(v.Index(1))
+		result.Index(1).Set(v.Index(0))
+		return result.Interface()
+	}
+
+	return items
+}
+
+// Helper function to extract IP string from any network item type
+func getIPFromNetworkItem(item interface{}) string {
+	switch v := item.(type) {
+	case *models.MachineNetwork:
+		if v != nil {
+			return string(v.Cidr)
+		}
+	case *models.ServiceNetwork:
+		if v != nil {
+			return string(v.Cidr)
+		}
+	case *models.ClusterNetwork:
+		if v != nil {
+			return string(v.Cidr)
+		}
+	case *models.APIVip:
+		if v != nil {
+			return string(v.IP)
+		}
+	case *models.IngressVip:
+		if v != nil {
+			return string(v.IP)
+		}
+	}
+	return ""
+}
+
 func AreMachineNetworksIdentical(n1, n2 []*models.MachineNetwork) bool {
-	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr == n2[j].Cidr })
+	if isDualStackItems(n1) && isDualStackItems(n2) {
+		// For dual-stack, order matters - use exact order comparison
+		if len(n1) != len(n2) {
+			return false
+		}
+		for i := 0; i < len(n1); i++ {
+			if !n1[i].Cidr.Equal(n2[i].Cidr) {
+				return false
+			}
+		}
+		return true
+	}
+	// For non-dual-stack, use original order-agnostic comparison
+	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr.Equal(n2[j].Cidr) })
 }
 
 func AreServiceNetworksIdentical(n1, n2 []*models.ServiceNetwork) bool {
-	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr == n2[j].Cidr })
+	if isDualStackItems(n1) && isDualStackItems(n2) {
+		// For dual-stack, order matters
+		if len(n1) != len(n2) {
+			return false
+		}
+		for i := 0; i < len(n1); i++ {
+			if !n1[i].Cidr.Equal(n2[i].Cidr) {
+				return false
+			}
+		}
+		return true
+	}
+	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr.Equal(n2[j].Cidr) })
 }
 
 func AreClusterNetworksIdentical(n1, n2 []*models.ClusterNetwork) bool {
-	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr == n2[j].Cidr && n1[i].HostPrefix == n2[j].HostPrefix })
+	if isDualStackItems(n1) && isDualStackItems(n2) {
+		// For dual-stack, order matters
+		if len(n1) != len(n2) {
+			return false
+		}
+		for i := 0; i < len(n1); i++ {
+			if !n1[i].Cidr.Equal(n2[i].Cidr) || n1[i].HostPrefix != n2[i].HostPrefix {
+				return false
+			}
+		}
+		return true
+	}
+	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].Cidr.Equal(n2[j].Cidr) && n1[i].HostPrefix == n2[j].HostPrefix })
 }
 
 func AreApiVipsIdentical(n1, n2 []*models.APIVip) bool {
-	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].IP == n2[j].IP })
+	if isDualStackItems(n1) && isDualStackItems(n2) {
+		if len(n1) != len(n2) {
+			return false
+		}
+		for i := 0; i < len(n1); i++ {
+			if !n1[i].IP.Equal(n2[i].IP) {
+				return false
+			}
+		}
+		return true
+	}
+	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].IP.Equal(n2[j].IP) })
 }
 
 func AreIngressVipsIdentical(n1, n2 []*models.IngressVip) bool {
-	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].IP == n2[j].IP })
+	if isDualStackItems(n1) && isDualStackItems(n2) {
+		if len(n1) != len(n2) {
+			return false
+		}
+		for i := 0; i < len(n1); i++ {
+			if !n1[i].IP.Equal(n2[i].IP) {
+				return false
+			}
+		}
+		return true
+	}
+	return areListsEquivalent(len(n1), len(n2), func(i, j int) bool { return n1[i].IP.Equal(n2[j].IP) })
 }
 
 func UpdateVipsTables(db *gorm.DB, cluster *common.Cluster, apiVipUpdated bool, ingressVipUpdated bool) error {
@@ -417,4 +626,115 @@ func UpdateVipsTables(db *gorm.DB, cluster *common.Cluster, apiVipUpdated bool, 
 	}
 
 	return nil
+}
+
+// Find the interface on which the given IP (v4 or v6) is set.
+func FindInterfaceByIP(ip netip.Addr, interfaces []*models.Interface) (*models.Interface, error) {
+	for _, intf := range interfaces {
+		addresses := intf.IPV4Addresses
+		addresses = append(addresses, intf.IPV6Addresses...)
+		for _, address := range addresses {
+			prefix, err := netip.ParsePrefix(address)
+			if err != nil {
+				return nil, err
+			}
+			if ip.Compare(prefix.Addr()) == 0 {
+				return intf, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("Cannot find the network interface on which the IP %s is set", ip.String())
+}
+
+// Wrapper function for FindInterfaceByIP that it accepts the IP as a string.
+func FindInterfaceByIPString(ipAddress string, interfaces []*models.Interface) (*models.Interface, error) {
+	ip, err := netip.ParseAddr(ipAddress)
+	if err != nil {
+		return nil, err
+	}
+	return FindInterfaceByIP(ip, interfaces)
+}
+
+func IsLoadBalancerUserManaged(c *common.Cluster) bool {
+	return c != nil && (common.IsMultiNodeNonePlatformCluster(c) ||
+		(c.LoadBalancer != nil && c.LoadBalancer.Type == models.LoadBalancerTypeUserManaged))
+}
+
+// TargetLoadBalancerType computes the effective load balancer type for validation
+// purposes, given the existing cluster state and what is being requested in params.
+// cluster may be nil when there is no existing cluster (e.g. during registration).
+// clusterParams is the create or update params struct; it may be nil, in which
+// case only the existing cluster state is considered.
+func TargetLoadBalancerType(cluster *common.Cluster, clusterParams interface{}) string {
+	result := models.LoadBalancerTypeClusterManaged
+	if IsLoadBalancerUserManaged(cluster) {
+		result = models.LoadBalancerTypeUserManaged
+	}
+	if lb := DerefClusterLoadBalancer(funk.Get(clusterParams, "LoadBalancer")); lb != nil {
+		result = lb.Type
+	} else {
+		umnRaw := funk.Get(clusterParams, "UserManagedNetworking")
+		if umnPtr, ok := umnRaw.(*bool); ok && swag.BoolValue(umnPtr) {
+			isSNO := false
+			if cluster != nil {
+				isSNO = common.IsSingleNodeCluster(cluster)
+			} else if haModePtr, ok := funk.Get(clusterParams, "HighAvailabilityMode").(*string); ok {
+				isSNO = swag.StringValue(haModePtr) == models.ClusterCreateParamsHighAvailabilityModeNone
+			}
+			if !isSNO {
+				result = models.LoadBalancerTypeUserManaged
+			}
+		}
+	}
+	return result
+}
+
+// IsNicBelongsAnyMachineNetwork is a helper function to find a nic within the machine networks.
+func IsNicBelongsAnyMachineNetwork(outgoingNicName string, mNetworks []*net.IPNet, interfaces []*models.Interface, isIPV6 bool) (bool, error) {
+	var addresses []string
+	for _, nic := range interfaces {
+		if nic.Name != outgoingNicName {
+			continue
+		}
+		if isIPV6 {
+			addresses = nic.IPV6Addresses
+		} else {
+			addresses = nic.IPV4Addresses
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address)
+			if err != nil {
+				return false, fmt.Errorf("internal error - failed to parse outgoing nic address CIDR: %w", err)
+			}
+
+			// If an address is found in any machine network, we are done
+			if IsIPBelongsToAnyMachineNetwork(ip, mNetworks) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func IsIPBelongsToAnyMachineNetwork(IP net.IP, mNetworks []*net.IPNet) bool {
+	for _, mNetwork := range mNetworks {
+		// If an address is found in the machine network, we are done
+		if mNetwork.Contains(IP) {
+			return true
+		}
+	}
+	return false
+}
+
+func ComputeParsedMachineNetworks(mNetworks []*models.MachineNetwork) ([]*net.IPNet, error) {
+	machineNetworks := make([]*net.IPNet, len(mNetworks))
+	for i, machineNet := range mNetworks {
+		_, mNetwork, err := net.ParseCIDR(string(machineNet.Cidr))
+		if err != nil {
+			return nil, fmt.Errorf("internal error - failed to parse machine network CIDR: %w", err)
+		}
+		machineNetworks[i] = mNetwork
+	}
+	return machineNetworks, nil
 }

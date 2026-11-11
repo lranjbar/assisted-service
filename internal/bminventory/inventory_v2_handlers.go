@@ -15,14 +15,18 @@ import (
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-version"
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
 	"github.com/openshift/assisted-service/internal/constants"
+	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/imageservice"
+	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
+	ctxparams "github.com/openshift/assisted-service/pkg/context"
 	"github.com/openshift/assisted-service/pkg/filemiddleware"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/ocm"
@@ -43,11 +47,51 @@ func (b *bareMetalInventory) V2UpdateHost(ctx context.Context, params installer.
 }
 
 func (b *bareMetalInventory) V2RegisterCluster(ctx context.Context, params installer.V2RegisterClusterParams) middleware.Responder {
-	c, err := b.RegisterClusterInternal(ctx, nil, params)
+	c, err := b.RegisterClusterInternal(ctx, nil, nil, params)
 	if err != nil {
 		return common.GenerateErrorResponder(err)
 	}
+	b.populateOperatorBundles(&c.Cluster)
 	return installer.NewV2RegisterClusterCreated().WithPayload(&c.Cluster)
+}
+
+func (b *bareMetalInventory) V2RegisterDisconnectedCluster(ctx context.Context, params installer.V2RegisterDisconnectedClusterParams) middleware.Responder {
+	id := strfmt.UUID(uuid.New().String())
+	url := installer.V2GetClusterURL{ClusterID: id}
+	log := logutil.FromContext(ctx, b.log).WithField(ctxparams.ClusterId, id)
+
+	log.Infof("Register disconnected cluster: %s with id %s", swag.StringValue(params.NewClusterParams.Name), id)
+
+	if swag.StringValue(params.NewClusterParams.Name) == "" {
+		err := errors.New("cluster name is required")
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, err))
+	}
+
+	if swag.StringValue(params.NewClusterParams.OpenshiftVersion) == "" {
+		err := errors.New("OpenShift version is required")
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, err))
+	}
+
+	cluster := &common.Cluster{
+		Cluster: models.Cluster{
+			ID:               &id,
+			Href:             swag.String(url.String()),
+			Kind:             swag.String(models.ClusterKindDisconnectedCluster),
+			Status:           swag.String(models.ClusterStatusUnmonitored),
+			Name:             swag.StringValue(params.NewClusterParams.Name),
+			OpenshiftVersion: swag.StringValue(params.NewClusterParams.OpenshiftVersion),
+			UserName:         ocm.UserNameFromContext(ctx),
+			OrgID:            ocm.OrgIDFromContext(ctx),
+			EmailDomain:      ocm.EmailDomainFromContext(ctx),
+		},
+	}
+
+	err := b.clusterApi.RegisterCluster(ctx, cluster)
+	if err != nil {
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusInternalServerError, err))
+	}
+
+	return installer.NewV2RegisterDisconnectedClusterCreated().WithPayload(&cluster.Cluster)
 }
 
 func (b *bareMetalInventory) GetSupportedFeatures(ctx context.Context, params installer.GetSupportedFeaturesParams) middleware.Responder {
@@ -57,6 +101,79 @@ func (b *bareMetalInventory) GetSupportedFeatures(ctx context.Context, params in
 	}
 
 	return installer.NewGetSupportedFeaturesOK().WithPayload(&installer.GetSupportedFeaturesOKBody{Features: supportLevelList})
+}
+
+func (b *bareMetalInventory) GetDetailedSupportedFeatures(ctx context.Context, params installer.GetDetailedSupportedFeaturesParams) middleware.Responder {
+	// Check parameters
+	_, err := version.NewVersion(params.OpenshiftVersion)
+	if err != nil {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("invalid openshift version: %w", err))
+	}
+
+	if params.CPUArchitecture == nil {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("cpu architecture is required"))
+	}
+
+	archSupported, err := featuresupport.IsArchitectureSupported(*params.CPUArchitecture, params.OpenshiftVersion)
+	if err != nil {
+		return common.NewApiError(http.StatusInternalServerError, err)
+	}
+
+	if !archSupported {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("cpu architecture %s is not supported for openshift version %s", *params.CPUArchitecture, params.OpenshiftVersion))
+	}
+
+	if params.PlatformType != nil {
+		platformSupported, err := featuresupport.IsPlatformSupported(models.PlatformType(*params.PlatformType), params.ExternalPlatformName, params.OpenshiftVersion, *params.CPUArchitecture)
+		if err != nil {
+			return common.NewApiError(http.StatusBadRequest, err)
+		}
+
+		if !platformSupported {
+			return common.NewApiError(http.StatusBadRequest, fmt.Errorf("platform %s is not supported for openshift version %s and cpu architecture %s", *params.PlatformType, params.OpenshiftVersion, *params.CPUArchitecture))
+		}
+	}
+
+	// Get features and operators
+	featureSupportList := featuresupport.GetFeatureSupportList(params.OpenshiftVersion, params.CPUArchitecture, (*models.PlatformType)(params.PlatformType), params.ExternalPlatformName)
+	operatorList := b.operatorManagerApi.GetOperatorDependenciesFeatureID()
+
+	// Reorder operators as a map
+	operatorMap := make(map[models.FeatureSupportLevelID]operators.OperatorFeatureSupportID)
+	for _, operator := range operatorList {
+		operatorMap[operator.FeatureSupportID] = operator
+	}
+
+	// Compute response
+	features := make([]*models.Feature, 0)
+	operators := make([]*models.Operator, 0)
+
+	for _, feature := range featureSupportList {
+		operator, isOperator := operatorMap[feature.FeatureSupportLevelID]
+
+		if isOperator {
+			operators = append(operators, &models.Operator{
+				FeatureSupportLevelID: feature.FeatureSupportLevelID,
+				SupportLevel:          feature.SupportLevel,
+				Reason:                feature.Reason,
+				Incompatibilities:     feature.Incompatibilities,
+				Name:                  &operator.OperatorName,
+				Dependencies:          operator.Dependencies,
+			})
+		} else {
+			features = append(features, &models.Feature{
+				FeatureSupportLevelID: feature.FeatureSupportLevelID,
+				SupportLevel:          feature.SupportLevel,
+				Reason:                feature.Reason,
+				Incompatibilities:     feature.Incompatibilities,
+			})
+		}
+	}
+
+	return installer.NewGetDetailedSupportedFeaturesOK().WithPayload(&installer.GetDetailedSupportedFeaturesOKBody{
+		Features:  features,
+		Operators: operators,
+	})
 }
 
 func (b *bareMetalInventory) GetSupportedArchitectures(ctx context.Context, params installer.GetSupportedArchitecturesParams) middleware.Responder {
@@ -81,6 +198,7 @@ func (b *bareMetalInventory) V2GetCluster(ctx context.Context, params installer.
 	if err != nil {
 		return common.GenerateErrorResponder(err)
 	}
+	b.populateOperatorBundles(&c.Cluster)
 	return installer.NewV2GetClusterOK().WithPayload(&c.Cluster)
 }
 
@@ -128,6 +246,13 @@ func (b *bareMetalInventory) V2GetClusterInstallConfig(ctx context.Context, para
 	cluster, err := b.getCluster(ctx, params.ClusterID.String(), common.UseEagerLoading)
 	if err != nil {
 		return common.GenerateErrorResponder(fmt.Errorf("Failed to get cluster %s: %w", params.ClusterID, err))
+	}
+
+	if common.IsDay2Cluster(cluster) {
+		return common.GenerateErrorResponderWithDefault(
+			fmt.Errorf("The install config is not available because this cluster resource is used only for adding additional hosts to an existing cluster"),
+			http.StatusBadRequest,
+		)
 	}
 
 	clusterInfraenvs, err := b.getClusterInfraenvs(cluster)
@@ -289,6 +414,8 @@ func (b *bareMetalInventory) V2UploadClusterIngressCert(ctx context.Context, par
 		return installer.NewV2UploadClusterIngressCertInternalServerError().
 			WithPayload(common.GenerateError(http.StatusInternalServerError, err))
 	}
+	defer resp.Close()
+
 	kubeconfigData, err := io.ReadAll(resp)
 	if err != nil {
 		log.WithError(err).Infof("Failed to convert kubeconfig s3 response to io reader")
@@ -465,7 +592,7 @@ func (b *bareMetalInventory) v2uploadLogs(ctx context.Context, params installer.
 
 	if params.LogsType == string(models.LogsTypeHost) {
 		if common.StrFmtUUIDPtr(params.ClusterID) == nil || params.HostID == nil {
-			return common.NewApiError(http.StatusInternalServerError,
+			return common.NewApiError(http.StatusBadRequest,
 				errors.Errorf("cluster_id and host_id are required for upload %s logs", params.LogsType))
 		}
 
@@ -590,6 +717,34 @@ func (b *bareMetalInventory) validateIgnoredValidations(problems []string, ignor
 	return problems
 }
 
+// applyIgnoredValidations validates and persists the given ignored cluster and host validation
+// ID lists (JSON arrays) to the database for the specified cluster. It verifies that the cluster
+// is in an updatable state and that none of the requested validations are non-ignorable.
+func (b *bareMetalInventory) applyIgnoredValidations(cluster *common.Cluster, ignoredClusterValidations, ignoredHostValidations string) error {
+	if err := b.clusterApi.VerifyClusterUpdatability(cluster); err != nil {
+		return common.NewApiError(http.StatusBadRequest, err)
+	}
+
+	problems := []string{}
+	problems = b.validateIgnoredValidations(problems, ignoredClusterValidations, common.NonIgnorableClusterValidations, common.ValidationTypeCluster)
+	problems = b.validateIgnoredValidations(problems, ignoredHostValidations, common.NonIgnorableHostValidations, common.ValidationTypeHost)
+	if len(problems) > 0 {
+		return common.NewApiError(http.StatusBadRequest, errors.New("cannot proceed due to the following errors: "+strings.Join(problems, "\n")))
+	}
+
+	if err := b.db.Model(&common.Cluster{}).Where("id = ?", cluster.ID.String()).Updates(map[string]interface{}{
+		"ignored_cluster_validations": ignoredClusterValidations,
+		"ignored_host_validations":    ignoredHostValidations,
+	}).Error; err != nil {
+		return errors.Wrapf(err, "failed to apply ignored validations to cluster %s", *cluster.ID)
+	}
+
+	cluster.IgnoredClusterValidations = ignoredClusterValidations
+	cluster.IgnoredHostValidations = ignoredHostValidations
+
+	return nil
+}
+
 func (b *bareMetalInventory) V2GetIgnoredValidations(ctx context.Context, params installer.V2GetIgnoredValidationsParams) middleware.Responder {
 	if !b.allowedToIgnoreValidations(ctx) {
 
@@ -613,24 +768,14 @@ func (b *bareMetalInventory) V2SetIgnoredValidations(ctx context.Context, params
 	}
 	cluster, err := b.getCluster(ctx, params.ClusterID.String())
 	if err != nil {
-		err = errors.Wrapf(err, "failed to fetch cluster %s to apply ignored validations", *cluster.ID)
+		err = errors.Wrapf(err, "failed to fetch cluster %s to apply ignored validations", params.ClusterID)
 		return installer.NewV2SetIgnoredValidationsInternalServerError().WithPayload(common.GenerateError(http.StatusInternalServerError, err))
 	}
-	err = b.clusterApi.VerifyClusterUpdatability(cluster)
+	err = b.applyIgnoredValidations(cluster, params.IgnoredValidations.ClusterValidationIds, params.IgnoredValidations.HostValidationIds)
 	if err != nil {
-		return b.setIgnoredValidationsBadRequest(err.Error())
-	}
-	problems := []string{}
-	cluster.IgnoredClusterValidations = params.IgnoredValidations.ClusterValidationIds
-	cluster.IgnoredHostValidations = params.IgnoredValidations.HostValidationIds
-
-	problems = b.validateIgnoredValidations(problems, cluster.IgnoredClusterValidations, common.NonIgnorableClusterValidations, common.ValidationTypeCluster)
-	problems = b.validateIgnoredValidations(problems, cluster.IgnoredHostValidations, common.NonIgnorableHostValidations, common.ValidationTypeHost)
-	if len(problems) > 0 {
-		return b.setIgnoredValidationsBadRequest("cannot proceed due to the following errors: " + strings.Join(problems, "\n"))
-	}
-
-	if err = b.db.Save(cluster).Error; err != nil {
+		if apiErr, ok := err.(*common.ApiErrorResponse); ok && apiErr.StatusCode() == http.StatusBadRequest {
+			return b.setIgnoredValidationsBadRequest(apiErr.Error())
+		}
 		err = errors.Wrapf(err, "failed to apply ignored validations to cluster %s", *cluster.ID)
 		return installer.NewV2SetIgnoredValidationsInternalServerError().WithPayload(common.GenerateError(http.StatusInternalServerError, err))
 	}
@@ -639,6 +784,17 @@ func (b *bareMetalInventory) V2SetIgnoredValidations(ctx context.Context, params
 		HostValidationIds:    cluster.IgnoredHostValidations,
 	}
 	return installer.NewV2SetIgnoredValidationsCreated().WithPayload(&ignoredValidations)
+}
+
+// SetIgnoredValidationsInternal is the internal (non-REST) entry point for updating ignored
+// validations on a cluster. It is used by the Kube-API controller to apply ignored validations
+// parsed from AgentClusterInstall annotations.
+func (b *bareMetalInventory) SetIgnoredValidationsInternal(ctx context.Context, clusterID strfmt.UUID, ignoredClusterValidations, ignoredHostValidations string) error {
+	cluster, err := common.GetClusterFromDB(b.db, clusterID, common.SkipEagerLoading)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get cluster %s for ignored validations update", clusterID)
+	}
+	return b.applyIgnoredValidations(cluster, ignoredClusterValidations, ignoredHostValidations)
 }
 
 func (b *bareMetalInventory) V2GetClusterUISettings(ctx context.Context, params installer.V2GetClusterUISettingsParams) middleware.Responder {
@@ -728,15 +884,19 @@ func (b *bareMetalInventory) GetInfraEnvDownloadURL(ctx context.Context, params 
 		return common.GenerateErrorResponder(err)
 	}
 
-	osImage, err := b.osImages.GetOsImageOrLatest(infraEnv.OpenshiftVersion, infraEnv.CPUArchitecture)
+	if !b.EnableImageService {
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, errors.New("image service is disabled")))
+	}
+	osImage, err := b.osImages.GetOsImageOrLatest(infraEnv.OpenshiftVersion, infraEnv.CPUArchitecture, infraEnv.OsStream, string(common.ImageTypeValue(infraEnv.Type)))
 	if err != nil {
 		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, err))
 	}
-	if osImage.OpenshiftVersion == nil {
-		return common.GenerateErrorResponder(errors.Errorf("OS image entry '%+v' missing OpenshiftVersion field", osImage))
+	version, err := imageservice.OsImageVersion(osImage)
+	if err != nil {
+		return common.GenerateErrorResponder(err)
 	}
 
-	newURL, expiresAt, err := b.generateShortImageDownloadURL(infraEnv.ID.String(), string(*infraEnv.Type), *osImage.OpenshiftVersion, infraEnv.CPUArchitecture, infraEnv.ImageTokenKey)
+	newURL, expiresAt, err := b.generateShortImageDownloadURL(infraEnv.ID.String(), string(*infraEnv.Type), version, infraEnv.CPUArchitecture, infraEnv.ImageTokenKey)
 	if err != nil {
 		return common.GenerateErrorResponder(err)
 	}
@@ -760,7 +920,7 @@ func (b *bareMetalInventory) generateShortImageDownloadURL(infraEnvID, imageType
 		return b.generateShortImageDownloadURLByAPIKey(infraEnvID, imageType, version, arch)
 	case auth.TypeRHSSO:
 		return b.generateShortImageDownloadURLByToken(infraEnvID, imageType, version, arch, imageTokenKey)
-	case auth.TypeNone:
+	case auth.TypeNone, auth.TypeAgentLocal:
 		return b.generateShortImageDownloadURLByID(infraEnvID, imageType, version, arch)
 	}
 
@@ -769,7 +929,6 @@ func (b *bareMetalInventory) generateShortImageDownloadURL(infraEnvID, imageType
 
 func (b *bareMetalInventory) generateShortImageDownloadURLByAPIKey(infraEnvID, imageType, version, arch string) (string, *strfmt.DateTime, error) {
 	var expiresAt strfmt.DateTime
-
 	token, err := gencrypto.LocalJWT(infraEnvID, gencrypto.InfraEnvKey)
 	if err != nil {
 		return "", nil, errors.Wrapf(err, "failed to generate token for infraEnv %s", infraEnvID)
@@ -917,12 +1076,9 @@ func kernelArgsAppendStr(infraEnv *common.InfraEnv) (string, error) {
 }
 
 func (b *bareMetalInventory) bootIPXEScript(ctx context.Context, infraEnv *common.InfraEnv) (string, error) {
-	osImage, err := b.osImages.GetOsImageOrLatest(infraEnv.OpenshiftVersion, infraEnv.CPUArchitecture)
+	osImage, err := b.osImages.GetOsImageOrLatest(infraEnv.OpenshiftVersion, infraEnv.CPUArchitecture, infraEnv.OsStream, "")
 	if err != nil {
 		return "", common.NewApiError(http.StatusBadRequest, err)
-	}
-	if osImage.OpenshiftVersion == nil {
-		return "", errors.Errorf("OS image entry '%+v' missing OpenshiftVersion field", osImage)
 	}
 
 	bootArtifactURLs, err := imageservice.GetBootArtifactURLs(b.ImageServiceBaseURL, infraEnv.ID.String(), osImage, b.insecureIPXEURLs)

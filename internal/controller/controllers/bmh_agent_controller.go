@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -28,22 +29,26 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/go-openapi/swag"
 	bmh_v1alpha1 "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	machinev1beta1 "github.com/openshift/api/machine/v1beta1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
+	"github.com/openshift/assisted-service/internal/bminventory"
+	"github.com/openshift/assisted-service/internal/cluster/validations"
+	"github.com/openshift/assisted-service/internal/common/ignition"
+	"github.com/openshift/assisted-service/internal/controller/patch"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
-	"github.com/openshift/assisted-service/internal/ignition"
 	"github.com/openshift/assisted-service/internal/spoke_k8s_client"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -63,14 +68,17 @@ type BMACConfig struct {
 // BMACReconciler reconciles a Agent object
 type BMACReconciler struct {
 	client.Client
-	APIReader             client.Reader
-	Log                   logrus.FieldLogger
-	Scheme                *runtime.Scheme
-	SpokeK8sClientFactory spoke_k8s_client.SpokeK8sClientFactory
-	spokeClient           client.Client
-	ConvergedFlowEnabled  bool
-	Drainer               Drainer
-	Config                *BMACConfig
+	APIReader                           client.Reader
+	Log                                 logrus.FieldLogger
+	Scheme                              *runtime.Scheme
+	Installer                           bminventory.InstallerInternals
+	SpokeK8sClientFactory               spoke_k8s_client.SpokeK8sClientFactory
+	spokeClient                         client.Client
+	ConvergedFlowEnabled                bool
+	PauseProvisionedBMHs                bool
+	StaleProvisioningRemediationEnabled bool
+	Drainer                             Drainer
+	Config                              *BMACConfig
 }
 
 const (
@@ -83,22 +91,34 @@ const (
 	BMH_ANNOTATION                      = "metal3.io/BareMetalHost"
 	BMH_API_VERSION                     = "baremetal.cluster.k8s.io/v1alpha1"
 	BMH_DETACHED_ANNOTATION             = "baremetalhost.metal3.io/detached"
+	BMH_PAUSED_ANNOTATION               = "baremetalhost.metal3.io/paused"
+	BMH_STATUS_ANNOTATION               = "baremetalhost.metal3.io/status"
 	BMH_INSPECT_ANNOTATION              = "inspect.metal3.io"
 	BMH_HARDWARE_DETAILS_ANNOTATION     = "inspect.metal3.io/hardwaredetails"
 	BMH_AGENT_IGNITION_CONFIG_OVERRIDES = "bmac.agent-install.openshift.io/ignition-config-overrides"
 	BMH_FINALIZER_NAME                  = "bmac.agent-install.openshift.io/deprovision"
 	BMH_DELETE_ANNOTATION               = "bmac.agent-install.openshift.io/remove-agent-and-node-on-delete"
 	BMH_CLUSTER_REFERENCE               = "bmac.agent-install.openshift.io/cluster-reference"
+	BMH_HOST_MANAGEMENT_ANNOTATION      = "bmac.agent-install.openshift.io/allow-provisioned-host-management"
+	BMH_SPOKE_CREATED_ANNOTATION        = "bmac.agent-install.openshift.io/spoke-bmh-machine-created"
 	MACHINE_ROLE                        = "machine.openshift.io/cluster-api-machine-role"
 	MACHINE_TYPE                        = "machine.openshift.io/cluster-api-machine-type"
 	MCS_CERT_NAME                       = "ca.crt"
+	MCS_CA_BUNDLE_NAME                  = "ca-bundle.crt"
 	OPENSHIFT_MACHINE_API_NAMESPACE     = "openshift-machine-api"
 	ASSISTED_DEPLOY_METHOD              = "start_assisted_install"
 	NODE_LABEL_PREFIX                   = "bmac.agent-install.openshift.io.node-label."
+	AGENT_LABEL_PREFIX                  = "bmac.agent-install.openshift.io.agent-label."
 
 	BMH_NODE_DRAIN_START_ANNOTATION   = "bmac.agent-install.openshift.io/drain-started-at"
 	BMH_NODE_DRAIN_TIMEOUT_ANNOTATION = "bmac.agent-install.openshift.io/drain-timeout" // in time.Duration format
 	BMH_NODE_DRAIN_STATUS_ANNOTATION  = "bmac.agent-install.openshift.io/drain-status"
+
+	BMH_AGENT_FENCING_CREDENTIALS_SECRET_NAME   = "bmac.agent-install.openshift.io/fencing-credentials-secret-name"   // nolint: gosec
+	BMH_AGENT_CREATE_FENCING_CREDENTIALS_SECRET = "bmac.agent-install.openshift.io/create-fencing-credentials-secret" // nolint: gosec
+	AGENT_FENCING_NAME_FORMAT                   = "%s-fencing-credentials"
+
+	BMH_STALE_PROVISIONING_ANNOTATION = "bmac.agent-install.openshift.io/stale-provisioning-remediation"
 
 	drainStatusSuccess    = "drain succeeded"
 	drainStatusInProgress = "draining in progress"
@@ -113,6 +133,39 @@ var (
 		"kube-root-ca.crt",
 	}
 )
+
+const (
+	staleProvisioningRemediating = "remediating"
+)
+
+// isStaleProvisioning returns true when the Agent has completed installation
+// but the BMH is still stuck in StateProvisioning, indicating that Ironic
+// failed to report the deployment completion to the hub.
+//
+// For day 1 hosts (Kind != HostKindAddToExistingClusterHost), completion is
+// signalled by Progress.CurrentStage == HostStageDone.
+//
+// For day 2 hosts (Kind == HostKindAddToExistingClusterHost), we require the
+// stronger signal DebugInfo.State == HostStatusAddedToExistingCluster.
+// HostStageDone alone is insufficient for day 2: ClusterDeployment.Spec.Installed
+// is already true from day 1, so the !installed precheck never fires. Using
+// HostStageDone would create a false-positive window of ~15 seconds between
+// the agent reporting completion and Ironic's polling loop reporting back to
+// BMO. HostStatusAddedToExistingCluster is only set after the backend host
+// state machine has fully transitioned and the agent controller has synced —
+// at least one reconcile cycle after HostStageDone — by which point Ironic
+// has had time to report the deployment completion.
+func isStaleProvisioning(agent *aiv1beta1.Agent, bmh *bmh_v1alpha1.BareMetalHost) bool {
+	if bmh.Status.Provisioning.State != bmh_v1alpha1.StateProvisioning {
+		return false
+	}
+
+	if agent.Status.Kind == models.HostKindAddToExistingClusterHost {
+		return agent.Status.DebugInfo.State == models.HostStatusAddedToExistingCluster
+	}
+
+	return agent.Status.Progress.CurrentStage == models.HostStageDone
+}
 
 const certificateAuthoritiesIgnitionOverride = `{
 	"ignition": {
@@ -130,15 +183,15 @@ const certificateAuthoritiesIgnitionOverride = `{
 // reconcileResult is an interface that encapsulates the result of a Reconcile
 // call, as returned by the action corresponding to the current state.
 //
-// Set the `dirty` flag when the BMH CR (or any CR) has been modified and an `Update`
-// is required.
-//
 // Set the `stop` flag when the `Reconcile` flow should be stopped. For example, the
 // required data for the current step is not ready yet. This will prevent the Reconcile
 // from going to the next step.
+//
+// Note: CR modifications are automatically detected and patched by the deferred patch
+// mechanism in the main Reconcile function. Individual reconcile steps do not need to
+// track or report whether they made changes.
 type reconcileResult interface {
 	Result() (reconcile.Result, error)
-	Dirty() bool
 	Stop(ctx context.Context) bool
 }
 
@@ -146,16 +199,11 @@ type reconcileResult interface {
 // and there is nothing else to do. It allows for setting the implementation or the
 // stop flag.
 type reconcileComplete struct {
-	dirty bool
-	stop  bool
+	stop bool
 }
 
 func (r reconcileComplete) Result() (result reconcile.Result, err error) {
 	return
-}
-
-func (r reconcileComplete) Dirty() bool {
-	return r.dirty
 }
 
 func (r reconcileComplete) Stop(ctx context.Context) bool {
@@ -164,19 +212,14 @@ func (r reconcileComplete) Stop(ctx context.Context) bool {
 
 type reconcileRequeue struct {
 	requeueAfter time.Duration
-	dirty        bool
 }
 
 func (r reconcileRequeue) Result() (result reconcile.Result, err error) {
 	result = reconcile.Result{
-		Requeue:      true,
+		Requeue:      true, //nolint:staticcheck // Preserve retry behavior when the delay is zero.
 		RequeueAfter: r.requeueAfter,
 	}
 	return result, err
-}
-
-func (r reconcileRequeue) Dirty() bool {
-	return r.dirty
 }
 
 func (r reconcileRequeue) Stop(ctx context.Context) bool {
@@ -186,8 +229,7 @@ func (r reconcileRequeue) Stop(ctx context.Context) bool {
 // reconcileError is a result indicating that an error occurred while attempting
 // to advance the current reconcile, and that reconciliation should be retried.
 type reconcileError struct {
-	err   error
-	dirty bool
+	err error
 }
 
 func (r reconcileError) Result() (result reconcile.Result, err error) {
@@ -195,32 +237,14 @@ func (r reconcileError) Result() (result reconcile.Result, err error) {
 	return
 }
 
-func (r reconcileError) Dirty() bool {
-	return r.dirty
-}
-
 func (r reconcileError) Stop(ctx context.Context) bool {
 	return true
 }
 
-func (r *BMACReconciler) handleReconcileResult(ctx context.Context, log logrus.FieldLogger, result reconcileResult, obj client.Object) reconcileResult {
-	if result.Dirty() {
-		log.Debugf("Updating dirty object %v", obj)
-		err := r.Client.Update(ctx, obj)
-		if err != nil {
-			return reconcileError{err: err}
-		}
-	}
-	if result.Stop(ctx) {
-		log.Debugf("Stopping reconcile")
-		return result
-	}
-	return nil
-}
-
 // +kubebuilder:rbac:groups=metal3.io,resources=baremetalhosts,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=metal3.io,resources=baremetalhosts/status,verbs=get;update;patch
 
-func (r *BMACReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *BMACReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (ctrlResult ctrl.Result, retErr error) {
 	ctx := addRequestIdIfNeeded(origCtx)
 	log := logutil.FromContext(ctx, r.Log).WithFields(
 		logrus.Fields{
@@ -229,10 +253,10 @@ func (r *BMACReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (c
 		})
 
 	defer func() {
-		log.Info("BareMetalHost Reconcile ended")
+		log.Debug("BareMetalHost Reconcile ended")
 	}()
 
-	log.Info("BareMetalHost Reconcile started")
+	log.Debug("BareMetalHost Reconcile started")
 	bmh := &bmh_v1alpha1.BareMetalHost{}
 
 	if err := r.Get(ctx, req.NamespacedName, bmh); err != nil {
@@ -241,6 +265,14 @@ func (r *BMACReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (c
 		}
 		return reconcileComplete{}.Result()
 	}
+
+	bmhPatch := client.MergeFromWithOptions(bmh.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	defer func() {
+		if err := patch.IfNeeded(ctx, r.Client, bmh, bmhPatch, log); err != nil {
+			log.WithError(err).Error("failed to patch BMH")
+			retErr = errors.Join(retErr, err)
+		}
+	}()
 
 	// Should we check the status of the BMH resource?
 	// Provisioning / Deprovisioning ?
@@ -253,144 +285,165 @@ func (r *BMACReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (c
 			"agent":           agent.Name,
 			"agent_namespace": agent.Namespace,
 		})
+		agentPatch := client.MergeFromWithOptions(agent.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		defer func() {
+			if err := patch.IfNeeded(ctx, r.Client, agent, agentPatch, log); err != nil {
+				log.WithError(err).Error("failed to patch Agent")
+				retErr = errors.Join(retErr, err)
+			}
+		}()
 	}
 	infraEnv, err := r.findInfraEnvForBMH(ctx, log, bmh)
 	if err != nil {
 		return reconcileError{err: err}.Result()
 	}
 
-	result := r.handleBMHFinalizer(ctx, log, bmh, agent)
-	if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-		return res.Result()
-	}
-
-	if agent != nil && agentIsUnbindingPendingUserAction(agent) {
-		result = reconcileUnboundAgent(log, bmh, r.ConvergedFlowEnabled)
-		if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-			return res.Result()
+	// Ensure BMH is labeled for backup if it's referenced by an InfraEnv
+	if infraEnv != nil {
+		if res := r.ensureBMHIsLabelled(ctx, log, bmh); res.Stop(ctx) {
+			ctrlResult, retErr = res.Result()
+			return
 		}
 	}
 
-	result = r.reconcileBMH(ctx, log, bmh, agent, infraEnv)
-	if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-		return res.Result()
+	if res := r.handleBMHFinalizer(ctx, log, bmh, agent); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
+	}
+
+	if agent != nil && agentIsUnbindingPendingUserAction(agent) {
+		if res := reconcileUnboundAgent(log, bmh, r.ConvergedFlowEnabled); res.Stop(ctx) {
+			ctrlResult, retErr = res.Result()
+			return
+		}
+	}
+
+	// Handle stale BMH provisioning (converged flow): must run before
+	// handlePauseAndDetachBMHAnnotations to prevent annotation conflicts.
+	if res := r.reconcileBMHStaleProvisioning(ctx, log, bmh, agent); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
+	}
+
+	// The reconcileBMH function below this can stop reconciliation so we want to handle
+	// the pause and detach annotations before we get into that function in case
+	// they should be removed or re-added.
+	if res := r.handlePauseAndDetachBMHAnnotations(ctx, log, bmh, agent); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
+	}
+
+	if res := r.reconcileBMH(ctx, log, bmh, agent, infraEnv); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
 	}
 
 	// handle multiple agents matching the
 	// same BMH's Mac Address
 	if agent == nil {
 		log.Debugf("Stopping BMAC reconcile after reconcileBMH")
-		return result.Result()
+		return
 	}
 
 	// if we get to this point, it means we have found an Agent that is associated
 	// with the BMH being reconciled. We will call both, reconcileAgentSpec and
 	// reconcileAgentInventory, every time. The logic to decide whether there's
 	// any action to take is implemented in each function respectively.
-	result = r.reconcileAgentSpec(log, bmh, agent, infraEnv)
-	if res := r.handleReconcileResult(ctx, log, result, agent); res != nil {
-		return res.Result()
+	if res := r.reconcileAgentSpec(ctx, log, bmh, agent, infraEnv); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
 	}
 
 	// In the converged flow ironic will reconcile the BMH_HARDWARE_DETAILS_ANNOTATION
 	if !r.ConvergedFlowEnabled {
-		result = r.reconcileAgentInventory(log, bmh, agent)
-		if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-			return res.Result()
+		if res := r.reconcileAgentInventory(log, bmh, agent); res.Stop(ctx) {
+			ctrlResult, retErr = res.Result()
+			return
 		}
 	}
 
-	result = r.ensureMCSCert(ctx, log, bmh, agent)
-	if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-		return res.Result()
+	if res := r.ensureMCSCert(ctx, log, bmh, agent); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
 	}
 
-	if r.ConvergedFlowEnabled {
-		result = r.addBMHDetachedAnnotationIfBmhIsProvisioned(log, bmh, agent)
-	} else {
-		// After the agent has started installation, Ironic should not manage the host.
-		// Adding the detached annotation to the BMH stops Ironic from managing it.
-		result = r.addBMHDetachedAnnotationIfHostIsRebooting(log, bmh, agent)
+	if res := r.reconcileDay2SpokeBMH(ctx, log, bmh, agent); res.Stop(ctx) {
+		ctrlResult, retErr = res.Result()
+		return
 	}
-	if res := r.handleReconcileResult(ctx, log, result, bmh); res != nil {
-		return res.Result()
-	}
-
-	result = r.reconcileSpokeBMH(ctx, log, bmh, agent)
-	if result.Dirty() {
-		err := r.Client.Update(ctx, bmh)
-		if err != nil {
-			log.WithError(err).Errorf("Error adding BMH detached annotation after creating spoke BMH")
-			return reconcileError{err: err}.Result()
-		}
-	}
-
-	return result.Result()
+	return
 }
 
 // handleBMHFinalizer adds a finalizer to the BMH if it isn't being deleted and the finalizer isn't already present
 // If the BMH is being deleted, the associated node is drained and the agent (if any) is annotated and deleted before the BMH is allowed to be removed
-// Finalizer handling is only run if the user has annotated the BMH and converged flow is enabled
+// Finalizer handling is only run if the user has annotated the BMH and converged flow is enabled,
+// or, when the BMH is annotated with 'paused' annotation.
 func (r *BMACReconciler) handleBMHFinalizer(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
-	if _, has_annotation := bmh.GetAnnotations()[BMH_DELETE_ANNOTATION]; !has_annotation || !r.ConvergedFlowEnabled {
-		return reconcileComplete{}
+	// return immediately and ensure our finalizer doesn't exist if the BMH is not one of ours (has the infraenv label)
+	if _, present := bmh.Labels[BMH_INFRA_ENV_LABEL]; !present {
+		controllerutil.RemoveFinalizer(bmh, BMH_FINALIZER_NAME)
+		return reconcileComplete{stop: true}
 	}
 
-	bmhHasFinalizer := funk.ContainsString(bmh.GetFinalizers(), BMH_FINALIZER_NAME)
 	if bmh.ObjectMeta.DeletionTimestamp.IsZero() {
-		if !bmhHasFinalizer {
-			controllerutil.AddFinalizer(bmh, BMH_FINALIZER_NAME)
-			return reconcileComplete{dirty: true}
-		}
+		controllerutil.AddFinalizer(bmh, BMH_FINALIZER_NAME)
 		return reconcileComplete{}
 	}
 
-	// BMH is being deleted and finalizer is gone, ensure detached is gone and return
+	var removeAgentOnDelete bool
+	if _, has_annotation := bmh.GetAnnotations()[BMH_DELETE_ANNOTATION]; has_annotation && r.ConvergedFlowEnabled {
+		log.Infof("'%s' annotation was added and converged flow is enabled", BMH_DELETE_ANNOTATION)
+		removeAgentOnDelete = true
+	}
+	// Register a finalizer if it's absent and should be present, remove the finalizer if it's present and should be absent
+	bmhHasFinalizer := funk.ContainsString(bmh.GetFinalizers(), BMH_FINALIZER_NAME)
+
+	// BMH is being deleted and finalizer is gone, ensure detached and paused are gone and return
 	if !bmhHasFinalizer {
-		dirty := removeBMHDetachedAnnotation(log, bmh)
-		return reconcileComplete{stop: true, dirty: dirty}
+		if removeAgentOnDelete {
+			removeBMHDetachedAnnotation(log, bmh)
+		}
+		removeBMHPausedAnnotation(log, bmh)
+		return reconcileComplete{stop: true}
 	}
 
 	log.Info("Handling BMH delete")
 	// agent could be nil here if it wasn't created yet, or if we deleted it, then failed to remove the finalizer for some reason
 	// if the agent is missing, just allow the BMH to be removed
 	if agent == nil {
-		removeBMHDetachedAnnotation(log, bmh)
+		if removeAgentOnDelete {
+			removeBMHDetachedAnnotation(log, bmh)
+		}
+		removeBMHPausedAnnotation(log, bmh)
 		controllerutil.RemoveFinalizer(bmh, BMH_FINALIZER_NAME)
-		return reconcileComplete{stop: true, dirty: true}
+		return reconcileComplete{stop: true}
 	}
 
-	dirty := false
-	if agent.Spec.ClusterDeploymentName != nil {
-		var res reconcileResult
-		dirty, res = r.handleDrain(ctx, log, agent, bmh)
-		if res.Stop(ctx) {
-			return res
-		}
+	if removeAgentOnDelete {
+		if agent.Spec.ClusterDeploymentName != nil {
+			res := r.handleDrain(ctx, log, agent, bmh)
+			if res.Stop(ctx) {
+				return res
+			}
 
-		if updated := configureBMHForCleaning(log, bmh); updated {
-			return reconcileComplete{stop: true, dirty: true}
-		}
+			configureBMHForCleaning(log, bmh)
 
-		// annotate the agent to inform the agent controller to remove the spoke node when the BMH finishes deprovisioning
-		if _, ok := agent.GetAnnotations()[BMH_FINALIZER_NAME]; !ok {
-			setAnnotation(&agent.ObjectMeta, BMH_FINALIZER_NAME, "true")
-			if err := r.Update(ctx, agent); err != nil {
-				log.WithError(err).Errorf("failed to set %s annotation on agent", BMH_FINALIZER_NAME)
-				return reconcileError{err: err, dirty: dirty}
+			if bmh.Status.Provisioning.State != bmh_v1alpha1.StateDeleting {
+				log.Info("Waiting for BMH to deprovision")
+				return reconcileRequeue{requeueAfter: defaultRequeueAfterOnError}
 			}
 		}
-	}
 
-	if err := r.Delete(ctx, agent); err != nil {
-		log.WithError(err).Errorf("Failed to delete agent as a part of BMH removal")
-		return reconcileError{err: err, dirty: dirty}
+		if err := r.Delete(ctx, agent); err != nil {
+			log.WithError(err).Errorf("Failed to delete agent as a part of BMH removal")
+			return reconcileError{err: err}
+		}
 	}
 
 	log.Infof("Removing BMH finalizer %s", BMH_FINALIZER_NAME)
 
 	controllerutil.RemoveFinalizer(bmh, BMH_FINALIZER_NAME)
-	return reconcileComplete{stop: true, dirty: true}
+	return reconcileComplete{stop: true}
 }
 
 // This reconcile step takes care of copying data from the BMH into the Agent.
@@ -408,63 +461,54 @@ func (r *BMACReconciler) handleBMHFinalizer(ctx context.Context, log logrus.Fiel
 // Unless there are errors, the agent should be `Approved` at the end of this
 // reconcile and a label should be set on it referencing the BMH. No changes to
 // the BMH should happen in this reconcile step.
-func (r *BMACReconciler) reconcileAgentSpec(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent, infraEnv *aiv1beta1.InfraEnv) reconcileResult {
+func (r *BMACReconciler) reconcileAgentSpec(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent, infraEnv *aiv1beta1.InfraEnv) reconcileResult {
 
 	log.Debugf("Setting agent spec according to BMH")
 
 	// Do all the copying from the BMH annotations to the agent.
 
-	var dirty bool
 	annotations := bmh.ObjectMeta.GetAnnotations()
 	if val, ok := annotations[BMH_AGENT_ROLE]; ok {
 		if agent.Spec.Role != models.HostRole(val) {
 			agent.Spec.Role = models.HostRole(val)
-			dirty = true
 		}
 	}
 
 	if val, ok := annotations[BMH_AGENT_HOSTNAME]; ok {
 		if agent.Spec.Hostname != val {
 			agent.Spec.Hostname = val
-			dirty = true
 		}
 	}
 
 	if val, ok := annotations[BMH_AGENT_MACHINE_CONFIG_POOL]; ok {
 		if agent.Spec.MachineConfigPool != val {
 			agent.Spec.MachineConfigPool = val
-			dirty = true
 		}
 	}
 
 	if val, ok := annotations[BMH_AGENT_INSTALLER_ARGS]; ok {
 		if agent.Spec.InstallerArgs != val {
 			agent.Spec.InstallerArgs = val
-			dirty = true
 		}
 	}
 
 	if val, ok := annotations[BMH_AGENT_IGNITION_CONFIG_OVERRIDES]; ok {
 		if agent.Spec.IgnitionConfigOverrides != val {
 			agent.Spec.IgnitionConfigOverrides = val
-			dirty = true
 		}
 	}
 
 	if !agent.Spec.Approved {
 		agent.Spec.Approved = true
-		dirty = true
 	}
 	if agent.ObjectMeta.Labels == nil {
 		agent.ObjectMeta.Labels = make(map[string]string)
-		dirty = true
 	}
 
 	// Label the agent with the reference to this BMH
 	name, ok := agent.ObjectMeta.Labels[AGENT_BMH_LABEL]
 	if !ok || name != bmh.Name {
 		agent.ObjectMeta.Labels[AGENT_BMH_LABEL] = bmh.Name
-		dirty = true
 	}
 
 	// findInstallationDiskID will return an empty string
@@ -474,25 +518,28 @@ func (r *BMACReconciler) reconcileAgentSpec(log logrus.FieldLogger, bmh *bmh_v1a
 	installationDiskID := r.findInstallationDiskID(agent.Status.Inventory.Disks, bmh.Spec.RootDeviceHints)
 	if installationDiskID != "" && bmh.Spec.RootDeviceHints != nil && agent.Spec.InstallationDiskID != installationDiskID {
 		agent.Spec.InstallationDiskID = installationDiskID
-		dirty = true
 	}
 
-	setDirty, err := r.reconcileClusterReference(bmh, agent, infraEnv)
-	if err != nil {
+	if _, err := r.reconcileClusterReference(bmh, agent, infraEnv); err != nil {
 		log.WithError(err).Errorf("failed to reconcile bmh cluster reference %s/%s", bmh.Namespace, bmh.Name)
 		return reconcileError{err: err}
 	}
-	if setDirty {
-		dirty = true
+
+	r.reconcileNodeLabels(bmh, agent)
+
+	if _, err := r.reconcileAgentLabels(bmh, agent); err != nil {
+		log.WithError(err).Errorf("failed to reconcile bmh agent labels %s/%s", bmh.Namespace, bmh.Name)
+		return reconcileError{err: err}
 	}
 
-	if r.reconcileNodeLabels(bmh, agent) {
-		dirty = true
+	if _, err := r.reconcileAgentFencingCredentials(ctx, bmh, agent); err != nil {
+		log.WithError(err).Errorf("failed to reconcile agent fencing credentials %s/%s", bmh.Namespace, bmh.Name)
+		return reconcileError{err: err}
 	}
 
 	log.Debugf("Agent spec reconcile finished:  %v", agent)
 
-	return reconcileComplete{dirty: dirty}
+	return reconcileComplete{}
 }
 
 func (r *BMACReconciler) reconcileNodeLabels(bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) bool {
@@ -513,18 +560,118 @@ func (r *BMACReconciler) reconcileNodeLabels(bmh *bmh_v1alpha1.BareMetalHost, ag
 	return false
 }
 
+func (r *BMACReconciler) reconcileAgentLabels(bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) (bool, error) {
+	agentLabels := make(map[string]string)
+
+	for key, value := range bmh.ObjectMeta.GetAnnotations() {
+		if strings.HasPrefix(key, AGENT_LABEL_PREFIX) {
+			agentLabels[key[len(AGENT_LABEL_PREFIX):]] = value
+		}
+	}
+	var ret bool
+	labels := agent.GetLabels()
+	for key, value := range agentLabels {
+		existingValue, exists := getLabel(labels, key)
+		if !exists || existingValue != value {
+			labels = AddLabel(labels, key, value)
+			ret = true
+		}
+	}
+	if ret {
+		agent.SetLabels(labels)
+	}
+	return ret, nil
+}
+
+func (r *BMACReconciler) reconcileAgentFencingCredentials(ctx context.Context, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) (bool, error) {
+	if val, ok := bmh.ObjectMeta.Annotations[BMH_AGENT_FENCING_CREDENTIALS_SECRET_NAME]; ok {
+		if agent.Spec.FencingCredentialsSecretRef != val {
+			agent.Spec.FencingCredentialsSecretRef = val
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if _, ok := bmh.ObjectMeta.Annotations[BMH_AGENT_CREATE_FENCING_CREDENTIALS_SECRET]; !ok {
+		return false, nil
+	}
+
+	fencingCredentialsSecretName := fmt.Sprintf(AGENT_FENCING_NAME_FORMAT, agent.ObjectMeta.Name)
+	err := r.reconcileFencingCredentialsSecret(ctx, bmh, agent, fencingCredentialsSecretName)
+	if err != nil {
+		return false, err
+	}
+
+	if agent.Spec.FencingCredentialsSecretRef != fencingCredentialsSecretName {
+		agent.Spec.FencingCredentialsSecretRef = fencingCredentialsSecretName
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *BMACReconciler) reconcileFencingCredentialsSecret(ctx context.Context, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent, fencingCredentialsSecretName string) error {
+	bmhCredentialsSecretRef := types.NamespacedName{Namespace: bmh.Namespace, Name: bmh.Spec.BMC.CredentialsName}
+	bmhCredentialsSecret, err := getSecret(ctx, r.Client, r.APIReader, bmhCredentialsSecretRef)
+	if err != nil {
+		return err
+	}
+
+	fencingCredentials := &models.FencingCredentialsParams{
+		Address:  swag.String(bmh.Spec.BMC.Address),
+		Password: swag.String(string(bmhCredentialsSecret.Data["password"])),
+		Username: swag.String(string(bmhCredentialsSecret.Data["username"])),
+	}
+	if bmh.Spec.BMC.DisableCertificateVerification {
+		fencingCredentials.CertificateVerification = swag.String("Disabled")
+	} else {
+		fencingCredentials.CertificateVerification = swag.String("Enabled")
+	}
+
+	fencingCredentialsData := map[string][]byte{
+		"address":                 []byte(*fencingCredentials.Address),
+		"username":                []byte(*fencingCredentials.Username),
+		"password":                []byte(*fencingCredentials.Password),
+		"certificateVerification": []byte(*fencingCredentials.CertificateVerification),
+	}
+
+	fencingCredentialsSecretRef := types.NamespacedName{Namespace: agent.Namespace, Name: fencingCredentialsSecretName}
+	fencingCredentialsSecret, err := getSecret(ctx, r.Client, r.APIReader, fencingCredentialsSecretRef)
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return err
+		}
+
+		fencingCredentialsSecret = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fencingCredentialsSecretName,
+				Namespace: agent.Namespace,
+			},
+			Data: fencingCredentialsData,
+		}
+		err = r.Create(ctx, fencingCredentialsSecret)
+	} else {
+		fencingCredentialsSecret.Data = fencingCredentialsData
+		err = r.Update(ctx, fencingCredentialsSecret)
+	}
+	if err != nil {
+		return err
+	}
+
+	return ensureSecretIsLabelled(ctx, r.Client, fencingCredentialsSecret, fencingCredentialsSecretRef)
+}
+
 func (r *BMACReconciler) reconcileClusterReference(bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent, infraEnv *aiv1beta1.InfraEnv) (bool, error) {
 	clusterReferenceStr, annotationExists := bmh.Annotations[BMH_CLUSTER_REFERENCE]
 
 	switch {
 	case clusterReferenceStr != "":
 		if infraEnv != nil && infraEnv.Spec.ClusterRef != nil {
-			return false, errors.Errorf("failed to reconcile cluster reference.  InfraEnv already has cluster reference %s/%s",
+			return false, fmt.Errorf("failed to reconcile cluster reference.  InfraEnv already has cluster reference %s/%s",
 				infraEnv.Spec.ClusterRef.Namespace, infraEnv.Spec.ClusterRef.Name)
 		}
 		splits := strings.Split(clusterReferenceStr, "/")
 		if len(splits) != 2 {
-			return false, errors.Errorf("failed to reconcile cluster reference.  Parse of cluster reference %s failed",
+			return false, fmt.Errorf("failed to reconcile cluster reference.  Parse of cluster reference %s failed",
 				clusterReferenceStr)
 		}
 		clusterReference := aiv1beta1.ClusterReference{
@@ -545,14 +692,43 @@ func (r *BMACReconciler) reconcileClusterReference(bmh *bmh_v1alpha1.BareMetalHo
 	return false, nil
 }
 
-// The detached annotation is added if the BMH provisioning state is provisioned
-func (r *BMACReconciler) addBMHDetachedAnnotationIfBmhIsProvisioned(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
-	if r.ConvergedFlowEnabled && bmh.Status.Provisioning.State != bmh_v1alpha1.StateProvisioned {
-		log.Debugf("Skipping adding detached annotation. BMH provisioning state is: %s should be: %s", bmh.Status.Provisioning.State, bmh_v1alpha1.StateProvisioned)
-		return reconcileComplete{}
-
+func (r *BMACReconciler) handlePauseAndDetachBMHAnnotations(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
+	// ensure the paused and detached annotations do not exist if the host management annotation is set and the delete annotation is unset
+	if metav1.HasAnnotation(bmh.ObjectMeta, BMH_HOST_MANAGEMENT_ANNOTATION) {
+		if r.ConvergedFlowEnabled && !metav1.HasAnnotation(bmh.ObjectMeta, BMH_DELETE_ANNOTATION) {
+			// remove detached and paused if they exist
+			removeBMHDetachedAnnotation(log, bmh)
+			removeBMHPausedAnnotation(log, bmh)
+			return reconcileComplete{}
+		}
+		log.Errorf("failed to allow BMH host management for BMH %s/%s. Either converged flow is not enabled or the BMH has the annotation %s",
+			bmh.Name, bmh.Namespace, BMH_DELETE_ANNOTATION)
 	}
-	return r.ensureBMHDetached(log, bmh, agent)
+
+	// detach and pause when provisioned for converged or anytime after reboot for non-converged
+	nonConvergedDetachStages := []models.HostStage{models.HostStageFailed, models.HostStageRebooting, models.HostStageJoined, models.HostStageDone}
+	if r.ConvergedFlowEnabled && bmh.Status.Provisioning.State == bmh_v1alpha1.StateProvisioned ||
+		!r.ConvergedFlowEnabled && agent != nil && funk.Contains(nonConvergedDetachStages, agent.Status.Progress.CurrentStage) {
+		res := r.ensureBMHDetached(log, bmh, agent)
+		if _, err := res.Result(); err != nil {
+			return res
+		}
+		if r.PauseProvisionedBMHs {
+			res := r.addBMHStatusAndPausedAnnotations(log, bmh)
+			if _, err := res.Result(); err != nil {
+				return res
+			}
+		}
+	}
+
+	// Remove 'paused' annotation if BMH's provisioning state is missing
+	if r.PauseProvisionedBMHs && bmh.Status.Provisioning.State == bmh_v1alpha1.StateNone {
+		res := r.removePausedAnnotation(log, bmh)
+		if _, err := res.Result(); err != nil {
+			return res
+		}
+	}
+	return reconcileComplete{}
 }
 
 func (r *BMACReconciler) detachedValue(bmh *bmh_v1alpha1.BareMetalHost) (string, error) {
@@ -595,19 +771,7 @@ func (r *BMACReconciler) ensureBMHDetached(log logrus.FieldLogger, bmh *bmh_v1al
 
 	bmh.ObjectMeta.Annotations[BMH_DETACHED_ANNOTATION] = desiredValue
 	log.Info("Added detached annotation to BMH")
-	return reconcileComplete{dirty: true, stop: true}
-}
-
-// The detached annotation is added if the installation of the agent associated with
-// the host has reached stages Failed, Rebooting, or Joined
-func (r *BMACReconciler) addBMHDetachedAnnotationIfHostIsRebooting(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
-	// Do nothing if host stage is not one of Failed, Rebooting, or Joined
-	if !funk.Contains([]models.HostStage{models.HostStageFailed, models.HostStageRebooting, models.HostStageJoined}, agent.Status.Progress.CurrentStage) {
-		log.Debugf("Skipping adding detached annotation. Host hasn't reached stage rebooted, joined, or failed. Current stage: %v", agent.Status.Progress.CurrentStage)
-		return reconcileComplete{}
-	}
-
-	return r.ensureBMHDetached(log, bmh, agent)
+	return reconcileComplete{stop: true}
 }
 
 // Reconcile BMH's HardwareDetails using the agent's inventory
@@ -719,7 +883,7 @@ func (r *BMACReconciler) reconcileAgentInventory(log logrus.FieldLogger, bmh *bm
 
 	setAnnotation(&bmh.ObjectMeta, BMH_HARDWARE_DETAILS_ANNOTATION, string(bytes))
 	log.Debugf("Agent Inventory reconciled to BMH \n %v \n %v", agent, bmh)
-	return reconcileComplete{dirty: true, stop: true}
+	return reconcileComplete{stop: true}
 
 }
 
@@ -747,22 +911,23 @@ func reconcileUnboundAgent(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHo
 		// in case. They will be regenerated in the reconciles following the agent's
 		// reboot
 		delete(bmh.ObjectMeta.Annotations, BMH_DETACHED_ANNOTATION)
+		delete(bmh.ObjectMeta.Annotations, BMH_PAUSED_ANNOTATION)
 		delete(bmh.ObjectMeta.Annotations, BMH_HARDWARE_DETAILS_ANNOTATION)
+		delete(bmh.Annotations, BMH_SPOKE_CREATED_ANNOTATION)
 		bmh.Spec.Image = nil
 
 		log.Infof("Unbound agent reconciled to BMH")
-		return reconcileComplete{dirty: true, stop: true}
+		return reconcileComplete{stop: true}
 	}
 
 	// for converged flow we need to orchestrate deprovisioning the host
-	var dirty, stop bool
+	var stop bool
 	switch bmh.Status.Provisioning.State {
 	case bmh_v1alpha1.StateProvisioned:
 		// unset customDeploy to initiate deprovisioning
 		if bmh.Spec.CustomDeploy != nil {
 			log.Info("deprovisioning BMH")
 			bmh.Spec.CustomDeploy = nil
-			dirty = true
 		}
 		stop = true
 	case bmh_v1alpha1.StateDeprovisioning:
@@ -772,17 +937,22 @@ func reconcileUnboundAgent(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHo
 
 	// always want the host attached if it's still unbinding pending user action
 	if _, ok := bmh.GetAnnotations()[BMH_DETACHED_ANNOTATION]; ok {
-		log.Info("removing BMH detached annotation")
+		log.Info("removing BMH detached and paused annotations")
 		delete(bmh.Annotations, BMH_DETACHED_ANNOTATION)
-		dirty = true
+		delete(bmh.Annotations, BMH_PAUSED_ANNOTATION)
 	}
+	// Clear annotations that are not relevant after the host is removed from an installed cluster
 	if _, ok := bmh.GetAnnotations()[BMH_HARDWARE_DETAILS_ANNOTATION]; ok {
 		log.Info("removing BMH hardware details annotation")
 		delete(bmh.Annotations, BMH_HARDWARE_DETAILS_ANNOTATION)
-		dirty = true
 	}
 
-	return reconcileComplete{dirty: dirty, stop: stop}
+	if _, ok := bmh.GetAnnotations()[BMH_SPOKE_CREATED_ANNOTATION]; ok {
+		log.Info("removing BMH spoke created annotation")
+		delete(bmh.Annotations, BMH_SPOKE_CREATED_ANNOTATION)
+	}
+
+	return reconcileComplete{stop: stop}
 }
 
 // Utility to verify whether a BMH should be reconciled based on the InfraEnv
@@ -871,7 +1041,7 @@ func (r *BMACReconciler) findInfraEnvForBMH(ctx context.Context, log logrus.Fiel
 // been set in the `InfraEnv` resource and the Image.URL value has not been
 // set in the `BareMetalHost`
 func (r *BMACReconciler) reconcileBMH(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent, infraEnv *aiv1beta1.InfraEnv) reconcileResult {
-	log.Debugf("Started BMH reconcile")
+	log.Debugf("Started reconcileBMH")
 	log.Debugf("BMH value %v", bmh)
 
 	// Stop `Reconcile` if BMH does not have an InfraEnv.
@@ -885,27 +1055,37 @@ func (r *BMACReconciler) reconcileBMH(ctx context.Context, log logrus.FieldLogge
 	//
 	// User is expected to remove the `detached` annotation manually
 	// to bring this BMH back into the pool of reconciled BMH resources.
-	bmhAnnotations := bmh.ObjectMeta.GetAnnotations()
-	if _, ok := bmhAnnotations[BMH_DETACHED_ANNOTATION]; ok {
-		result := r.ensureBMHDetached(log, bmh, agent)
-		if !result.Stop(ctx) {
-			// only create a new result here if ensureBMHDetected had no changes and no errors
-			// this ensures that the reconcile call will still exit
-			result = reconcileComplete{stop: true}
-		}
-		log.Debugf("Stopped BMH reconcile because it has been detached")
-		return result
+	if metav1.HasAnnotation(bmh.ObjectMeta, BMH_DETACHED_ANNOTATION) {
+		log.Debugf("Stopped reconcileBMH because it has been detached")
+		return reconcileComplete{}
 	}
 
-	dirty := false
 	// in case of converged flow set the custom deploy instead of the annotations
 	if r.ConvergedFlowEnabled {
 		if bmh.Spec.CustomDeploy == nil || bmh.Spec.CustomDeploy.Method != ASSISTED_DEPLOY_METHOD {
+			// Before setting customDeploy, verify the PreprovisioningImage has been
+			// updated by the assisted-service PPI controller with the correct ISO.
+			// Without this check, BMO may use its own IPA image (previously set on
+			// the PPI) to boot the host, causing the deploy step to fail and
+			// requiring an extra reboot cycle.
+			ppi := &bmh_v1alpha1.PreprovisioningImage{}
+			ppiKey := types.NamespacedName{Name: bmh.Name, Namespace: bmh.Namespace}
+			if err := r.Get(ctx, ppiKey, ppi); err != nil {
+				if !k8serrors.IsNotFound(err) {
+					return reconcileError{err: err}
+				}
+				log.Debug("PreprovisioningImage not found, waiting for it to be created")
+				return reconcileComplete{stop: true}
+			}
+			readyCondition := meta.FindStatusCondition(ppi.Status.Conditions, string(bmh_v1alpha1.ConditionImageReady))
+			if readyCondition == nil || readyCondition.Status != metav1.ConditionTrue || readyCondition.Reason != aiv1beta1.InfraEnvAvailableReason {
+				log.WithField("condition", readyCondition).Info("PreprovisioningImage is not ready with assisted-service image, waiting for update")
+				return reconcileComplete{stop: true}
+			}
 			log.Infof("Updating BMH CustomDeploy to %s", ASSISTED_DEPLOY_METHOD)
 			bmh.Spec.CustomDeploy = &bmh_v1alpha1.CustomDeploy{Method: ASSISTED_DEPLOY_METHOD}
-			dirty = true
 		}
-		return reconcileComplete{dirty: dirty, stop: false}
+		return reconcileComplete{}
 	}
 
 	annotations := bmh.ObjectMeta.GetAnnotations()
@@ -919,18 +1099,24 @@ func (r *BMACReconciler) reconcileBMH(ctx context.Context, log logrus.FieldLogge
 		// Ideally, the user would do this while creating the BMH
 		// we are just taking extra care that this is the case.
 		setAnnotation(&bmh.ObjectMeta, BMH_INSPECT_ANNOTATION, "disabled")
-		dirty = true
+	}
+
+	if bmh.Spec.AutomatedCleaningMode != bmh_v1alpha1.CleaningModeDisabled {
+		// Disable AutomatedCleaningMode if the converged flow is not enabled
+		// since AutomatedCleaning requires IPA, but disabling the converged flow
+		// disables IPA.
+		bmh.Spec.AutomatedCleaningMode = bmh_v1alpha1.CleaningModeDisabled
 	}
 
 	proceed, stopReconcileLoop, requeuePeriod, reason := shouldReconcileBMH(bmh, infraEnv)
 
 	if !proceed {
 		if requeuePeriod != 0 {
-			log.Infof("Requeuing reconcileBMH: %s", reason)
+			log.Debugf("Requeuing reconcileBMH: %s", reason)
 			return reconcileRequeue{requeueAfter: requeuePeriod}
 		}
-		log.Infof("Stopping reconcileBMH: %s", reason)
-		return reconcileComplete{dirty: dirty, stop: stopReconcileLoop}
+		log.Debugf("Stopping reconcileBMH: %s", reason)
+		return reconcileComplete{stop: stopReconcileLoop}
 	}
 
 	// Set the bmh.Spec.Image field to nil if the BMH is in a non-ready state.
@@ -940,7 +1126,7 @@ func (r *BMACReconciler) reconcileBMH(ctx context.Context, log logrus.FieldLogge
 	if bmh.Status.Provisioning.State != bmh_v1alpha1.StateReady && bmh.Status.Provisioning.State != bmh_v1alpha1.StateAvailable {
 		log.Infof("Removing BMH image field to trigger Ironic image refresh")
 		bmh.Spec.Image = nil
-		return reconcileComplete{stop: true, dirty: true}
+		return reconcileComplete{stop: true}
 	}
 
 	log.Debugf("Setting attributes in BMH")
@@ -954,21 +1140,21 @@ func (r *BMACReconciler) reconcileBMH(ctx context.Context, log logrus.FieldLogge
 	bmh.Spec.Image.DiskFormat = &liveIso
 
 	log.Infof("Image URL has been set in the BMH")
-	return reconcileComplete{dirty: true, stop: true}
+	return reconcileComplete{stop: true}
 }
 
 // Reconcile the `BareMetalHost` resource on the spoke cluster
 //
-// Baremetal-operator in the hub cluster creates a host using the live-iso feature. To add this host as a worker node
+// Baremetal-operator in the hub cluster creates a host using the live-iso feature. To add this host as a node
 // to an existing spoke cluster, the following things need to be done:
-// - Check agent to see if day2 flow needs to be triggered.
+// - Check cluster deployment to see if day2 flow needs to be triggered.
 // - Get the kubeconfig client from secret data
 // - Creates a new Machine
 // - Create BMH with externallyProvisioned set to true and set the newly created machine as ConsumerRef
 // BMH_HARDWARE_DETAILS_ANNOTATION is needed for auto approval of the CSR.
-func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
-
-	if !r.validateWorkerForDay2(log, agent) {
+func (r *BMACReconciler) reconcileDay2SpokeBMH(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
+	if metav1.HasAnnotation(bmh.ObjectMeta, BMH_SPOKE_CREATED_ANNOTATION) {
+		log.Debugf("Stopped reconcileDay2SpokeBMH because it has already been created")
 		return reconcileComplete{}
 	}
 	cd, installed, err := r.getClusterDeploymentAndCheckIfInstalled(ctx, log, agent)
@@ -976,6 +1162,7 @@ func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.Field
 		return reconcileError{err: err}
 	}
 	if !installed {
+		log.Debugf("Skipping spoke BareMetalHost reconcile for agent %s/%s since it's not day2.", agent.Name, agent.Namespace)
 		return reconcileComplete{}
 	}
 
@@ -997,10 +1184,28 @@ func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.Field
 		// If none platform do not attempt to create spoke BMH
 		return reconcileComplete{}
 	}
+	skipSpokeBMH, err := isBaremetalPlatformWithoutMAPI(ctx, r.Client, r.Installer, cd)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to determine if cluster deployment %s/%s is baremetal platform without MAPI capability", cd.Namespace, cd.Name)
+		if propagateError {
+			return reconcileError{err: err}
+		}
+		return reconcileComplete{}
+	}
+	if skipSpokeBMH {
+		log.Debugf("Skipping spoke BareMetalHost creation for agent %s/%s since it's baremetal platform without MAPI capability", agent.Name, agent.Namespace)
+		return reconcileComplete{}
+	}
 
-	if !funk.ContainsString([]string{models.HostStatusInstalling, models.HostStatusInstallingInProgress}, agent.Status.DebugInfo.State) {
-		// If agent hasn't started installing, do not create the spoke BMH yet
-		log.Debugf("Agent has not started installing, not creating the spoke BMH for %s on cluster %s", bmh.Name, agent.Spec.ClusterDeploymentName.Name)
+	if !funk.ContainsString([]string{
+		models.HostStatusInstalling,
+		models.HostStatusInstallingInProgress,
+		// MCS certificate reconciliation can stop a BMH reconcile before the
+		// spoke BMH/Machine are created. The next reconcile may happen after the
+		// Agent has joined the cluster; allow it to backfill the missing resources.
+		models.HostStatusAddedToExistingCluster,
+	}, agent.Status.DebugInfo.State) {
+		log.Debugf("Agent status %q is not eligible to create the spoke BMH for %s on cluster %s", agent.Status.DebugInfo.State, bmh.Name, agent.Spec.ClusterDeploymentName.Name)
 		return reconcileComplete{stop: false}
 	}
 
@@ -1012,7 +1217,7 @@ func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.Field
 		return reconcileError{err: err}
 	}
 
-	spokeClient, err := r.getSpokeClient(secret)
+	spokeClient, err := r.getSpokeClient(cd, secret)
 	if err != nil {
 		log.WithError(err).Errorf("failed to create spoke kubeclient")
 		return reconcileError{err: err}
@@ -1022,8 +1227,8 @@ func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.Field
 	if err != nil {
 		log.WithError(err).Errorf("failed to get checksum and url value from master spoke machine")
 		if stopReconcileLoop {
-			log.Info("Stopping reconcileSpokeBMH")
-			return reconcileComplete{dirty: false, stop: stopReconcileLoop}
+			log.Debug("Stopping reconcileDay2SpokeBMH")
+			return reconcileComplete{stop: stopReconcileLoop}
 		}
 		return reconcileError{err: err}
 	}
@@ -1039,13 +1244,14 @@ func (r *BMACReconciler) reconcileSpokeBMH(ctx context.Context, log logrus.Field
 		return reconcileError{err: err}
 	}
 
-	_, err = r.ensureSpokeMachine(ctx, log, spokeClient, bmh, cd, machineNSName, checksum, url)
+	_, err = r.ensureSpokeMachine(ctx, log, spokeClient, bmh, cd, machineNSName, checksum, url, string(agent.Status.Role))
 	if err != nil {
 		log.WithError(err).Errorf("failed to create or update spoke Machine")
 		return reconcileError{err: err}
 	}
 
-	return r.ensureBMHDetached(log, bmh, agent)
+	setAnnotation(&bmh.ObjectMeta, BMH_SPOKE_CREATED_ANNOTATION, time.Now().String())
+	return reconcileComplete{}
 }
 
 // Finds the installation disk based on the RootDeviceHints
@@ -1079,7 +1285,7 @@ func (r *BMACReconciler) findInstallationDiskID(devices []aiv1beta1.HostDisk, hi
 
 	acceptable := hostutil.GetAcceptableDisksWithHints(disks, hints)
 	if len(acceptable) > 0 {
-		return acceptable[0].ID
+		return getDiskID(acceptable)
 	}
 
 	// If hints are provided but we did not find an eligible disk, we need to raise an error.
@@ -1090,6 +1296,18 @@ func (r *BMACReconciler) findInstallationDiskID(devices []aiv1beta1.HostDisk, hi
 	// the Agent Reconciler), we let the assisted installer handle error caused by the incorrect
 	// disk further in the process.
 	return "/dev/not-found-by-hints"
+}
+
+// Given a list of acceptable disks,
+// find the multipath disk ID, if it exists,
+// otherwise return the ID of the first disk in the list.
+func getDiskID(disks []*models.Disk) string {
+	for _, disk := range disks {
+		if strings.EqualFold(string(disk.DriveType), string(models.DriveTypeMultipath)) {
+			return disk.ID
+		}
+	}
+	return disks[0].ID
 }
 
 // Finds the agents related to this ClusterDeployment
@@ -1245,21 +1463,34 @@ func (r *BMACReconciler) getChecksumAndURL(ctx context.Context, spokeClient clie
 	if len(machineList.Items) == 0 {
 		return checksum, url, errors.New("There are no machines with master label"), true
 	}
-	providerSpecValue := string(machineList.Items[0].Spec.ProviderSpec.Value.Raw)
+
+	providerSpec := machineList.Items[0].Spec.ProviderSpec.Value
+	if providerSpec == nil {
+		return checksum, url, errors.New("master machine has nil ProviderSpec"), false
+	}
 
 	var providerSpecValueObj map[string]interface{}
-	err = json.Unmarshal([]byte(providerSpecValue), &providerSpecValueObj)
-	if err != nil {
+	if err = json.Unmarshal(providerSpec.Raw, &providerSpecValueObj); err != nil {
 		return checksum, url, err, false
 	}
-	image := providerSpecValueObj["image"].(map[string]interface{})
-	checksum = fmt.Sprint(image["checksum"])
-	url = fmt.Sprint(image["url"])
-	return checksum, url, err, false
+
+	imageRaw, ok := providerSpecValueObj["image"]
+	if !ok || imageRaw == nil {
+		return checksum, url, errors.New("master machine ProviderSpec missing 'image' field"), false
+	}
+	image, ok := imageRaw.(map[string]interface{})
+	if !ok {
+		return checksum, url, errors.New("master machine ProviderSpec 'image' field has unexpected type"), false
+	}
+
+	checksum, _ = image["checksum"].(string)
+	url, _ = image["url"].(string)
+
+	return checksum, url, nil, false
 }
 
-func (r *BMACReconciler) ensureSpokeMachine(ctx context.Context, log logrus.FieldLogger, spokeClient client.Client, bmh *bmh_v1alpha1.BareMetalHost, clusterDeployment *hivev1.ClusterDeployment, machineName types.NamespacedName, checksum string, URL string) (*machinev1beta1.Machine, error) {
-	machineSpoke, mutateFn := r.newSpokeMachine(bmh, clusterDeployment, machineName, checksum, URL)
+func (r *BMACReconciler) ensureSpokeMachine(ctx context.Context, log logrus.FieldLogger, spokeClient client.Client, bmh *bmh_v1alpha1.BareMetalHost, clusterDeployment *hivev1.ClusterDeployment, machineName types.NamespacedName, checksum, URL, role string) (*machinev1beta1.Machine, error) {
+	machineSpoke, mutateFn := r.newSpokeMachine(bmh, clusterDeployment, machineName, checksum, URL, role)
 	if result, err := controllerutil.CreateOrUpdate(ctx, spokeClient, machineSpoke, mutateFn); err != nil {
 		return nil, err
 	} else if result != controllerutil.OperationResultNone {
@@ -1269,19 +1500,17 @@ func (r *BMACReconciler) ensureSpokeMachine(ctx context.Context, log logrus.Fiel
 }
 
 // Get MCS cert from the spoke cluster, encode it and add it to BMH
-// To increase the capacity of the spoke cluster on day2, while adding remote worker nodes to the spoke cluster,
+// To increase the capacity of the spoke cluster on day2, while adding day2 nodes to the spoke cluster,
 // we need to pull the MCS certificate from the spoke cluster and inject it as part of the ignition config
 // before the node boots so that there is no failure due to Certificate signed by Unknown Authority
 // Ref: https://access.redhat.com/solutions/4799921
 func (r *BMACReconciler) ensureMCSCert(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
-	if !r.validateWorkerForDay2(log, agent) {
-		return reconcileComplete{}
-	}
 	cd, installed, err := r.getClusterDeploymentAndCheckIfInstalled(ctx, log, agent)
 	if err != nil {
 		return reconcileError{err: err}
 	}
 	if !installed {
+		log.Debugf("Skipping spoke MCS cert for agent %s/%s since it's not day2.", agent.Name, agent.Namespace)
 		return reconcileComplete{}
 	}
 
@@ -1299,7 +1528,7 @@ func (r *BMACReconciler) ensureMCSCert(ctx context.Context, log logrus.FieldLogg
 		return reconcileError{err: err}
 	}
 
-	spokeClient, err := r.getSpokeClient(secret)
+	spokeClient, err := r.getSpokeClient(cd, secret)
 	if err != nil {
 		log.WithError(err).Errorf("failed to create spoke kubeclient")
 		return reconcileError{err: err}
@@ -1333,52 +1562,67 @@ func (r *BMACReconciler) ensureMCSCert(ctx context.Context, log logrus.FieldLogg
 		setAnnotation(&bmh.ObjectMeta, BMH_AGENT_IGNITION_CONFIG_OVERRIDES, ignitionWithMCSCert)
 	}
 	log.Info("MCS certificate injected")
-	return reconcileComplete{dirty: true, stop: true}
+	return reconcileComplete{stop: true}
 }
 
 func (r *BMACReconciler) createIgnitionWithMCSCert(ctx context.Context, spokeClient client.Client) (string, string, error) {
 	configMap := &corev1.ConfigMap{}
 	var encodedMCSCrt, ignitionWithMCSCert string
-	key := types.NamespacedName{
-		Namespace: "kube-system",
-		Name:      "root-ca",
+	var certData string
+
+	// MCS CA certificate lookup. In OCP 4.19, the MCO introduced a cert controller
+	// that manages machine-config-server-ca separately from kube-system/root-ca.
+	// When a pre-4.19 cluster upgrades to 4.19+, the cert controller creates
+	// machine-config-server-ca with a new CA, but kube-system/root-ca is not
+	// updated, causing them to diverge. We read machine-config-server-ca first
+	// since it is the authoritative source for the MCS TLS certificate CA.
+	// Fallbacks:
+	// - kube-system/root-ca: pre-4.19 clusters where machine-config-server-ca does not exist
+	// - openshift-config/kube-root-ca or kube-root-ca.crt: Hypershift hosted clusters
+	type caSource struct {
+		namespace string
+		name      string
+		key       string
 	}
-	if err := spokeClient.Get(ctx, key, configMap); err != nil {
-		if k8serrors.IsNotFound(err) {
-			// Hypershift stores root ca in a different configmap and different namespace
-			found := false
-			for _, keyName := range kubeRootCAHypershiftNames {
-				key = types.NamespacedName{
-					Namespace: "openshift-config",
-					Name:      keyName,
-				}
-				if err = spokeClient.Get(ctx, key, configMap); err == nil {
-					found = true
-					break
-				}
-			}
-			if !found {
-				if k8serrors.IsNotFound(err) {
-					return encodedMCSCrt, ignitionWithMCSCert, err
-				}
-			}
+	sources := []caSource{
+		{"openshift-machine-config-operator", "machine-config-server-ca", MCS_CA_BUNDLE_NAME},
+		{"kube-system", "root-ca", MCS_CERT_NAME},
+	}
+	for _, hs := range kubeRootCAHypershiftNames {
+		sources = append(sources, caSource{"openshift-config", hs, MCS_CERT_NAME})
+	}
+
+	var err error
+	for _, src := range sources {
+		key := types.NamespacedName{
+			Namespace: src.namespace,
+			Name:      src.name,
+		}
+		if err = spokeClient.Get(ctx, key, configMap); err == nil {
+			certData = strings.TrimSpace(configMap.Data[src.key])
+			break
+		}
+		// Only try the next source if the configmap doesn't exist.
+		// fail fast on other errors
+		if !k8serrors.IsNotFound(err) {
+			return encodedMCSCrt, ignitionWithMCSCert, err
 		}
 	}
-	if configMap.Data == nil {
-		return encodedMCSCrt, ignitionWithMCSCert, errors.Errorf("Configmap %s/%s  does not contain any data", configMap.Namespace, configMap.Name)
-	}
-	certData, ok := configMap.Data[MCS_CERT_NAME]
-	if !ok || len(certData) == 0 {
-		return encodedMCSCrt, ignitionWithMCSCert, errors.Errorf("Configmap data for %s/%s  does not contain %s", configMap.Namespace, configMap.Name, MCS_CERT_NAME)
-	}
-	mcsCrt := configMap.Data[MCS_CERT_NAME]
-	encodedMCSCrt = base64.StdEncoding.EncodeToString([]byte(mcsCrt))
-	ignitionWithMCSCert, err := r.formatMCSCertificateIgnition(encodedMCSCrt)
 	if err != nil {
-		return encodedMCSCrt, ignitionWithMCSCert, errors.Errorf("Failed to create ignition string with MCS cert")
+		return encodedMCSCrt, ignitionWithMCSCert, err
+	}
+	if len(certData) == 0 {
+		return encodedMCSCrt, ignitionWithMCSCert, fmt.Errorf("ConfigMap %s/%s does not contain CA certificate data", configMap.Namespace, configMap.Name)
+	}
+	if err = validations.ValidatePEMCertificateBundle(certData); err != nil {
+		return encodedMCSCrt, ignitionWithMCSCert, fmt.Errorf("ConfigMap %s/%s contains invalid CA certificate data: %w", configMap.Namespace, configMap.Name, err)
+	}
+	encodedMCSCrt = base64.StdEncoding.EncodeToString([]byte(certData))
+	ignitionWithMCSCert, err = r.formatMCSCertificateIgnition(encodedMCSCrt)
+	if err != nil {
+		return encodedMCSCrt, ignitionWithMCSCert, fmt.Errorf("Failed to create ignition string with MCS cert")
 	}
 	return encodedMCSCrt, ignitionWithMCSCert, nil
-
 }
 
 func (r *BMACReconciler) newSpokeBMH(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, machineName types.NamespacedName, agent *aiv1beta1.Agent) (*bmh_v1alpha1.BareMetalHost, controllerutil.MutateFn) {
@@ -1416,7 +1660,7 @@ func (r *BMACReconciler) newSpokeBMH(log logrus.FieldLogger, bmh *bmh_v1alpha1.B
 	return bmhSpoke, mutateFn
 }
 
-func (r *BMACReconciler) newSpokeMachine(bmh *bmh_v1alpha1.BareMetalHost, clusterDeployment *hivev1.ClusterDeployment, machineName types.NamespacedName, checksum string, URL string) (*machinev1beta1.Machine, controllerutil.MutateFn) {
+func (r *BMACReconciler) newSpokeMachine(bmh *bmh_v1alpha1.BareMetalHost, clusterDeployment *hivev1.ClusterDeployment, machineName types.NamespacedName, checksum, URL, role string) (*machinev1beta1.Machine, controllerutil.MutateFn) {
 	machine := &machinev1beta1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      machineName.Name,
@@ -1458,15 +1702,16 @@ func (r *BMACReconciler) newSpokeMachine(bmh *bmh_v1alpha1.BareMetalHost, cluste
 
 		// Setting the same labels as the rest of the machines in the spoke cluster
 		machine.Labels = AddLabel(machine.Labels, machinev1beta1.MachineClusterIDLabel, clusterDeployment.Name)
-		machine.Labels = AddLabel(machine.Labels, MACHINE_ROLE, string(models.HostRoleWorker))
-		machine.Labels = AddLabel(machine.Labels, MACHINE_TYPE, string(models.HostRoleWorker))
+		machine.Labels = AddLabel(machine.Labels, MACHINE_ROLE, role)
+		machine.Labels = AddLabel(machine.Labels, MACHINE_TYPE, role)
 		return nil
 	}
 
 	return machine, mutateFn
 }
 
-func (r *BMACReconciler) getSpokeClient(secret *corev1.Secret) (client.Client, error) {
+func (r *BMACReconciler) getSpokeClient(clusterDeployment *hivev1.ClusterDeployment,
+	secret *corev1.Secret) (client.Client, error) {
 	var err error
 	// We only set `spokeClient` during tests. Do not
 	// set it as it would cache the client, which would
@@ -1475,7 +1720,7 @@ func (r *BMACReconciler) getSpokeClient(secret *corev1.Secret) (client.Client, e
 	if r.spokeClient != nil {
 		return r.spokeClient, err
 	}
-	return r.SpokeK8sClientFactory.CreateFromSecret(secret)
+	return r.SpokeK8sClientFactory.CreateFromSecret(clusterDeployment, secret)
 }
 
 // Returns a list of BMH ReconcileRequests for a given Agent
@@ -1573,6 +1818,16 @@ func (r *BMACReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return requests
 	}
 
+	mapPPItoBMH := func(ctx context.Context, a client.Object) []reconcile.Request {
+		// PreprovisioningImage has the same name/namespace as its owning BMH
+		return []reconcile.Request{{
+			NamespacedName: types.NamespacedName{
+				Name:      a.GetName(),
+				Namespace: a.GetNamespace(),
+			},
+		}}
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("baremetal-agent-controller").
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.Config.MaxConcurrentReconciles}).
@@ -1580,6 +1835,7 @@ func (r *BMACReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&aiv1beta1.Agent{}, handler.EnqueueRequestsFromMapFunc(mapAgentToBMH)).
 		Watches(&aiv1beta1.InfraEnv{}, handler.EnqueueRequestsFromMapFunc(mapInfraEnvToBMH)).
 		Watches(&hivev1.ClusterDeployment{}, handler.EnqueueRequestsFromMapFunc(mapClusterDeploymentToBMH)).
+		Watches(&bmh_v1alpha1.PreprovisioningImage{}, handler.EnqueueRequestsFromMapFunc(mapPPItoBMH)).
 		Complete(r)
 }
 
@@ -1596,15 +1852,6 @@ func (r *BMACReconciler) formatMCSCertificateIgnition(mcsCert string) (string, e
 		return "", err
 	}
 	return buf.String(), nil
-}
-
-func (r *BMACReconciler) validateWorkerForDay2(log logrus.FieldLogger, agent *aiv1beta1.Agent) bool {
-	// Only worker role is supported for day2 operation
-	if agent.Status.Role != models.HostRoleWorker || agent.Spec.ClusterDeploymentName == nil {
-		log.Debugf("Skipping spoke BareMetalHost reconcile for agent, role %s and clusterDeployment %s.", agent.Status.Role, agent.Spec.ClusterDeploymentName)
-		return false
-	}
-	return true
 }
 
 func (r *BMACReconciler) getClusterDeploymentAndCheckIfInstalled(ctx context.Context, log logrus.FieldLogger, agent *aiv1beta1.Agent) (*hivev1.ClusterDeployment, bool, error) {
@@ -1634,52 +1881,64 @@ func (r *BMACReconciler) getClusterDeploymentAndCheckIfInstalled(ctx context.Con
 	return clusterDeployment, true, err
 }
 
-func removeBMHDetachedAnnotation(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) (dirty bool) {
+func (r *BMACReconciler) ensureBMHIsLabelled(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) reconcileResult {
+	if !metav1.HasLabel(bmh.ObjectMeta, BackupLabel) {
+		metav1.SetMetaDataLabel(&bmh.ObjectMeta, BackupLabel, BackupLabelValue)
+		log.Infof("Added backup label to BMH %s/%s", bmh.Namespace, bmh.Name)
+		return reconcileComplete{}
+	}
+
+	return reconcileComplete{}
+}
+
+func removeBMHDetachedAnnotation(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) {
 	if _, ok := bmh.GetAnnotations()[BMH_DETACHED_ANNOTATION]; ok {
 		log.Info("removing BMH detached annotation")
 		delete(bmh.Annotations, BMH_DETACHED_ANNOTATION)
-		dirty = true
 	}
-	return
 }
 
-func configureBMHForCleaning(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) (dirty bool) {
-	dirty = removeBMHDetachedAnnotation(log, bmh)
+func removeBMHPausedAnnotation(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) {
+	if _, ok := bmh.GetAnnotations()[BMH_PAUSED_ANNOTATION]; ok {
+		log.Info("removing BMH paused annotation")
+		delete(bmh.Annotations, BMH_PAUSED_ANNOTATION)
+	}
+}
+
+func configureBMHForCleaning(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) {
+	removeBMHDetachedAnnotation(log, bmh)
+	removeBMHPausedAnnotation(log, bmh)
 
 	if bmh.Spec.AutomatedCleaningMode != bmh_v1alpha1.CleaningModeMetadata {
 		log.Infof("setting BMH cleaning mode to %s", bmh_v1alpha1.CleaningModeMetadata)
 		bmh.Spec.AutomatedCleaningMode = bmh_v1alpha1.CleaningModeMetadata
-		dirty = true
 	}
-	return
 }
 
-func (r *BMACReconciler) handleDrain(ctx context.Context, log logrus.FieldLogger, agent *aiv1beta1.Agent, bmh *bmh_v1alpha1.BareMetalHost) (bool, reconcileResult) {
+func (r *BMACReconciler) handleDrain(ctx context.Context, log logrus.FieldLogger, agent *aiv1beta1.Agent, bmh *bmh_v1alpha1.BareMetalHost) reconcileResult {
 	drainTimedOut, err := nodeDrainTimedout(bmh)
 	if err != nil {
 		message := fmt.Sprintf("failed to check node drain timeout: %s", err.Error())
 		log.Error(message)
 		setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_STATUS_ANNOTATION, message)
-		return true, reconcileComplete{stop: true, dirty: true}
+		return reconcileComplete{stop: true}
 	}
 
 	currentDrainStatus := bmh.GetAnnotations()[BMH_NODE_DRAIN_STATUS_ANNOTATION]
 	if currentDrainStatus == drainStatusSuccess || currentDrainStatus == drainStatusTimeout {
-		return false, reconcileComplete{}
+		return reconcileComplete{}
 	}
 
 	if drainTimedOut {
 		log.Warn("Timed out waiting to drain node, continuing with deprovisioning")
 		setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_STATUS_ANNOTATION, drainStatusTimeout)
-		return true, reconcileComplete{}
+		return reconcileComplete{}
 	}
 
 	// have not alredy succeeded or timed out, run drain
 
-	dirty := false
 	if _, present := bmh.GetAnnotations()[BMH_NODE_DRAIN_START_ANNOTATION]; !present {
 		setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_START_ANNOTATION, time.Now().UTC().Truncate(time.Second).Format(time.RFC3339))
-		dirty = true
 	}
 
 	requeue, err := r.drainAgentNode(ctx, log, agent)
@@ -1687,20 +1946,18 @@ func (r *BMACReconciler) handleDrain(ctx context.Context, log logrus.FieldLogger
 		errString := fmt.Sprintf("failed to drain node: %s", err.Error())
 		if currentDrainStatus != errString {
 			setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_STATUS_ANNOTATION, errString)
-			dirty = true
 		}
-		return dirty, reconcileError{err: err, dirty: dirty}
+		return reconcileError{err: err}
 	}
 	if requeue {
 		if currentDrainStatus != drainStatusInProgress {
 			setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_STATUS_ANNOTATION, drainStatusInProgress)
-			dirty = true
 		}
-		return dirty, reconcileRequeue{requeueAfter: 20 * time.Second, dirty: dirty}
+		return reconcileRequeue{requeueAfter: 20 * time.Second}
 	}
 
 	setAnnotation(&bmh.ObjectMeta, BMH_NODE_DRAIN_STATUS_ANNOTATION, drainStatusSuccess)
-	return true, reconcileComplete{}
+	return reconcileComplete{}
 }
 
 // nodeDrainTimedout returns true if the node drain should be skipped due to timout, false if draining should be run
@@ -1752,7 +2009,23 @@ func (r *BMACReconciler) drainAgentNode(ctx context.Context, log logrus.FieldLog
 		return false, err
 	}
 
-	client, clientset, err := r.SpokeK8sClientFactory.ClientAndSetFromSecret(spokeSecret)
+	clusterDeploymentKey := types.NamespacedName{
+		Namespace: agent.Spec.ClusterDeploymentName.Namespace,
+		Name:      agent.Spec.ClusterDeploymentName.Name,
+	}
+	clusterDeployment := &hivev1.ClusterDeployment{}
+	err = r.Client.Get(ctx, clusterDeploymentKey, clusterDeployment)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			clusterDeployment = nil
+			err = nil
+		}
+	}
+	if err != nil {
+		log.WithError(err).Error("failed to get cluster deployment")
+		return false, err
+	}
+	client, clientset, err := r.SpokeK8sClientFactory.ClientAndSetFromSecret(clusterDeployment, spokeSecret)
 	if err != nil {
 		log.WithError(err).Error("failed to create spoke client")
 		return false, err
@@ -1774,10 +2047,14 @@ func (r *BMACReconciler) drainAgentNode(ctx context.Context, log logrus.FieldLog
 		DeleteEmptyDirData:  true,
 		GracePeriodSeconds:  -1,
 		Timeout:             20 * time.Second,
-		OnPodDeletedOrEvicted: func(pod *corev1.Pod, usingEviction bool) {
+		OnPodDeletionOrEvictionFinished: func(pod *corev1.Pod, usingEviction bool, err error) {
 			verbStr := "Deleted"
 			if usingEviction {
 				verbStr = "Evicted"
+			}
+			if err != nil {
+				log.Warnf("%s Pod %s/%s from Node %s, %s", verbStr, pod.Namespace, pod.Name, nodeName, err.Error())
+				return
 			}
 			log.Infof("%s Pod %s/%s from Node %s", verbStr, pod.Namespace, pod.Name, nodeName)
 		},
@@ -1790,13 +2067,202 @@ func (r *BMACReconciler) drainAgentNode(ctx context.Context, log logrus.FieldLog
 	}
 	if err := r.Drainer.RunCordonOrUncordon(drainHelper, node, true); err != nil {
 		log.WithError(err).Errorf("failed to cordon node %s: output: %s", nodeName, out)
-		return false, errors.Wrapf(err, "failed to cordon node %s", nodeName)
+		return false, fmt.Errorf("failed to cordon node %s: %w", nodeName, err)
 	}
 	if err := r.Drainer.RunNodeDrain(drainHelper, nodeName); err != nil {
-		log.WithError(err).Warnf("failed to drain node %s within timeout", nodeName)
+		log.WithError(err).Warnf("failed to drain node %s within %d timeout", nodeName, drainHelper.Timeout)
 		log.Debugf("node %s drain output: %s", nodeName, out)
 		return true, nil
 	}
 
 	return false, nil
+}
+
+// Adding 'status' and 'paused' annotations to the BMH.
+// This is required to ensure that the BMH is keeping its status
+// (when moving the BMH to another hub).
+// I.e. when the BMH is applied on another hub without we need
+// the 'status' annotation to restore it by BMO.
+// See BMO docs for more details: https://github.com/metal3-io/metal3-docs/blob/6a656b3eb195c1b09ba35fcad4d011c6cb02dbc2/docs/user-guide/src/bmo/status_annotation.md
+func (r *BMACReconciler) addBMHStatusAndPausedAnnotations(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) reconcileResult {
+	if bmh.ObjectMeta.Annotations == nil {
+		bmh.ObjectMeta.Annotations = make(map[string]string)
+	}
+
+	if bmh.Status.OperationalStatus != bmh_v1alpha1.OperationalStatusDetached {
+		// The BMH is not yet detached, thus we shouldn't pause it in this state
+		// (since 'detached' OperationalStatus won't be saved in status annotation).
+		return reconcileComplete{}
+	}
+
+	// Convert BMH status to a JSON string
+	statusJson, err := json.Marshal(bmh.Status)
+	if err != nil {
+		return reconcileError{err: err}
+	}
+	desiredValue := string(statusJson)
+
+	// Add 'status' annotation if missing
+	currentValue, hasAnnotation := bmh.ObjectMeta.Annotations[BMH_STATUS_ANNOTATION]
+	if !hasAnnotation || currentValue != desiredValue {
+		bmh.ObjectMeta.Annotations[BMH_STATUS_ANNOTATION] = desiredValue
+		log.Info("Added status annotation to BMH")
+	}
+
+	// Add 'paused' annotation if missing
+	desiredValue = "assisted-service-controller"
+	currentValue, hasAnnotation = bmh.ObjectMeta.Annotations[BMH_PAUSED_ANNOTATION]
+	if !hasAnnotation || currentValue != desiredValue {
+		bmh.ObjectMeta.Annotations[BMH_PAUSED_ANNOTATION] = desiredValue
+		log.Info("Added paused annotation to BMH")
+		return reconcileComplete{}
+	}
+
+	return reconcileComplete{}
+}
+
+// Removes 'paused' annotation for letting BMO to restore BMH's status (using the 'status' annotation).
+func (r *BMACReconciler) removePausedAnnotation(log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost) reconcileResult {
+	_, hasPausedAnnotation := bmh.ObjectMeta.Annotations[BMH_PAUSED_ANNOTATION]
+	_, hasStatusAnnotation := bmh.ObjectMeta.Annotations[BMH_STATUS_ANNOTATION]
+	if hasPausedAnnotation && hasStatusAnnotation {
+		delete(bmh.ObjectMeta.Annotations, BMH_PAUSED_ANNOTATION)
+		log.Info("Removed paused annotation from BMH")
+		return reconcileComplete{stop: true}
+	}
+	return reconcileComplete{}
+}
+
+// reconcileBMHStaleProvisioning detects and remediates the stale provisioning
+// condition: the Agent has completed installation but the BMH is stuck in
+// StateProvisioning because Ironic lost its connection to BMO before delivering
+// the deploy-complete callback.
+//
+// The fix cannot simply patch BMH.status directly while Ironic still tracks the
+// node — BMO would immediately overwrite the status on its next reconcile. We
+// therefore force-detach first: BMO deletes the Ironic node entirely, then the
+// live status patch to StateProvisioned is safe. When BMO next reconciles it
+// calls Adopt(), finds the Ironic node re-created in "active", and completes
+// without re-provisioning.
+//
+// A marker annotation (BMH_STALE_PROVISIONING_ANNOTATION) tracks the
+// four-phase state machine across reconcile loops:
+//
+//  1. Detect stale status; set force-detach annotation + marker="remediating".
+//  2. Wait for BMO to process the force-detach (OperationalStatus == "detached").
+//  3. Patch BMH.status.provisioning.state to StateProvisioned via r.Status().Patch().
+//  4. BMH exits StateProvisioning: remove the force-detach annotation (triggering
+//     BMO re-attach) and, once OperationalStatus clears, remove the marker.
+//     If an external actor already resolved the state, all annotations are cleaned
+//     up in a single reconcile.
+func (r *BMACReconciler) reconcileBMHStaleProvisioning(ctx context.Context, log logrus.FieldLogger, bmh *bmh_v1alpha1.BareMetalHost, agent *aiv1beta1.Agent) reconcileResult {
+	// Prechecks. If any condition is not satisfied and the marker is present,
+	// clean up the marker and force-detach annotation rather than silently
+	// no-oping — someone may have manually deleted or unbound the Agent while
+	// remediation was in progress, and we must not leave stale annotations.
+	precheckCleanup := func() reconcileResult {
+		if metav1.HasAnnotation(bmh.ObjectMeta, BMH_STALE_PROVISIONING_ANNOTATION) {
+			log.Infof("Stale provisioning remediation aborted: precheck no longer satisfied, cleaning up")
+			delete(bmh.ObjectMeta.Annotations, BMH_STALE_PROVISIONING_ANNOTATION)
+			delete(bmh.ObjectMeta.Annotations, BMH_DETACHED_ANNOTATION)
+		}
+		return reconcileComplete{}
+	}
+
+	if !r.StaleProvisioningRemediationEnabled {
+		return precheckCleanup()
+	}
+
+	if !r.ConvergedFlowEnabled || agent == nil {
+		return precheckCleanup()
+	}
+
+	_, installed, err := r.getClusterDeploymentAndCheckIfInstalled(ctx, log, agent)
+	if err != nil {
+		return reconcileError{err: err}
+	}
+	if !installed {
+		return precheckCleanup()
+	}
+
+	_, hasMarker := bmh.ObjectMeta.Annotations[BMH_STALE_PROVISIONING_ANNOTATION]
+
+	// isStaleProvisioning == false: BMH is no longer stuck in StateProvisioning (or it never was).
+	if !isStaleProvisioning(agent, bmh) {
+		if !hasMarker {
+			return reconcileComplete{}
+		}
+
+		// Always remove the force-detach annotation — this is a no-op if it was
+		// already consumed by BMO or never present (external resolution path).
+		delete(bmh.ObjectMeta.Annotations, BMH_DETACHED_ANNOTATION)
+
+		// Phase 4: BMO is still processing the detach (OperationalStatus still
+		// "detached"). The detach annotation has been removed above to trigger
+		// re-attach; wait one more reconcile for BMO to complete the re-import
+		// before removing the marker and letting the pipeline continue.
+		if bmh.Status.OperationalStatus == bmh_v1alpha1.OperationalStatusDetached {
+			log.Debugf("Stale provisioning remediation phase 4: BMH no longer stale, waiting for BMO to clear OperationalStatus (currently %s)", bmh.Status.OperationalStatus)
+			return reconcileComplete{stop: true}
+		}
+
+		// Remediation complete (or resolved externally). Remove the marker.
+		log.Infof("Stale provisioning remediation complete, BMH state is now %s", bmh.Status.Provisioning.State)
+		delete(bmh.ObjectMeta.Annotations, BMH_STALE_PROVISIONING_ANNOTATION)
+		return reconcileComplete{}
+	}
+
+	// isStaleProvisioning == true: BMH is still stuck in StateProvisioning.
+
+	if !hasMarker {
+		// Fresh detection: check if another actor already set the detach annotation.
+		if currentDetach, hasDetach := bmh.ObjectMeta.Annotations[BMH_DETACHED_ANNOTATION]; hasDetach {
+			log.Debugf("Stale provisioning detected but detach annotation already set by another actor (%s), skipping remediation", currentDetach)
+			return reconcileComplete{}
+		}
+		// Phase 1: begin remediation — set force-detach so BMO deletes the Ironic
+		// node, giving us a clean slate to patch the status without a race.
+		log.Infof("Stale provisioning remediation phase 1: host installed but BMH stuck in %s, setting force-detach", bmh.Status.Provisioning.State)
+		if bmh.ObjectMeta.Annotations == nil {
+			bmh.ObjectMeta.Annotations = make(map[string]string)
+		}
+		bmh.ObjectMeta.Annotations[BMH_STALE_PROVISIONING_ANNOTATION] = staleProvisioningRemediating
+		detachArg := bmh_v1alpha1.DetachedAnnotationArguments{Force: true}
+		detachJson, err := json.Marshal(detachArg)
+		if err != nil {
+			return reconcileError{err: err}
+		}
+		bmh.ObjectMeta.Annotations[BMH_DETACHED_ANNOTATION] = string(detachJson)
+		return reconcileComplete{stop: true}
+	}
+
+	// Marker is present from a previous reconcile loop.
+
+	// Phase 2: waiting for BMO to process the force-detach.
+	if bmh.Status.OperationalStatus != bmh_v1alpha1.OperationalStatusDetached {
+		log.Debugf("Stale provisioning remediation phase 2: waiting for BMO to detach (OperationalStatus=%s)", bmh.Status.OperationalStatus)
+		return reconcileComplete{stop: true}
+	}
+
+	// Phase 3: BMO has detached the node. Patch the live status to StateProvisioned.
+	// The detach annotation is removed in the following reconcile (Phase 4) after the
+	// API server confirms the status change, so the two writes stay in separate loops.
+	//
+	// Use a deep copy as the patch target so the deferred metadata patch (which tracks
+	// the original bmh pointer) is not contaminated by the status field mutations or
+	// the resourceVersion bump from r.Status().Patch() — both would cause a spurious
+	// optimistic-lock conflict on the deferred write.
+	bmhForStatusPatch := bmh.DeepCopy()
+	statusPatch := client.MergeFrom(bmhForStatusPatch.DeepCopy())
+	bmhForStatusPatch.Status.Provisioning.State = bmh_v1alpha1.StateProvisioned
+	bmhForStatusPatch.Status.Provisioning.CustomDeploy = bmh.Spec.CustomDeploy
+
+	if err := r.Status().Patch(ctx, bmhForStatusPatch, statusPatch); err != nil {
+		log.WithError(err).Warn("Stale provisioning remediation phase 3: failed to patch BMH status to provisioned")
+		return reconcileError{err: err}
+	}
+
+	log.Infof("Stale provisioning remediation phase 3: successfully patched BMH status to provisioned")
+
+	return reconcileComplete{stop: true}
 }

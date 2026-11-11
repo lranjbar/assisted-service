@@ -22,7 +22,7 @@ TEST_DEREGISTER_WORKER_INTERVAL = "5s"
 TEST_DELETION_WORKER_INTERVAL = "5s"
 TEST_INFRAENV_DELETION_WORKER_INTERVAL = "5s"
 
-WIREMOCK_SERVICE = "http://wiremock:8080"
+WIREMOCK_SERVICE = "http://wiremock:8070"
 
 def load_key():
     try:
@@ -67,8 +67,8 @@ def main():
             else:
                 data["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = "Never"
 
-        if deploy_options.image_pull_policy:
-            data["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = deploy_options.image_pull_policy
+        if deploy_options.image_pull_policy or os.environ.get("IMAGE_PULL_POLICY"):
+            data["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] = deploy_options.image_pull_policy or os.environ.get("IMAGE_PULL_POLICY")
 
         if deploy_options.target == deployment_options.OCP_TARGET:
             data["spec"]["replicas"] = 1 # force single replica
@@ -77,7 +77,6 @@ def main():
             service_container["env"].append({'name': 'DEPLOY_TARGET', 'value': "ocp"})
             service_container["env"].append({'name': 'STORAGE', 'value': "filesystem"})
             service_container["env"].append({'name': 'ISO_WORKSPACE_BASE_DIR', 'value': '/data'})
-            service_container["env"].append({'name': 'ISO_CACHE_DIR', 'value': '/data/cache'})
 
         if deploy_options.port:
             for port_option in deploy_options.port:

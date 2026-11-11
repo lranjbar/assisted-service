@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/pkg/ocm"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -42,16 +43,29 @@ type Authorizer interface {
 
 	/* verify that the current user has a capability (based on their organization capabilities)  */
 	HasOrgBasedCapability(ctx context.Context, capability string) (bool, error)
+
+	/* Injects the metrics API for recording auth-related counters.
+	 * Called post-construction to break cyclic init dependencies. */
+	SetMetrics(metricsAPI metrics.API)
 }
 
 func NewAuthzHandler(cfg *Config, ocmCLient *ocm.Client, log logrus.FieldLogger, db *gorm.DB) Authorizer {
-	if cfg.AuthType == TypeRHSSO {
-		return &AuthzHandler{
+	var authzr Authorizer
+	switch cfg.AuthType {
+	case TypeRHSSO:
+		authzr = &AuthzHandler{
 			cfg:    cfg,
 			client: ocmCLient,
 			log:    log,
 			db:     db,
 		}
+
+	case TypeAgentLocal:
+		authzr = &AgentLocalAuthzHandler{}
+	case TypeLocal:
+		authzr = NewLocalAuthzHandler(cfg, log)
+	default:
+		authzr = &NoneHandler{}
 	}
-	return &NoneHandler{}
+	return authzr
 }

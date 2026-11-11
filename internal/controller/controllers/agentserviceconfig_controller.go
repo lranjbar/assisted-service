@@ -17,24 +17,31 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	_ "embed"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
+	certtypes "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/go-openapi/swag"
-	"github.com/hashicorp/go-version"
 	routev1 "github.com/openshift/api/route/v1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
+	"github.com/openshift/assisted-service/internal/cluster/validations"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/gencrypto"
+	"github.com/openshift/assisted-service/internal/kubernetes"
+	"github.com/openshift/assisted-service/internal/tlsconfig"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	logutil "github.com/openshift/assisted-service/pkg/log"
+	"github.com/openshift/assisted-service/pkg/mirrorregistries"
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	toml "github.com/pelletier/go-toml"
 	pkgerror "github.com/pkg/errors"
@@ -44,6 +51,7 @@ import (
 	admregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	netv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -52,8 +60,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -78,23 +88,27 @@ const (
 
 	defaultIngressCertCMName      string = "default-ingress-cert"
 	defaultIngressCertCMNamespace string = "openshift-config-managed"
+	clusterCAConfigMapName        string = "cluster-trusted-ca-bundle"
+	assistedCAConfigMapName       string = "assisted-trusted-ca-bundle"
 
 	configmapAnnotation                 = "unsupported.agent-install.openshift.io/assisted-service-configmap"
 	imageServiceSkipVerifyTLSAnnotation = "unsupported.agent-install.openshift.io/assisted-image-service-skip-verify-tls"
+	allowUnrestrictedImagePulls         = "unsupported.agent-install.openshift.io/assisted-service-allow-unrestricted-image-pulls"
 
 	assistedConfigHashAnnotation                 = "agent-install.openshift.io/config-hash"
 	mirrorConfigHashAnnotation                   = "agent-install.openshift.io/mirror-hash"
 	userConfigHashAnnotation                     = "agent-install.openshift.io/user-config-hash"
 	osImagesAdditionalParamsConfigHashAnnotation = "agent-install.openshift.io/os-images-additional-params-config-hash"
 	osImagesCAConfigHashAnnotation               = "agent-install.openshift.io/os-images-ca-hash"
+	enableImageServiceAnnotation                 = "agent-install.openshift.io/enable-image-service"
 	imageServiceStatefulSetFinalizerName         = imageServiceName + "." + aiv1beta1.Group + "/ai-deprovision"
 	agentServiceConfigFinalizerName              = "agentserviceconfig." + aiv1beta1.Group + "/ai-deprovision"
 
 	servingCertAnnotation    = "service.beta.openshift.io/serving-cert-secret-name"
 	injectCABundleAnnotation = "service.beta.openshift.io/inject-cabundle"
+	injectTrustedCALabel     = "config.openshift.io/inject-trusted-cabundle"
 
-	defaultNamespace                 = "default"
-	osImageDownloadTrustedCAFilename = "tls.crt"
+	defaultNamespace = "default"
 
 	osImageAdditionalParamsHeadersEnvVar     = "OS_IMAGES_REQUEST_HEADERS"
 	osImageAdditionalParamsQueryParamsEnvVar = "OS_IMAGES_REQUEST_QUERY_PARAMS"
@@ -123,7 +137,14 @@ type AgentServiceConfigReconcileContext struct {
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
 
-	Recorder record.EventRecorder
+	Recorder        record.EventRecorder
+	PodIntrospector kubernetes.PodIntrospector
+
+	// flag to indicate if the operator is running on an OpenShift cluster or some other flavor of Kubernetes
+	IsOpenShift bool
+
+	// RestConfig is the cluster REST configuration, used for fetching TLS profile settings
+	RestConfig *rest.Config
 }
 
 // AgentServiceConfigReconciler reconciles a AgentServiceConfig object
@@ -161,6 +182,7 @@ type ASC struct {
 	spec *aiv1beta1.AgentServiceConfigSpec
 
 	/* Status part of AgentServiceConfig CRD family */
+	status     *aiv1beta1.AgentServiceConfigStatus
 	conditions *[]conditionsv1.Condition
 
 	/* properties. use this field for cross cluster communication */
@@ -175,6 +197,7 @@ func initASC(r *AgentServiceConfigReconciler, instance *aiv1beta1.AgentServiceCo
 	asc.Object = instance
 	asc.spec = &instance.Spec
 	asc.conditions = &instance.Status.Conditions
+	asc.status = &instance.Status
 	return asc
 }
 
@@ -191,6 +214,7 @@ type ComponentStatusFn func(context.Context, logrus.FieldLogger, string, appsv1.
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes/custom-host,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
@@ -203,6 +227,10 @@ type ComponentStatusFn func(context.Context, logrus.FieldLogger, string, appsv1.
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups="apiregistration.k8s.io",resources=apiservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cert-manager.io,resources=issuers,verbs=get;list;watch;create;update;patch;delete
 
 func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var asc ASC
@@ -214,10 +242,10 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 		})
 
 	defer func() {
-		log.Info("AgentServiceConfig Reconcile ended")
+		log.Debug("AgentServiceConfig Reconcile ended")
 	}()
 
-	log.Info("AgentServiceConfig Reconcile started")
+	log.Debug("AgentServiceConfig Reconcile started")
 
 	instance := &aiv1beta1.AgentServiceConfig{}
 	asc = initASC(r, instance)
@@ -248,28 +276,45 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 
 	// Ensure relevant finalizers exist (cleanup on deletion)
 	if err := ensureFinalizers(ctx, log, asc, agentServiceConfigFinalizerName); err != nil {
-		return ctrl.Result{Requeue: true}, err
+		return ctrl.Result{}, err
 	}
 	if !instance.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
 
+	supportsCertManager := false
+	if !asc.rec.IsOpenShift {
+		var err error
+		supportsCertManager, err = serverSupportsCertManager(ctx, asc.Client)
+		if err != nil {
+			log.WithError(err).Error("failed to check if server supports cert-manager")
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Invoke validation funcs
-	valid, err := validate(ctx, log, asc)
+	valid, err := validate(ctx, log, asc, supportsCertManager)
 	if err != nil {
-		return ctrl.Result{Requeue: true}, err
+		return ctrl.Result{}, err
 	}
 	if !valid {
 		return ctrl.Result{}, nil
 	}
 
+	// If image service is disabled and osImages is populated, add error condition
+	if !isImageServiceEnabled(asc.Object.GetAnnotations()) && len(asc.spec.OSImages) > 0 {
+		osImagesError := fmt.Errorf("osImages should be empty when image service is disabled")
+		registerOSImageError(ctx, osImagesError, asc)
+		return ctrl.Result{}, osImagesError
+	}
+
 	// Remove IPXE HTTP routes if not needed
 	if err := cleanHTTPRoute(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
+		return ctrl.Result{}, err
 	}
 
 	// Reconcile components
-	for _, component := range getComponents(asc.spec) {
+	for _, component := range getComponents(asc.spec, asc.rec.IsOpenShift, asc.Object.GetAnnotations()) {
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			return result, err
 		}
@@ -280,20 +325,17 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 		}
 	}
 
-	// Ensure image-service StatefulSet is reconciled
-	if err := ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
-
+	// Ensure image-service StatefulSet is reconciled (only if image service is not disabled)
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		if err := ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	if err := updateConditions(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
-	}
-
-	return ctrl.Result{}, nil
+	return updateConditions(ctx, log, asc)
 }
 
-func updateConditions(ctx context.Context, log *logrus.Entry, asc ASC) error {
+func updateConditions(ctx context.Context, log *logrus.Entry, asc ASC) (ctrl.Result, error) {
 	msg := "AgentServiceConfig reconcile completed without error."
 	conditionsv1.SetStatusConditionNoHeartbeat(asc.conditions, conditionsv1.Condition{
 		Type:    aiv1beta1.ConditionReconcileCompleted,
@@ -302,18 +344,30 @@ func updateConditions(ctx context.Context, log *logrus.Entry, asc ASC) error {
 		Message: msg,
 	})
 
-	if err := monitorOperands(ctx, log, asc); err != nil {
+	if message, err := monitorOperands(ctx, log, asc); err != nil {
 		conditionsv1.SetStatusConditionNoHeartbeat(asc.conditions, conditionsv1.Condition{
 			Type:    aiv1beta1.ConditionDeploymentsHealthy,
 			Status:  corev1.ConditionFalse,
-			Reason:  aiv1beta1.ReasonDeploymentFailure,
+			Reason:  aiv1beta1.ReasonMonitoringFailure,
 			Message: err.Error(),
 		})
 		if updateErr := asc.Client.Status().Update(ctx, asc.Object); updateErr != nil {
 			log.WithError(updateErr).Error("Failed to update status")
-			return updateErr
+			return ctrl.Result{}, updateErr
 		}
-		return err
+		return ctrl.Result{}, err
+	} else if message != "" {
+		conditionsv1.SetStatusConditionNoHeartbeat(asc.conditions, conditionsv1.Condition{
+			Type:    aiv1beta1.ConditionDeploymentsHealthy,
+			Status:  corev1.ConditionFalse,
+			Reason:  aiv1beta1.ReasonDeploymentFailure,
+			Message: message,
+		})
+		if updateErr := asc.Client.Status().Update(ctx, asc.Object); updateErr != nil {
+			log.WithError(updateErr).Error("Failed to update status")
+			return ctrl.Result{}, updateErr
+		}
+		return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // Recheck operand health after recording an unhealthy condition.
 	}
 
 	conditionsv1.SetStatusConditionNoHeartbeat(asc.conditions, conditionsv1.Condition{
@@ -325,38 +379,70 @@ func updateConditions(ctx context.Context, log *logrus.Entry, asc ASC) error {
 
 	if statusErr := asc.Client.Status().Update(ctx, asc.Object); statusErr != nil {
 		log.WithError(statusErr).Error("Failed to update status")
-		return statusErr
+		return ctrl.Result{}, statusErr
 	}
 
-	return nil
+	return ctrl.Result{}, nil
 }
 
-func getComponents(spec *aiv1beta1.AgentServiceConfigSpec) []component {
+func getComponents(spec *aiv1beta1.AgentServiceConfigSpec, isOpenshift bool, annotations map[string]string) []component {
+	imageServiceEnabled := isImageServiceEnabled(annotations)
+
 	components := []component{
 		{"FilesystemStorage", aiv1beta1.ReasonStorageFailure, newFilesystemPVC},
 		{"DatabaseStorage", aiv1beta1.ReasonStorageFailure, newDatabasePVC},
-		{"ImageServiceService", aiv1beta1.ReasonImageHandlerServiceFailure, newImageServiceService},
 		{"AgentService", aiv1beta1.ReasonAgentServiceFailure, newAgentService},
-		{"ServiceMonitor", aiv1beta1.ReasonAgentServiceMonitorFailure, newServiceMonitor},
-		{"ImageServiceRoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceRoute},
-		{"AgentRoute", aiv1beta1.ReasonAgentRouteFailure, newAgentRoute},
+		{"AgentServiceNetworkPolicy", aiv1beta1.ReasonNetworkPolicyFailure, newAssistedServiceNetworkPolicy},
 		{"AgentLocalAuthSecret", aiv1beta1.ReasonAgentLocalAuthSecretFailure, newAgentLocalAuthSecret},
 		{"DatabaseSecret", aiv1beta1.ReasonPostgresSecretFailure, newPostgresSecret},
-		{"ImageServiceServiceAccount", aiv1beta1.ReasonImageHandlerServiceAccountFailure, newImageServiceServiceAccount},
-		{"IngressCertConfigMap", aiv1beta1.ReasonIngressCertFailure, newIngressCertCM},
-		{"ImageServiceConfigMap", aiv1beta1.ReasonConfigFailure, newImageServiceConfigMap},
-		{"AssistedServiceConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedCM},
-		{"AssistedServiceDeployment", aiv1beta1.ReasonDeploymentFailure, newAssistedServiceDeployment},
+		{"AgentRoute", aiv1beta1.ReasonAgentRouteFailure, newAgentRoute},
 	}
-	// Additional routes need to be synced if HTTP iPXE routes are exposed
-	if exposeIPXEHTTPRoute(spec) {
+
+	if imageServiceEnabled {
 		components = append(components,
-			component{"ImageServiceIPXERoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceIPXERoute},
-			component{"AgentIPXERoute", aiv1beta1.ReasonAgentRouteFailure, newAgentIPXERoute},
+			component{"ImageServiceService", aiv1beta1.ReasonImageHandlerServiceFailure, newImageServiceService},
+			component{"ImageServiceNetworkPolicy", aiv1beta1.ReasonNetworkPolicyFailure, newImageServiceNetworkPolicy},
+			component{"ImageServiceServiceAccount", aiv1beta1.ReasonImageHandlerServiceAccountFailure, newImageServiceServiceAccount},
+			component{"ImageServiceRoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceRoute},
 		)
 	}
-	return components
 
+	if isOpenshift {
+		components = append(components,
+			component{"ServiceMonitor", aiv1beta1.ReasonAgentServiceMonitorFailure, newServiceMonitor},
+			component{"IngressCertConfigMap", aiv1beta1.ReasonIngressCertFailure, newIngressCertCM},
+			component{"ClusterTrustedCAConfigMap", aiv1beta1.ReasonConfigFailure, newClusterTrustedCACM},
+			component{"AssistedTrustedCAConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedTrustedCACM},
+		)
+
+		if imageServiceEnabled {
+			components = append(components,
+				// this is only for mounting in the https certs
+				component{"ImageServiceConfigMap", aiv1beta1.ReasonConfigFailure, newImageServiceConfigMap},
+			)
+		}
+
+		// Additional routes need to be synced if HTTP iPXE routes are exposed
+		if exposeIPXEHTTPRoute(spec) {
+			components = append(components,
+				component{"AgentIPXERoute", aiv1beta1.ReasonAgentRouteFailure, newAgentIPXERoute},
+			)
+			if imageServiceEnabled {
+				components = append(components,
+					component{"ImageServiceIPXERoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceIPXERoute},
+				)
+			}
+		}
+	} else {
+		components = append(components, certManagerComponents()...)
+	}
+	// needs to be created after all routes to pull the hostnames into the configmap
+	components = append(components,
+		component{"AssistedServiceConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedCM})
+	components = append(components,
+		// needs to be created after all of the configmaps to calculate the config hash and ensure the correct data exists
+		component{"AssistedServiceDeployment", aiv1beta1.ReasonDeploymentFailure, newAssistedServiceDeployment})
+	return components
 }
 
 func (r *AgentServiceConfigReconciler) getWebhookComponents() []component {
@@ -366,6 +452,7 @@ func (r *AgentServiceConfigReconciler) getWebhookComponents() []component {
 		{"InfraEnvValidatingWebHook", aiv1beta1.ReasonValidatingWebHookFailure, newInfraEnvWebHook},
 		{"AgentValidatingWebHook", aiv1beta1.ReasonValidatingWebHookFailure, newAgentWebHook},
 		{"WebHookService", aiv1beta1.ReasonWebHookServiceFailure, newWebHookService},
+		{"WebHookNetworkPolicy", aiv1beta1.ReasonNetworkPolicyFailure, newWebhookNetworkPolicy},
 		{"WebHookServiceDeployment", aiv1beta1.ReasonWebHookDeploymentFailure, newWebHookDeployment},
 		{"WebHookServiceAccount", aiv1beta1.ReasonWebHookServiceAccountFailure, newWebHookServiceAccount},
 		{"WebHookClusterRole", aiv1beta1.ReasonWebHookClusterRoleFailure, newWebHookClusterRole},
@@ -387,9 +474,9 @@ func reconcileComponent(ctx context.Context, log *logrus.Entry, asc ASC, compone
 		})
 		if statusErr := asc.Client.Status().Update(ctx, asc.Object); statusErr != nil {
 			log.WithError(err).Error("Failed to update status")
-			return ctrl.Result{Requeue: true}, statusErr
+			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{Requeue: true}, err
+		return ctrl.Result{}, err
 	}
 
 	if result, err := controllerutil.CreateOrUpdate(ctx, asc.Client, obj, mutateFn); err != nil {
@@ -403,12 +490,12 @@ func reconcileComponent(ctx context.Context, log *logrus.Entry, asc ASC, compone
 		})
 		if statusErr := asc.Client.Status().Update(ctx, asc.Object); statusErr != nil {
 			log.WithError(err).Error("Failed to update status")
-			return ctrl.Result{Requeue: true}, statusErr
+			return ctrl.Result{}, statusErr
 		}
 	} else if result != controllerutil.OperationResultNone {
 		log.Info(component.name + " created")
 	}
-	return ctrl.Result{Requeue: false}, nil
+	return ctrl.Result{}, nil
 }
 
 func ensureFinalizers(ctx context.Context, log logrus.FieldLogger, asc ASC, finalizerName string) error {
@@ -461,37 +548,70 @@ func cleanHTTPRoute(ctx context.Context, log logrus.FieldLogger, asc ASC) error 
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AgentServiceConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	ingressCMPredicates := builder.WithPredicates(predicate.Funcs{
-		CreateFunc:  func(e event.CreateEvent) bool { return checkIngressCMName(e.Object) },
-		UpdateFunc:  func(e event.UpdateEvent) bool { return checkIngressCMName(e.ObjectNew) },
-		DeleteFunc:  func(e event.DeleteEvent) bool { return checkIngressCMName(e.Object) },
-		GenericFunc: func(e event.GenericEvent) bool { return checkIngressCMName(e.Object) },
-	})
-	ingressCMHandler := handler.EnqueueRequestsFromMapFunc(
-		func(_ context.Context, _ client.Object) []reconcile.Request {
-			return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: AgentServiceConfigName}}}
-		},
-	)
-
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1beta1.AgentServiceConfig{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
-		Owns(&monitoringv1.ServiceMonitor{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Secret{}).
-		Owns(&routev1.Route{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&rbacv1.ClusterRoleBinding{}).
 		Owns(&rbacv1.ClusterRole{}).
-		Owns(&apiregv1.APIService{}).
-		Watches(&corev1.ConfigMap{}, ingressCMHandler, ingressCMPredicates).
-		Complete(r)
+		Owns(&apiregv1.APIService{})
+
+	mirrorRegistryCMPredicates := builder.WithPredicates(predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return e.ObjectNew.GetNamespace() == r.Namespace },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+		GenericFunc: func(e event.GenericEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+	})
+	mirrorRegistryCMHandler := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, cm client.Object) []reconcile.Request {
+			log := logutil.FromContext(ctx, r.Log).WithFields(
+				logrus.Fields{
+					"mirror_registry": cm.GetName(),
+				})
+			instance := &aiv1beta1.AgentServiceConfig{}
+			if err := r.Get(ctx, types.NamespacedName{Name: AgentServiceConfigName}, instance); err != nil {
+				log.Debugf("failed to get AgentServiceConfig")
+				return []reconcile.Request{}
+			}
+			if instance.Spec.MirrorRegistryRef != nil && instance.Spec.MirrorRegistryRef.Name == cm.GetName() {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: AgentServiceConfigName}}}
+			}
+			return []reconcile.Request{}
+		},
+	)
+	b = b.Watches(&corev1.ConfigMap{}, mirrorRegistryCMHandler, mirrorRegistryCMPredicates)
+
+	if r.IsOpenShift {
+		ingressCMPredicates := builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(e event.CreateEvent) bool { return checkIngressCMName(e.Object) },
+			UpdateFunc:  func(e event.UpdateEvent) bool { return checkIngressCMName(e.ObjectNew) },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return checkIngressCMName(e.Object) },
+			GenericFunc: func(e event.GenericEvent) bool { return checkIngressCMName(e.Object) },
+		})
+		ingressCMHandler := handler.EnqueueRequestsFromMapFunc(
+			func(_ context.Context, _ client.Object) []reconcile.Request {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: AgentServiceConfigName}}}
+			},
+		)
+
+		b = b.Owns(&monitoringv1.ServiceMonitor{}).
+			Owns(&routev1.Route{}).
+			Watches(&corev1.ConfigMap{}, ingressCMHandler, ingressCMPredicates)
+	} else {
+		b = b.Owns(&netv1.Ingress{}).
+			Owns(&certtypes.Certificate{}).
+			Owns(&certtypes.Issuer{})
+	}
+
+	return b.Complete(r)
 }
 
-func monitorOperands(ctx context.Context, log logrus.FieldLogger, asc ASC) error {
+func monitorOperands(ctx context.Context, log logrus.FieldLogger, asc ASC) (string, error) {
 	isStatusConditionFalse := func(conditions []appsv1.DeploymentCondition, conditionType appsv1.DeploymentConditionType) bool {
 		for _, condition := range conditions {
 			if condition.Type == conditionType {
@@ -502,58 +622,59 @@ func monitorOperands(ctx context.Context, log logrus.FieldLogger, asc ASC) error
 	}
 
 	// monitor deployments
-	for _, deployName := range []string{"agentinstalladmission", "assisted-service"} {
+	deploys := []string{"assisted-service"}
+	if asc.rec.IsOpenShift {
+		deploys = append(deploys, "agentinstalladmission")
+	}
+	for _, deployName := range deploys {
 		deployment := &appsv1.Deployment{}
 		if err := asc.Client.Get(ctx, types.NamespacedName{Name: deployName, Namespace: asc.namespace}, deployment); err != nil {
-			return err
+			return "", err
 		}
 
 		if isStatusConditionFalse(deployment.Status.Conditions, appsv1.DeploymentAvailable) {
 			msg := fmt.Sprintf("Deployment %s is not available", deployName)
 			log.Error(msg)
-			return pkgerror.New(msg)
+			return msg, nil
 		}
 
 		if isStatusConditionFalse(deployment.Status.Conditions, appsv1.DeploymentProgressing) {
 			msg := fmt.Sprintf("Deployment %s is not progressing", deployName)
 			log.Error(msg)
-			return pkgerror.New(msg)
+			return msg, nil
 		}
 	}
 
-	// monitor statefulset
+	return monitorImageServiceStatefulSet(ctx, log, asc)
+}
+
+// Monitor Image Service StatefulSet. NOOP if image service is disabled.
+func monitorImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc ASC) (string, error) {
+	if !isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		return "", nil
+	}
 	ss := &appsv1.StatefulSet{}
 	if err := asc.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: asc.namespace}, ss); err != nil {
-		return err
+		return "", err
 	}
-
 	desiredReplicas := *ss.Spec.Replicas
-	checkReplicas := func(replicas int32, name string) error {
+	for kind, replicas := range map[string]int32{
+		"created": ss.Status.Replicas,
+		"ready":   ss.Status.ReadyReplicas,
+		"current": ss.Status.CurrentReplicas,
+		"updated": ss.Status.UpdatedReplicas,
+	} {
 		if replicas != desiredReplicas {
-			return fmt.Errorf("StatefulSet %s %s replicas does not match desired replicas", imageServiceName, name)
+			return fmt.Sprintf("StatefulSet %s %s replicas does not match desired replicas", imageServiceName, kind), nil
 		}
-		return nil
 	}
-	if err := checkReplicas(ss.Status.Replicas, "created"); err != nil {
-		return err
-	}
-	if err := checkReplicas(ss.Status.ReadyReplicas, "ready"); err != nil {
-		return err
-	}
-	if err := checkReplicas(ss.Status.CurrentReplicas, "current"); err != nil {
-		return err
-	}
-	if err := checkReplicas(ss.Status.UpdatedReplicas, "updated"); err != nil {
-		return err
-	}
-
-	return nil
+	return "", nil
 }
 
 func newFilesystemPVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), serviceName),
 			Namespace: asc.namespace,
 		},
 		Spec: asc.spec.FileSystemStorage,
@@ -576,7 +697,7 @@ func newFilesystemPVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (cli
 func newDatabasePVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      databaseName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), databaseName),
 			Namespace: asc.namespace,
 		},
 		Spec: asc.spec.DatabaseStorage,
@@ -609,17 +730,19 @@ func newAgentService(ctx context.Context, log logrus.FieldLogger, asc ASC) (clie
 			return err
 		}
 		addAppLabel(serviceName, &svc.ObjectMeta)
-		setAnnotation(&svc.ObjectMeta, servingCertAnnotation, serviceName)
+		if asc.rec.IsOpenShift {
+			setAnnotation(&svc.ObjectMeta, servingCertAnnotation, serviceName)
+		}
 		if len(svc.Spec.Ports) != 2 {
 			svc.Spec.Ports = []corev1.ServicePort{}
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{}, corev1.ServicePort{})
 		}
 		svc.Spec.Ports[0].Name = serviceName
-		svc.Spec.Ports[0].Port = int32(servicePort.IntValue())
+		svc.Spec.Ports[0].Port = int32(servicePort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[0].TargetPort = servicePort
 		svc.Spec.Ports[0].Protocol = corev1.ProtocolTCP
 		svc.Spec.Ports[1].Name = fmt.Sprintf("%s-http", serviceName)
-		svc.Spec.Ports[1].Port = int32(serviceHTTPPort.IntValue())
+		svc.Spec.Ports[1].Port = int32(serviceHTTPPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[1].TargetPort = serviceHTTPPort
 		svc.Spec.Ports[1].Protocol = corev1.ProtocolTCP
 		svc.Spec.Selector = map[string]string{"app": serviceName}
@@ -643,17 +766,19 @@ func newImageServiceService(ctx context.Context, log logrus.FieldLogger, asc ASC
 			return err
 		}
 		addAppLabel(serviceName, &svc.ObjectMeta)
-		setAnnotation(&svc.ObjectMeta, servingCertAnnotation, imageServiceName)
+		if asc.rec.IsOpenShift {
+			setAnnotation(&svc.ObjectMeta, servingCertAnnotation, imageServiceName)
+		}
 		if len(svc.Spec.Ports) != 2 {
 			svc.Spec.Ports = []corev1.ServicePort{}
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{}, corev1.ServicePort{})
 		}
 		svc.Spec.Ports[0].Name = imageServiceName
-		svc.Spec.Ports[0].Port = int32(imageHandlerPort.IntValue())
+		svc.Spec.Ports[0].Port = int32(imageHandlerPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[0].TargetPort = imageHandlerPort
 		svc.Spec.Ports[0].Protocol = corev1.ProtocolTCP
 		svc.Spec.Ports[1].Name = fmt.Sprintf("%s-http", imageServiceName)
-		svc.Spec.Ports[1].Port = int32(imageHandlerHTTPPort.IntValue())
+		svc.Spec.Ports[1].Port = int32(imageHandlerHTTPPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[1].TargetPort = imageHandlerHTTPPort
 		svc.Spec.Ports[1].Protocol = corev1.ProtocolTCP
 		svc.Spec.Selector = map[string]string{"app": imageServiceName}
@@ -662,6 +787,166 @@ func newImageServiceService(ctx context.Context, log logrus.FieldLogger, asc ASC
 	}
 
 	return svc, mutateFn, nil
+}
+
+func newAssistedServiceNetworkPolicy(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	np := &netv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: asc.namespace,
+		},
+	}
+
+	mutateFn := func() error {
+		if err := controllerutil.SetControllerReference(asc.Object, np, asc.rec.Scheme); err != nil {
+			return err
+		}
+		addAppLabel(serviceName, &np.ObjectMeta)
+
+		np.Spec = netv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": serviceName},
+			},
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress},
+			Ingress: []netv1.NetworkPolicyIngressRule{
+				{
+					From: []netv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{}},
+						{NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"network.openshift.io/policy-group": "ingress"},
+						}},
+					},
+					Ports: []netv1.NetworkPolicyPort{
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &servicePort},
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &serviceHTTPPort},
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 9443}},
+					},
+				},
+				{
+					From: []netv1.NetworkPolicyPeer{
+						{NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"network.openshift.io/policy-group": "monitoring"},
+						}},
+					},
+					Ports: []netv1.NetworkPolicyPort{
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &servicePort},
+					},
+				},
+			},
+		}
+		return nil
+	}
+
+	return np, mutateFn, nil
+}
+
+func newImageServiceNetworkPolicy(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	np := &netv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      imageServiceName,
+			Namespace: asc.namespace,
+		},
+	}
+
+	mutateFn := func() error {
+		if err := controllerutil.SetControllerReference(asc.Object, np, asc.rec.Scheme); err != nil {
+			return err
+		}
+		addAppLabel(imageServiceName, &np.ObjectMeta)
+
+		np.Spec = netv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": imageServiceName},
+			},
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress},
+			Ingress: []netv1.NetworkPolicyIngressRule{
+				{
+					From: []netv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{}},
+						{NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"network.openshift.io/policy-group": "ingress"},
+						}},
+					},
+					Ports: []netv1.NetworkPolicyPort{
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &imageHandlerPort},
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &imageHandlerHTTPPort},
+					},
+				},
+			},
+		}
+		return nil
+	}
+
+	return np, mutateFn, nil
+}
+
+func newWebhookNetworkPolicy(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	np := &netv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      webhookServiceName,
+			Namespace: asc.namespace,
+		},
+	}
+
+	mutateFn := func() error {
+		if err := controllerutil.SetControllerReference(asc.Object, np, asc.rec.Scheme); err != nil {
+			return err
+		}
+		addAppLabel(webhookServiceName, &np.ObjectMeta)
+
+		np.Spec = netv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": webhookServiceName},
+			},
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress, netv1.PolicyTypeEgress},
+			Ingress: []netv1.NetworkPolicyIngressRule{
+				{
+					Ports: []netv1.NetworkPolicyPort{
+						{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 9443}},
+					},
+				},
+			},
+			Egress: networkPolicyDefaultEgress(),
+		}
+		return nil
+	}
+
+	return np, mutateFn, nil
+}
+
+func networkPolicyDefaultEgress() []netv1.NetworkPolicyEgressRule {
+	return []netv1.NetworkPolicyEgressRule{
+		{
+			To: []netv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"kubernetes.io/metadata.name": "openshift-dns"},
+				},
+			}},
+			Ports: []netv1.NetworkPolicyPort{
+				{Protocol: ptr.To(corev1.ProtocolUDP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 5353}},
+				{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 5353}},
+			},
+		},
+		{
+			To: []netv1.NetworkPolicyPeer{
+				{IPBlock: &netv1.IPBlock{CIDR: "0.0.0.0/0"}},
+				{IPBlock: &netv1.IPBlock{CIDR: "::/0"}},
+			},
+			Ports: []netv1.NetworkPolicyPort{
+				{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 6443}},
+			},
+		},
+		{
+			To: []netv1.NetworkPolicyPeer{
+				{IPBlock: &netv1.IPBlock{CIDR: "0.0.0.0/0"}},
+				{IPBlock: &netv1.IPBlock{CIDR: "::/0"}},
+			},
+			Ports: []netv1.NetworkPolicyPort{
+				{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 443}},
+				{Protocol: ptr.To(corev1.ProtocolTCP), Port: &intstr.IntOrString{Type: intstr.Int, IntVal: 5000}},
+			},
+		},
+	}
 }
 
 func newServiceMonitor(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
@@ -677,6 +962,8 @@ func newServiceMonitor(ctx context.Context, log logrus.FieldLogger, asc ASC) (cl
 			return err
 		}
 
+		serverName := fmt.Sprintf("%s.%s.svc", serviceName, asc.namespace)
+
 		addAppLabel(serviceName, &sm.ObjectMeta)
 		sm.Spec.Endpoints = []monitoringv1.Endpoint{{
 			Port:   serviceName,
@@ -684,7 +971,7 @@ func newServiceMonitor(ctx context.Context, log logrus.FieldLogger, asc ASC) (cl
 			TLSConfig: &monitoringv1.TLSConfig{
 				CAFile: "/etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt",
 				SafeTLSConfig: monitoringv1.SafeTLSConfig{
-					ServerName: fmt.Sprintf("%s.%s.svc", serviceName, asc.namespace),
+					ServerName: &serverName,
 				},
 			},
 		}}
@@ -698,6 +985,12 @@ func newServiceMonitor(ctx context.Context, log logrus.FieldLogger, asc ASC) (cl
 }
 
 func newAgentRoute(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	if !asc.rec.IsOpenShift {
+		if asc.spec.Ingress == nil {
+			return nil, nil, fmt.Errorf("ingress config is required for non-OpenShift deployments")
+		}
+		return newIngress(asc, serviceName, asc.spec.Ingress.AssistedServiceHostname, int32(servicePort.IntValue())) // nolint: gosec
+	}
 	weight := int32(100)
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
@@ -815,6 +1108,12 @@ func newAgentIPXERoute(ctx context.Context, log logrus.FieldLogger, asc ASC) (cl
 }
 
 func newImageServiceRoute(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	if !asc.rec.IsOpenShift {
+		if asc.spec.Ingress == nil {
+			return nil, nil, fmt.Errorf("ingress config is required for non-OpenShift deployments")
+		}
+		return newIngress(asc, imageServiceName, asc.spec.Ingress.ImageServiceHostname, int32(imageHandlerPort.IntValue())) // nolint: gosec
+	}
 	weight := int32(100)
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
@@ -860,7 +1159,7 @@ func newImageServiceIPXERoute(ctx context.Context, log logrus.FieldLogger, asc A
 func newAgentLocalAuthSecret(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agentLocalAuthSecretName,
+			Name:      getSecretName(asc.Object.GetAnnotations(), agentLocalAuthSecretName),
 			Namespace: asc.namespace,
 			Labels: map[string]string{
 				BackupLabel: BackupLabelValue,
@@ -895,7 +1194,7 @@ func newAgentLocalAuthSecret(ctx context.Context, log logrus.FieldLogger, asc AS
 func newPostgresSecret(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      databaseName,
+			Name:      getSecretName(asc.Object.GetAnnotations(), databaseName),
 			Namespace: asc.namespace,
 			Labels: map[string]string{
 				BackupLabel: BackupLabelValue,
@@ -981,6 +1280,83 @@ func newIngressCertCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (cli
 	return cm, mutateFn, nil
 }
 
+func newClusterTrustedCACM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterCAConfigMapName,
+			Namespace: asc.namespace,
+		},
+	}
+
+	mutateFn := func() error {
+		if err := controllerutil.SetControllerReference(asc.Object, cm, asc.rec.Scheme); err != nil {
+			return err
+		}
+		metav1.SetMetaDataLabel(&cm.ObjectMeta, injectTrustedCALabel, "true")
+		return nil
+	}
+
+	return cm, mutateFn, nil
+}
+
+func newAssistedTrustedCACM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	var b strings.Builder
+
+	clusterTrustedCACM := &corev1.ConfigMap{}
+	if err := asc.Client.Get(ctx, types.NamespacedName{Name: clusterCAConfigMapName, Namespace: asc.namespace}, clusterTrustedCACM); err != nil {
+		log.WithError(err).Error("Failed to get cluster trusted CA config map")
+		return nil, nil, err
+	}
+	trustedCABundle := clusterTrustedCACM.Data[caBundleKey]
+	if trustedCABundle == "" {
+		return nil, nil, fmt.Errorf("waiting for cluster trusted CA bundle to be injected in config map %s", clusterCAConfigMapName)
+	}
+	if _, err := b.WriteString(trustedCABundle); err != nil {
+		log.WithError(err).Error("Failed to get ca-bundle from cluster CA ConfigMap")
+		return nil, nil, err
+	}
+
+	if asc.spec.MirrorRegistryRef != nil {
+		mirrorCM := &corev1.ConfigMap{}
+		namespacedName := types.NamespacedName{Name: asc.spec.MirrorRegistryRef.Name, Namespace: asc.namespace}
+		if err := asc.Client.Get(ctx, namespacedName, mirrorCM); err != nil {
+			return nil, nil, err
+		}
+		if _, err := b.WriteString("\n" + mirrorCM.Data[mirrorRegistryRefCertKey]); err != nil {
+			log.WithError(err).Error("Failed to get ca-bundle from mirror registry CA ConfigMap")
+			return nil, nil, err
+		}
+	}
+
+	// Ensure no duplicate certificates in the CA bundle
+	caBundle, numOfDuplicates, err := common.RemoveDuplicatesFromCaBundle(b.String())
+	if err != nil {
+		return nil, nil, err
+	}
+	if numOfDuplicates > 0 {
+		log.Infof("Removed %d duplicate certificates from CA bundle", numOfDuplicates)
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      assistedCAConfigMapName,
+			Namespace: asc.namespace,
+		},
+	}
+
+	mutateFn := func() error {
+		if err := controllerutil.SetControllerReference(asc.Object, cm, asc.rec.Scheme); err != nil {
+			return err
+		}
+		cm.Data = map[string]string{
+			caBundleKey: caBundle,
+		}
+		return nil
+	}
+
+	return cm, mutateFn, nil
+}
+
 func newImageServiceConfigMap(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1002,22 +1378,40 @@ func newImageServiceConfigMap(ctx context.Context, log logrus.FieldLogger, asc A
 }
 
 func urlForRoute(ctx context.Context, asc ASC, routeName string) (string, error) {
-	route := &routev1.Route{}
-	err := asc.Client.Get(ctx, types.NamespacedName{Name: routeName, Namespace: asc.namespace}, route)
-	if err != nil || route.Spec.Host == "" {
-		if err == nil {
-			err = fmt.Errorf("%s route host is empty", routeName)
+	var hostname, scheme string
+
+	scheme = "https"
+	if asc.rec.IsOpenShift {
+		route := &routev1.Route{}
+		err := asc.Client.Get(ctx, types.NamespacedName{Name: routeName, Namespace: asc.namespace}, route)
+		if err != nil || route.Spec.Host == "" {
+			if err == nil {
+				err = fmt.Errorf("%s route host is empty", routeName)
+			}
+			return "", err
 		}
-		return "", err
+		hostname = route.Spec.Host
+	} else {
+		if asc.spec.Ingress == nil {
+			return "", fmt.Errorf("ingress config is required for non-OpenShift deployments")
+		}
+		switch routeName {
+		case serviceName:
+			hostname = asc.spec.Ingress.AssistedServiceHostname
+		case imageServiceName:
+			hostname = asc.spec.Ingress.ImageServiceHostname
+		default:
+			return "", fmt.Errorf("unknown route name %s", routeName)
+		}
 	}
 
-	u := &url.URL{Scheme: "https", Host: route.Spec.Host}
+	u := &url.URL{Scheme: scheme, Host: hostname}
 	return u.String(), nil
 }
 
 // unauthenticatedRegistries appends mirror registries and user-specified unauthenticated registries to the default list
 func unauthenticatedRegistries(ctx context.Context, asc ASC) string {
-	unauthenticatedRegistries := []string{"quay.io", "registry.svc.ci.openshift.org"}
+	unauthenticatedRegistries := []string{"quay.io", "registry.ci.openshift.org"}
 	if asc.spec.MirrorRegistryRef != nil {
 		cm := &corev1.ConfigMap{}
 		// Any errors in the following code block is not handled since they indicate a problem with the
@@ -1034,9 +1428,18 @@ func unauthenticatedRegistries(ctx context.Context, asc ASC) string {
 						}
 					}
 				}
+
+				if mirrorsData, err := mirrorregistries.ExtractLocationMirrorDataFromRegistriesFromToml(contents); err == nil {
+					for _, registriesConf := range mirrorsData {
+						if registry, err := validations.ParseRegistry(registriesConf.Location); err == nil {
+							unauthenticatedRegistries = append(unauthenticatedRegistries, registry)
+						}
+					}
+				}
 			}
 		}
 	}
+
 	if asc.spec.UnauthenticatedRegistries != nil {
 		unauthenticatedRegistries = append(unauthenticatedRegistries, asc.spec.UnauthenticatedRegistries...)
 	}
@@ -1047,6 +1450,19 @@ func unauthenticatedRegistries(ctx context.Context, asc ASC) string {
 //go:embed default_controller_hw_requirements.json
 var defaultControllerHardwareRequirements string
 
+var defaultWaitingForControlPlaneHostStageTimeout = "90m"
+
+func getWaitingForControlPlaneHostStageTimeout() string {
+	if timeout := os.Getenv("HOST_STAGE_WAITING_FOR_CONTROL_PLANE_TIMEOUT"); timeout != "" {
+		return timeout
+	}
+
+	// The defualt timeout for all deployment modes is 60m, we want to increase it to 90m for operator deployment
+	// because lately we see more failures due to timeout in this host installation stage. There is an open Jira issue
+	// for investigating this timeout issue: https://issues.redhat.com/browse/MGMT-20662
+	return defaultWaitingForControlPlaneHostStageTimeout
+}
+
 func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	serviceURL, err := urlForRoute(ctx, asc, serviceName)
 	if err != nil {
@@ -1054,10 +1470,14 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 		return nil, nil, err
 	}
 
-	imageServiceURL, err := urlForRoute(ctx, asc, imageServiceName)
-	if err != nil {
-		log.WithError(err).Warnf("Failed to get URL for route %s", imageServiceName)
-		return nil, nil, err
+	// When image service is disabled, set to empty string
+	var imageServiceURL string
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		imageServiceURL, err = urlForRoute(ctx, asc, imageServiceName)
+		if err != nil {
+			log.WithError(err).Warnf("Failed to get URL for route %s", imageServiceName)
+			return nil, nil, err
+		}
 	}
 
 	cm := &corev1.ConfigMap{
@@ -1080,8 +1500,8 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"AGENT_DOCKER_IMAGE":     AgentImage(),
 			"CONTROLLER_IMAGE":       ControllerImage(),
 			"INSTALLER_IMAGE":        InstallerImage(),
-			"SELF_VERSION":           ServiceImage(),
-			"OS_IMAGES":              getOSImages(log, asc.spec),
+			"SELF_VERSION":           ServiceImage(asc.Object),
+			"OS_IMAGES":              getOSImages(log, asc.spec, asc.Object.GetAnnotations()),
 			"MUST_GATHER_IMAGES":     getMustGatherImages(log, asc.spec),
 			"ISO_IMAGE_TYPE":         "minimal-iso",
 			"S3_USE_SSL":             "false",
@@ -1092,7 +1512,6 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"DEPLOY_TARGET":          "k8s",
 			"STORAGE":                "filesystem",
 			"ISO_WORKSPACE_BASE_DIR": "/data",
-			"ISO_CACHE_DIR":          "/data/cache",
 
 			// from configmap
 			"AUTH_TYPE":                   "local",
@@ -1110,15 +1529,43 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"ENABLE_DATA_COLLECTION": "True",
 			"DATA_UPLOAD_ENDPOINT":   "https://console.redhat.com/api/ingress/v1/upload",
 
-			"NAMESPACE":       asc.namespace,
-			"INSTALL_INVOKER": "assisted-installer-operator",
-
-			// enable https
-			"SERVE_HTTPS":            "True",
-			"HTTPS_CERT_FILE":        "/etc/assisted-tls-config/tls.crt",
-			"HTTPS_KEY_FILE":         "/etc/assisted-tls-config/tls.key",
-			"SERVICE_CA_CERT_PATH":   "/etc/assisted-ingress-cert/ca-bundle.crt",
+			"NAMESPACE":              asc.namespace,
+			"INSTALL_INVOKER":        "assisted-installer-operator",
 			"SKIP_CERT_VERIFICATION": "False",
+			"HOST_STAGE_WAITING_FOR_CONTROL_PLANE_TIMEOUT": getWaitingForControlPlaneHostStageTimeout(),
+			"EVENT_RATE_LIMITS":                            "",
+		}
+		// serve https only on OCP
+		if asc.rec.IsOpenShift {
+			cm.Data["SERVE_HTTPS"] = "True"
+			cm.Data["HTTPS_CERT_FILE"] = "/etc/assisted-tls-config/tls.crt"
+			cm.Data["HTTPS_KEY_FILE"] = "/etc/assisted-tls-config/tls.key"
+			cm.Data["SERVICE_CA_CERT_PATH"] = "/etc/assisted-ingress-cert/ca-bundle.crt"
+			if asc.rec.RestConfig != nil {
+				args, err := tlsconfig.FetchTLSCLIArgs(ctx, asc.rec.RestConfig)
+				if err != nil {
+					log.WithError(err).Warn("unable to fetch TLS profile for assisted-service, skipping TLS configuration")
+				} else {
+					for _, env := range args.Env() {
+						cm.Data[env.Name] = env.Value
+					}
+				}
+			}
+		} else {
+			cm.Data["SERVICE_CA_CERT_PATH"] = "/etc/assisted-ingress-cert/ca.crt"
+		}
+
+		if forceInsecurePolicy, ok := asc.Object.GetAnnotations()[allowUnrestrictedImagePulls]; ok {
+			if forceInsecurePolicy == "true" {
+				log.Infof("ForceInsecurePolicyJson annotation found with value 'true', setting FORCE_INSECURE_POLICY_JSON=true")
+				cm.Data["FORCE_INSECURE_POLICY_JSON"] = forceInsecurePolicy
+				asc.rec.Recorder.Event(asc.Object, "Normal", "ForceInsecurePolicyEnabled", "FORCE_INSECURE_POLICY_JSON environment variable enabled via annotation")
+			} else {
+				log.Infof("ForceInsecurePolicyJson annotation found with value '%s' (not 'true'), skipping FORCE_INSECURE_POLICY_JSON", forceInsecurePolicy)
+				asc.rec.Recorder.Event(asc.Object, "Warning", "ForceInsecurePolicyInvalidValue", fmt.Sprintf("ForceInsecurePolicy annotation has invalid value '%s', expected 'true'", forceInsecurePolicy))
+			}
+		} else {
+			log.Debugf("ForceInsecurePolicyJson annotation not found, FORCE_INSECURE_POLICY_JSON will not be set")
 		}
 
 		copyEnv(cm.Data, "HTTP_PROXY")
@@ -1127,6 +1574,15 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 		copyEnv(cm.Data, "DEPLOYMENT_TYPE")
 		copyEnv(cm.Data, "DEPLOYMENT_VERSION")
 		getDeploymentData(ctx, cm, asc)
+
+		cm.Data["ENABLE_IMAGE_SERVICE"] = "true"
+		// Set ENABLE_IMAGE_SERVICE environment variable based on annotation
+		if !isImageServiceEnabled(asc.Object.GetAnnotations()) {
+			cm.Data["ENABLE_IMAGE_SERVICE"] = "false"
+			log.Infof("Image service disabled via annotation, setting ENABLE_IMAGE_SERVICE=false")
+			asc.rec.Recorder.Event(asc.Object, "Normal", "ImageServiceDisabled", "Image service has been disabled via annotation")
+		}
+
 		return nil
 	}
 
@@ -1166,7 +1622,7 @@ func getDeploymentData(ctx context.Context, cm *corev1.ConfigMap, asc ASC) {
 	}
 	//  Both ACM and MCE are not deployed so this is a stand-alone operator deployment
 	cm.Data["DEPLOYMENT_TYPE"] = "Operator"
-	cm.Data["DEPLOYMENT_VERSION"] = ServiceImage()
+	cm.Data["DEPLOYMENT_VERSION"] = ServiceImage(asc.Object)
 }
 
 // Extracts the environment variable OPERATOR_VERSION from a k8s deployment
@@ -1212,39 +1668,69 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		"app": imageServiceName,
 	}
 
+	// Use consistent PVC name with prefix support
+	imageServiceDataPVCName := getPVCName(asc.Object.GetAnnotations(), "image-service-data")
+
 	imageServiceBaseURL := getImageService(ctx, log, asc)
+	containerEnv := []corev1.EnvVar{
+		{Name: "LISTEN_PORT", Value: imageHandlerPort.String()},
+		{Name: "RHCOS_VERSIONS", Value: getOSImages(log, asc.spec, asc.Object.GetAnnotations())},
+		{Name: "ASSISTED_SERVICE_HOST", Value: serviceName + "." + asc.namespace + ".svc:" + servicePort.String()},
+		{Name: "IMAGE_SERVICE_BASE_URL", Value: imageServiceBaseURL},
+		{Name: "INSECURE_SKIP_VERIFY", Value: skipVerifyTLS},
+		{Name: "DATA_DIR", Value: "/data"},
+		{Name: "DATA_TEMP_DIR", Value: "/data_temp"},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: imageServiceDataPVCName, MountPath: "/data"},
+		{Name: "data-temp-volume", MountPath: "/data_temp"},
+	}
+	var healthCheckScheme corev1.URIScheme
+
+	// enable https only for openshift
+	if asc.rec.IsOpenShift {
+		containerEnv = append(containerEnv,
+			corev1.EnvVar{Name: "HTTPS_CERT_FILE", Value: "/etc/image-service/certs/tls.crt"},
+			corev1.EnvVar{Name: "HTTPS_KEY_FILE", Value: "/etc/image-service/certs/tls.key"},
+			corev1.EnvVar{Name: "HTTPS_CA_FILE", Value: "/etc/image-service/ca-bundle/service-ca.crt"},
+			corev1.EnvVar{Name: "ASSISTED_SERVICE_SCHEME", Value: "https"},
+			corev1.EnvVar{Name: "HTTP_LISTEN_PORT", Value: imageHandlerHTTPPort.String()},
+		)
+		if asc.rec.RestConfig != nil {
+			args, err := tlsconfig.FetchTLSCLIArgs(ctx, asc.rec.RestConfig)
+			if err != nil {
+				log.WithError(err).Warning("unable to fetch TLS profile for image-service, using defaults")
+			} else {
+				containerEnv = append(containerEnv, args.Env()...)
+			}
+		}
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{Name: "tls-certs", MountPath: "/etc/image-service/certs"},
+			corev1.VolumeMount{Name: "service-cabundle", MountPath: "/etc/image-service/ca-bundle"},
+		)
+		healthCheckScheme = corev1.URISchemeHTTPS
+	} else {
+		containerEnv = append(containerEnv,
+			corev1.EnvVar{Name: "ASSISTED_SERVICE_SCHEME", Value: "http"},
+		)
+		healthCheckScheme = corev1.URISchemeHTTP
+	}
 
 	container := corev1.Container{
 		Name:  imageServiceName,
 		Image: ImageServiceImage(),
 		Ports: []corev1.ContainerPort{
 			{
-				ContainerPort: int32(imageHandlerPort.IntValue()),
+				ContainerPort: int32(imageHandlerPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 			{
-				ContainerPort: int32(imageHandlerHTTPPort.IntValue()),
+				ContainerPort: int32(imageHandlerHTTPPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env: []corev1.EnvVar{
-			{Name: "LISTEN_PORT", Value: imageHandlerPort.String()},
-			{Name: "HTTP_LISTEN_PORT", Value: imageHandlerHTTPPort.String()},
-			{Name: "RHCOS_VERSIONS", Value: getOSImages(log, asc.spec)},
-			{Name: "HTTPS_CERT_FILE", Value: "/etc/image-service/certs/tls.crt"},
-			{Name: "HTTPS_KEY_FILE", Value: "/etc/image-service/certs/tls.key"},
-			{Name: "HTTPS_CA_FILE", Value: "/etc/image-service/ca-bundle/service-ca.crt"},
-			{Name: "ASSISTED_SERVICE_SCHEME", Value: "https"},
-			{Name: "ASSISTED_SERVICE_HOST", Value: serviceName + "." + asc.namespace + ".svc:" + servicePort.String()},
-			{Name: "IMAGE_SERVICE_BASE_URL", Value: imageServiceBaseURL},
-			{Name: "INSECURE_SKIP_VERIFY", Value: skipVerifyTLS},
-			{Name: "DATA_DIR", Value: "/data"},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "tls-certs", MountPath: "/etc/image-service/certs"},
-			{Name: "service-cabundle", MountPath: "/etc/image-service/ca-bundle"},
-			{Name: "image-service-data", MountPath: "/data"},
-		},
+		Env:          containerEnv,
+		VolumeMounts: volumeMounts,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("100m"),
@@ -1256,7 +1742,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/health",
 					Port:   imageHandlerPort,
-					Scheme: corev1.URISchemeHTTPS,
+					Scheme: healthCheckScheme,
 				},
 			},
 		},
@@ -1266,7 +1752,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/live",
 					Port:   imageHandlerPort,
-					Scheme: corev1.URISchemeHTTPS,
+					Scheme: healthCheckScheme,
 				},
 			},
 		},
@@ -1307,24 +1793,35 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		statefulSet.Spec.Replicas = &replicas
 		statefulSet.Spec.Template.Spec.ServiceAccountName = imageServiceName
 
-		volumes := ensureVolume(statefulSet.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: "tls-certs",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: imageServiceName,
-				},
-			},
-		})
-		volumes = ensureVolume(volumes, corev1.Volume{
-			Name: "service-cabundle",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: imageServiceName,
+		if !asc.rec.IsOpenShift {
+			statefulSet.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+				FSGroup: swag.Int64(0),
+			}
+		}
+
+		injectImagePullSecretsWhenNonOCP(ctx, &statefulSet.Spec.Template, asc)
+
+		volumes := statefulSet.Spec.Template.Spec.Volumes
+		if asc.rec.IsOpenShift {
+			volumes = ensureVolume(volumes, corev1.Volume{
+				Name: "tls-certs",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: imageServiceName,
 					},
 				},
-			},
-		})
+			})
+			volumes = ensureVolume(volumes, corev1.Volume{
+				Name: "service-cabundle",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: imageServiceName,
+						},
+					},
+				},
+			})
+		}
 
 		if asc.spec.OSImageCACertRef != nil {
 			cm := &corev1.ConfigMap{}
@@ -1338,8 +1835,25 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				return err
 			}
 			setAnnotation(&statefulSet.ObjectMeta, osImagesCAConfigHashAnnotation, osImagesCAConfigHash)
-			container.Env = append(container.Env, corev1.EnvVar{Name: "OS_IMAGE_DOWNLOAD_TRUSTED_CA_FILE", Value: filepath.Join("/etc/image-service/os-images-ca-bundle", osImageDownloadTrustedCAFilename)})
-			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "os-images-ca-bundle", MountPath: "/etc/image-service/os-images-ca-bundle"})
+
+			// Pick first and only key as CA bundle
+			var trustedCAKey string
+			for k := range cm.Data {
+				trustedCAKey = k
+				break
+			}
+			if trustedCAKey == "" {
+				return fmt.Errorf("config map %s has no data keys", namespacedName)
+			}
+
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name:  "OS_IMAGE_DOWNLOAD_TRUSTED_CA_FILE",
+				Value: filepath.Join("/etc/image-service/os-images-ca-bundle", trustedCAKey),
+			})
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      "os-images-ca-bundle",
+				MountPath: "/etc/image-service/os-images-ca-bundle",
+			})
 			volumes = ensureVolume(volumes, corev1.Volume{
 				Name: "os-images-ca-bundle",
 				VolumeSource: corev1.VolumeSource{
@@ -1365,10 +1879,10 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			}
 			setAnnotation(&statefulSet.ObjectMeta, osImagesAdditionalParamsConfigHashAnnotation, osImagesAdditionalParamsConfigHash)
 			if secret.Data[osImageAdditionalParamsHeadersKey] != nil {
-				container.Env = append(container.Env, newSecretEnvVar(osImageAdditionalParamsHeadersEnvVar, osImageAdditionalParamsHeadersKey, asc.spec.OSImageAdditionalParamsRef.Name))
+				container.Env = append(container.Env, newStaticSecretEnvVar(osImageAdditionalParamsHeadersEnvVar, osImageAdditionalParamsHeadersKey, asc.spec.OSImageAdditionalParamsRef.Name))
 			}
 			if secret.Data[osImageAdditionalParamsQueryParamsKey] != nil {
-				container.Env = append(container.Env, newSecretEnvVar(osImageAdditionalParamsQueryParamsEnvVar, osImageAdditionalParamsQueryParamsKey, asc.spec.OSImageAdditionalParamsRef.Name))
+				container.Env = append(container.Env, newStaticSecretEnvVar(osImageAdditionalParamsQueryParamsEnvVar, osImageAdditionalParamsQueryParamsKey, asc.spec.OSImageAdditionalParamsRef.Name))
 			}
 		}
 
@@ -1377,7 +1891,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		if asc.spec.ImageStorage != nil {
 			var found bool
 			for i, claim := range statefulSet.Spec.VolumeClaimTemplates {
-				if claim.ObjectMeta.Name == "image-service-data" {
+				if claim.ObjectMeta.Name == imageServiceDataPVCName {
 					found = true
 					statefulSet.Spec.VolumeClaimTemplates[i].Spec.Resources.Requests = getStorageRequests(asc.spec.ImageStorage)
 				}
@@ -1386,7 +1900,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				statefulSet.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
 					{
 						ObjectMeta: metav1.ObjectMeta{
-							Name: "image-service-data",
+							Name: imageServiceDataPVCName,
 						},
 						Spec: *asc.spec.ImageStorage,
 					},
@@ -1394,7 +1908,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			}
 			newVols := make([]corev1.Volume, 0)
 			for i := range volumes {
-				if volumes[i].Name != "image-service-data" {
+				if volumes[i].Name != imageServiceDataPVCName {
 					newVols = append(newVols, volumes[i])
 				}
 			}
@@ -1403,12 +1917,19 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			statefulSet.Spec.VolumeClaimTemplates = nil
 
 			volumes = ensureVolume(volumes, corev1.Volume{
-				Name: "image-service-data",
+				Name: imageServiceDataPVCName,
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
 			})
 		}
+
+		volumes = ensureVolume(volumes, corev1.Volume{
+			Name: "data-temp-volume",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
 
 		statefulSet.Spec.Template.Spec.Volumes = volumes
 
@@ -1552,15 +2073,15 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 
 	envSecrets := []corev1.EnvVar{
 		// database
-		newSecretEnvVar("DB_HOST", "db.host", databaseName),
-		newSecretEnvVar("DB_NAME", "db.name", databaseName),
-		newSecretEnvVar("DB_PASS", "db.password", databaseName),
-		newSecretEnvVar("DB_PORT", "db.port", databaseName),
-		newSecretEnvVar("DB_USER", "db.user", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_HOST", "db.host", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_NAME", "db.name", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_PASS", "db.password", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_PORT", "db.port", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_USER", "db.user", databaseName),
 
 		// local auth secret
-		newSecretEnvVar("EC_PUBLIC_KEY_PEM", "ec-public-key.pem", agentLocalAuthSecretName),
-		newSecretEnvVar("EC_PRIVATE_KEY_PEM", "ec-private-key.pem", agentLocalAuthSecretName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "EC_PUBLIC_KEY_PEM", "ec-public-key.pem", agentLocalAuthSecretName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "EC_PRIVATE_KEY_PEM", "ec-private-key.pem", agentLocalAuthSecretName),
 	}
 
 	if exposeIPXEHTTPRoute(asc.spec) {
@@ -1600,26 +2121,113 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		)
 	}
 
+	volumes := []corev1.Volume{
+		{
+			Name: "bucket-filesystem",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: getPVCName(asc.Object.GetAnnotations(), serviceName),
+				},
+			},
+		},
+		{
+			Name: "postgresdb",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: getPVCName(asc.Object.GetAnnotations(), databaseName),
+				},
+			},
+		},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "bucket-filesystem", MountPath: "/data"},
+		{Name: "ingress-cert", MountPath: "/etc/assisted-ingress-cert"},
+	}
+	var healthCheckScheme corev1.URIScheme
+	if asc.rec.IsOpenShift {
+		// Require the assisted trusted ca bundle configmap is ready before continuing
+		cm := &corev1.ConfigMap{}
+		namespacedName := types.NamespacedName{Name: assistedCAConfigMapName, Namespace: asc.namespace}
+		if err = asc.Client.Get(ctx, namespacedName, cm); err != nil {
+			return nil, nil, err
+		}
+		if _, ok := cm.Data[caBundleKey]; !ok {
+			return nil, nil, fmt.Errorf("%s doesn't contain ca bundle yet", assistedCAConfigMapName)
+		}
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "tls-certs",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: serviceName,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "ingress-cert",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: defaultIngressCertCMName,
+						},
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "trusted-ca-certs",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						Items: []corev1.KeyToPath{{
+							Key:  caBundleKey,
+							Path: common.SystemCertificateBundle,
+						}},
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: assistedCAConfigMapName,
+						},
+						DefaultMode: swag.Int32(420),
+					},
+				},
+			},
+		)
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{Name: "tls-certs", MountPath: "/etc/assisted-tls-config"},
+			corev1.VolumeMount{
+				Name:      "trusted-ca-certs",
+				MountPath: common.SystemCertificateBundlePath,
+				SubPath:   common.SystemCertificateBundle,
+			},
+		)
+		healthCheckScheme = corev1.URISchemeHTTPS
+	} else {
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "ingress-cert",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: ingressTLSSecretName(serviceName),
+					},
+				},
+			},
+		)
+		healthCheckScheme = corev1.URISchemeHTTP
+	}
+
 	serviceContainer := corev1.Container{
 		Name:  serviceName,
-		Image: ServiceImage(),
+		Image: ServiceImage(asc.Object),
 		Ports: []corev1.ContainerPort{
 			{
-				ContainerPort: int32(servicePort.IntValue()),
+				ContainerPort: int32(servicePort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 			{
-				ContainerPort: int32(serviceHTTPPort.IntValue()),
+				ContainerPort: int32(serviceHTTPPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		EnvFrom: envFrom,
-		Env:     envSecrets,
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "bucket-filesystem", MountPath: "/data"},
-			{Name: "tls-certs", MountPath: "/etc/assisted-tls-config"},
-			{Name: "ingress-cert", MountPath: "/etc/assisted-ingress-cert"},
-		},
+		EnvFrom:      envFrom,
+		Env:          envSecrets,
+		VolumeMounts: volumeMounts,
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("200m"),
@@ -1632,7 +2240,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/health",
 					Port:   servicePort,
-					Scheme: corev1.URISchemeHTTPS,
+					Scheme: healthCheckScheme,
 				},
 			},
 		},
@@ -1641,76 +2249,49 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/ready",
 					Port:   servicePort,
-					Scheme: corev1.URISchemeHTTPS,
+					Scheme: healthCheckScheme,
 				},
 			},
+		},
+	}
+
+	postgresEnv := []corev1.EnvVar{
+		newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_DATABASE", "db.name", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_USER", "db.user", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_PASSWORD", "db.password", databaseName),
+	}
+	postgresVolumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "postgresdb",
+			MountPath: "/var/lib/pgsql/data",
+		},
+	}
+	postgresResources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("400Mi"),
 		},
 	}
 
 	postgresContainer := corev1.Container{
 		Name:  databaseName,
 		Image: DatabaseImage(),
+		// Use a wrapper script that conditionally enables pg_upgrade only when a version
+		// mismatch is detected. This allows automatic upgrades while avoiding failures
+		// on normal restarts. EUS skip-upgrades (PG12 → PG15) are handled by hop init
+		// containers. See docs/dev/postgresql-upgrade.md for details.
+		Command: []string{"/bin/bash", "-c"},
+		Args:    []string{PostgresStartupScript},
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          databaseName,
-				ContainerPort: int32(databasePort.IntValue()),
+				ContainerPort: int32(databasePort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		Env: []corev1.EnvVar{
-			newSecretEnvVar("POSTGRESQL_DATABASE", "db.name", databaseName),
-			newSecretEnvVar("POSTGRESQL_USER", "db.user", databaseName),
-			newSecretEnvVar("POSTGRESQL_PASSWORD", "db.password", databaseName),
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      "postgresdb",
-				MountPath: "/var/lib/pgsql/data",
-			},
-		},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("400Mi"),
-			},
-		},
-	}
-
-	volumes := []corev1.Volume{
-		{
-			Name: "bucket-filesystem",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: serviceName,
-				},
-			},
-		},
-		{
-			Name: "postgresdb",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: databaseName,
-				},
-			},
-		},
-		{
-			Name: "tls-certs",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: serviceName,
-				},
-			},
-		},
-		{
-			Name: "ingress-cert",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: defaultIngressCertCMName,
-					},
-				},
-			},
-		},
+		Env:          postgresEnv,
+		VolumeMounts: postgresVolumeMounts,
+		Resources:    postgresResources,
 	}
 
 	if asc.spec.MirrorRegistryRef != nil {
@@ -1737,7 +2318,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			return nil, nil, pkgerror.Wrapf(err, "Unable to mark mirror configmap for backup")
 		}
 
-		volume := corev1.Volume{
+		registriesConfVolume := corev1.Volume{
 			Name: mirrorRegistryConfigVolume,
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -1761,27 +2342,41 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			},
 		)
 
-		if _, ok := cm.Data[mirrorRegistryRefCertKey]; ok {
-			volume.VolumeSource.ConfigMap.Items = append(
-				volume.VolumeSource.ConfigMap.Items,
-				corev1.KeyToPath{
-					Key:  mirrorRegistryRefCertKey,
-					Path: common.MirrorRegistriesCertificateFile,
+		// add our mirror registry config to volumes
+		volumes = append(volumes, registriesConfVolume)
+
+		// add mirror registry CA bundle to volumes if exists
+		if cm.Data[mirrorRegistryRefCertKey] != "" {
+			// add CA bundle volume to list
+			volumes = append(
+				volumes,
+				corev1.Volume{
+					Name: mirrorRegistryCertBundleVolume,
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: *asc.spec.MirrorRegistryRef,
+							DefaultMode:          swag.Int32(420),
+							Items: []corev1.KeyToPath{
+								{
+									Key:  mirrorRegistryRefCertKey,
+									Path: common.MirrorRegistriesCertificateFile,
+								},
+							},
+						},
+					},
 				},
 			)
 
+			// add volume mount with the CA bundle
 			serviceContainer.VolumeMounts = append(
 				serviceContainer.VolumeMounts,
 				corev1.VolumeMount{
-					Name:      mirrorRegistryConfigVolume,
+					Name:      mirrorRegistryCertBundleVolume,
 					MountPath: common.MirrorRegistriesCertificatePath,
 					SubPath:   common.MirrorRegistriesCertificateFile,
 				},
 			)
 		}
-
-		// add our mirror registry config to volumes
-		volumes = append(volumes, volume)
 	}
 
 	deploymentLabels := map[string]string{
@@ -1826,9 +2421,18 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		setAnnotation(meta, mirrorConfigHashAnnotation, mirrorConfigHash)
 		setAnnotation(meta, userConfigHashAnnotation, userConfigHash)
 
+		deployment.Spec.Template.Spec.InitContainers = postgresUpgradeInitContainers(postgresEnv, postgresVolumeMounts, postgresResources)
 		deployment.Spec.Template.Spec.Containers = []corev1.Container{serviceContainer, postgresContainer}
 		deployment.Spec.Template.Spec.Volumes = volumes
 		deployment.Spec.Template.Spec.ServiceAccountName = serviceAccountName
+
+		if !asc.rec.IsOpenShift {
+			deployment.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+				FSGroup: swag.Int64(0),
+			}
+		}
+
+		injectImagePullSecretsWhenNonOCP(ctx, &deployment.Spec.Template, asc)
 
 		if asc.rec.NodeSelector != nil {
 			deployment.Spec.Template.Spec.NodeSelector = asc.rec.NodeSelector
@@ -1845,6 +2449,33 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		return nil
 	}
 	return deployment, mutateFn, nil
+}
+
+func getSecretName(annotations map[string]string, secretID string) string {
+	if prefix, ok := annotations[aiv1beta1.SecretsPrefixAnnotation]; ok {
+		return prefix + secretID
+	}
+	return secretID
+}
+
+func getPVCName(annotations map[string]string, pvcID string) string {
+	if prefix, ok := annotations[aiv1beta1.PVCPrefixAnnotation]; ok {
+		return prefix + pvcID
+	}
+	return pvcID
+}
+
+// injectImagePullSecretsWhenNonOCP injects imagePullSecrets from the current pod into the pod template spec
+// This is only done for non-OpenShift environments (Kubernetes mode)
+func injectImagePullSecretsWhenNonOCP(ctx context.Context, podTemplateSpec *corev1.PodTemplateSpec, asc ASC) {
+	if !asc.rec.IsOpenShift {
+		if asc.rec.PodIntrospector == nil {
+			return
+		}
+		if imagePullSecrets := asc.rec.PodIntrospector.GetImagePullSecrets(ctx); len(imagePullSecrets) > 0 {
+			podTemplateSpec.Spec.ImagePullSecrets = imagePullSecrets
+		}
+	}
 }
 
 func copyEnv(config map[string]string, key string) {
@@ -1874,45 +2505,49 @@ func getMustGatherImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceCon
 	if spec.MustGatherImages == nil {
 		return MustGatherImages()
 	}
-	mustGatherVersions := make(versions.MustGatherVersions)
-	for _, specImage := range spec.MustGatherImages {
-		versionKey, err := getVersionKey(specImage.OpenshiftVersion)
-		if err != nil {
-			log.WithError(err).Error(fmt.Sprintf("Problem parsing OpenShift version %v, skipping.", specImage.OpenshiftVersion))
-			continue
-		}
-		if mustGatherVersions[versionKey] == nil {
-			mustGatherVersions[versionKey] = make(versions.MustGatherVersion)
-		}
-		mustGatherVersions[versionKey][specImage.Name] = specImage.Url
-	}
 
-	if len(mustGatherVersions) == 0 {
-		return MustGatherImages()
-	}
-	encodedVersions, err := json.Marshal(mustGatherVersions)
+	cache, err := versions.NewMustGatherVersionCacheFromMustGatherImages(spec.MustGatherImages)
 	if err != nil {
-		log.WithError(err).Error(fmt.Sprintf("Problem marshaling must gather images (%v) to string, returning default %v", mustGatherVersions, MustGatherImages()))
+		log.WithError(err).Errorf("Problem creating must gather version cache, returning default %v", MustGatherImages())
+
 		return MustGatherImages()
 	}
 
-	return string(encodedVersions)
+	if cache.Size() == 0 {
+		return MustGatherImages()
+	}
+	encodedVersions, err := cache.ToJSON()
+	if err != nil {
+		log.WithError(err).Errorf("Problem marshaling must gather images to string, returning default %v", MustGatherImages())
+
+		return MustGatherImages()
+	}
+
+	return encodedVersions
 }
 
 // getOSImages returns the value of OS_IMAGES variable
 // to be stored in the service's ConfigMap
 //
-//  1. If osImages field is not present in the AgentServiceConfig's Spec
+//  1. If image service is disabled via annotation, returns empty JSON array "[]"
+//
+//  2. If osImages field is not present in the AgentServiceConfig's Spec
 //     it returns the value of OS_IMAGES env variable.
 //     This is also the fallback behavior in case of a processing error.
 //
-//  2. If osImages field is present in the AgentServiceConfig's Spec it
+//  3. If osImages field is present in the AgentServiceConfig's Spec it
 //     converts the structure to the one that can be recognize by the service
 //     and returns it as a JSON string.
 //
-//  3. In case both sources are present, the Spec values overrides the env
+//  4. In case both sources are present, the Spec values overrides the env
 //     values.
-func getOSImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceConfigSpec) string {
+func getOSImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceConfigSpec, annotations map[string]string) string {
+	// If image service is disabled, return empty array
+	if !isImageServiceEnabled(annotations) {
+		log.Info("Image service is disabled, returning empty OS images list")
+		return "[]"
+	}
+
 	if spec.OSImages == nil {
 		return OSImages()
 	}
@@ -1924,6 +2559,12 @@ func getOSImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceConfigSpec)
 			URL:              &spec.OSImages[i].Url,
 			Version:          &spec.OSImages[i].Version,
 			CPUArchitecture:  &spec.OSImages[i].CPUArchitecture,
+		}
+		if spec.OSImages[i].OSStream != "" {
+			osImage.OsStream = &spec.OSImages[i].OSStream
+		}
+		if spec.OSImages[i].DefaultOSStream != nil {
+			osImage.DefaultOsStream = spec.OSImages[i].DefaultOSStream
 		}
 		osImages = append(osImages, &osImage)
 	}
@@ -1954,6 +2595,19 @@ func exposeIPXEHTTPRoute(spec *aiv1beta1.AgentServiceConfigSpec) bool {
 	}
 }
 
+// isImageServiceEnabled returns true if the enable-image-service annotation is set to "true" or not present (default enabled)
+func isImageServiceEnabled(annotations map[string]string) bool {
+	if annotations == nil {
+		return true
+	}
+	value := annotations[enableImageServiceAnnotation]
+	// If annotation is not set, default to enabled
+	if value == "" {
+		return true
+	}
+	return value == "true"
+}
+
 func getCMHash(ctx context.Context, asc ASC, namespacedName types.NamespacedName) (string, error) {
 	cm := &corev1.ConfigMap{}
 	if err := asc.Client.Get(ctx, namespacedName, cm); err != nil {
@@ -1962,17 +2616,7 @@ func getCMHash(ctx context.Context, asc ASC, namespacedName types.NamespacedName
 	return checksumMap(cm.Data)
 }
 
-func getVersionKey(openshiftVersion string) (string, error) {
-	v, err := version.NewVersion(openshiftVersion)
-	if err != nil {
-		return openshiftVersion, err
-	}
-
-	// put string in x.y format
-	return fmt.Sprintf("%d.%d", v.Segments()[0], v.Segments()[1]), nil
-}
-
-func newSecretEnvVar(name, key, secretName string) corev1.EnvVar {
+func newStaticSecretEnvVar(name, key, secretName string) corev1.EnvVar {
 	return corev1.EnvVar{
 		Name: name,
 		ValueFrom: &corev1.EnvVarSource{
@@ -1984,6 +2628,10 @@ func newSecretEnvVar(name, key, secretName string) corev1.EnvVar {
 			},
 		},
 	}
+}
+
+func newSecretEnvVar(annotations map[string]string, name, key, secretName string) corev1.EnvVar {
+	return newStaticSecretEnvVar(name, key, getSecretName(annotations, secretName))
 }
 
 func newInfraEnvWebHook(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
@@ -2290,6 +2938,17 @@ func newWebHookClusterRole(ctx context.Context, log logrus.FieldLogger, asc ASC)
 				"create",
 			},
 		},
+		{
+			APIGroups: []string{
+				"hive.openshift.io",
+			},
+			Resources: []string{
+				"clusterdeployments",
+			},
+			Verbs: []string{
+				"get",
+			},
+		},
 	}
 	cr := rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2318,12 +2977,15 @@ func newWebHookService(ctx context.Context, log logrus.FieldLogger, asc ASC) (cl
 			return err
 		}
 		addAppLabel(webhookServiceName, &svc.ObjectMeta)
-		setAnnotation(&svc.ObjectMeta, servingCertAnnotation, webhookServiceName)
+		if asc.rec.IsOpenShift {
+			setAnnotation(&svc.ObjectMeta, servingCertAnnotation, webhookServiceName)
+		}
 		if len(svc.Spec.Ports) == 0 {
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{})
 		}
 		svc.Spec.Ports[0].Name = webhookServiceName
 		svc.Spec.Ports[0].Port = 443
+		// port change?
 		svc.Spec.Ports[0].TargetPort = intstr.IntOrString{Type: intstr.Int, IntVal: 9443}
 		svc.Spec.Ports[0].Protocol = corev1.ProtocolTCP
 		svc.Spec.Selector = map[string]string{"app": webhookServiceName}
@@ -2357,7 +3019,11 @@ func newWebHookAPIService(ctx context.Context, log logrus.FieldLogger, asc ASC) 
 			return err
 		}
 
-		setAnnotation(&as.ObjectMeta, "service.beta.openshift.io/inject-cabundle", "true")
+		if asc.rec.IsOpenShift {
+			setAnnotation(&as.ObjectMeta, injectCABundleAnnotation, "true")
+		} else {
+			setAnnotation(&as.ObjectMeta, certManagerCAInjectionAnnotation, fmt.Sprintf("%s/%s", asc.namespace, webhookServiceName))
+		}
 		baseApiServiceSpec(as, asc.namespace)
 		return nil
 	}
@@ -2365,16 +3031,28 @@ func newWebHookAPIService(ctx context.Context, log logrus.FieldLogger, asc ASC) 
 }
 
 func newWebHookDeployment(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
+	command := []string{
+		"/assisted-service-admission",
+		"--secure-port=9443",
+		"--audit-log-path=-",
+		"--tls-cert-file=/var/serving-cert/tls.crt",
+		"--tls-private-key-file=/var/serving-cert/tls.key",
+	}
+
+	if asc.rec.IsOpenShift && asc.rec.RestConfig != nil {
+		args, err := tlsconfig.FetchTLSCLIArgs(ctx, asc.rec.RestConfig)
+		if err != nil {
+			log.WithError(err).Warning("unable to fetch TLS profile for webhook, using defaults")
+		} else {
+			command = append(command, args.Flags()...)
+		}
+	}
+
 	serviceContainer := corev1.Container{
-		Name:  "agentinstalladmission",
-		Image: ServiceImage(),
-		Command: []string{
-			"/assisted-service-admission",
-			"--secure-port=9443",
-			"--audit-log-path=-",
-			"--tls-cert-file=/var/serving-cert/tls.crt",
-			"--tls-private-key-file=/var/serving-cert/tls.key",
-		},
+		Name: "agentinstalladmission",
+		// always use the default image for webhooks since this will never need to run the installer binary
+		Image:   serviceImageDefault(),
+		Command: command,
 		Ports: []corev1.ContainerPort{
 			{
 				ContainerPort: 9443,
@@ -2447,6 +3125,20 @@ func newWebHookDeployment(ctx context.Context, log logrus.FieldLogger, asc ASC) 
 		deployment.Spec.Template.Spec.Volumes = volumes
 		deployment.Spec.Template.Spec.ServiceAccountName = serviceAccountName
 
+		injectImagePullSecretsWhenNonOCP(ctx, &deployment.Spec.Template, asc)
+
+		if asc.rec.NodeSelector != nil {
+			deployment.Spec.Template.Spec.NodeSelector = asc.rec.NodeSelector
+		} else {
+			deployment.Spec.Template.Spec.NodeSelector = map[string]string{}
+		}
+
+		if asc.rec.Tolerations != nil {
+			deployment.Spec.Template.Spec.Tolerations = asc.rec.Tolerations
+		} else {
+			deployment.Spec.Template.Spec.Tolerations = []corev1.Toleration{}
+		}
+
 		return nil
 	}
 	return deployment, mutateFn, nil
@@ -2486,6 +3178,17 @@ func registerCACertFailureCondition(ctx context.Context, log logrus.FieldLogger,
 	return nil
 }
 
+func registerOSImageError(ctx context.Context, err error, asc ASC) bool {
+	return conditionsv1.SetStatusConditionNoHeartbeat(
+		asc.conditions, conditionsv1.Condition{
+			Type:    aiv1beta1.ConditionReconcileCompleted,
+			Status:  corev1.ConditionFalse,
+			Reason:  aiv1beta1.ReasonOSImagesShouldBeEmptyFailure,
+			Message: err.Error(),
+		},
+	)
+}
+
 func registerOSImagesAdditionalParamsFailureCondition(ctx context.Context, log logrus.FieldLogger, err error, asc ASC) error {
 	conditionsv1.SetStatusConditionNoHeartbeat(
 		asc.conditions, conditionsv1.Condition{
@@ -2503,7 +3206,7 @@ func registerOSImagesAdditionalParamsFailureCondition(ctx context.Context, log l
 	return nil
 }
 
-func validate(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error) {
+func validateOSImageCACertRef(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error) {
 	if asc.spec.OSImageCACertRef != nil && asc.spec.OSImageCACertRef.Name != "" {
 		osImageCACertConfigMap := &corev1.ConfigMap{}
 		err := asc.Client.Get(ctx, types.NamespacedName{
@@ -2513,11 +3216,134 @@ func validate(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error
 		if err != nil {
 			return false, registerCACertFailureCondition(ctx, log, err, asc)
 		}
-		_, ok := osImageCACertConfigMap.Data[osImageDownloadTrustedCAFilename]
-		if !ok || len(osImageCACertConfigMap.Data) != 1 {
-			err = fmt.Errorf("ConfigMap referenced by OSImgaeCACertRef is expected to contain a single key named \"%s\"", osImageDownloadTrustedCAFilename)
+		if len(osImageCACertConfigMap.Data) != 1 {
+			err = fmt.Errorf("ConfigMap referenced by OSImageCACertRef must contain exactly one key")
 			return false, registerCACertFailureCondition(ctx, log, err, asc)
 		}
+
+		var trustedCAKey string
+		for k := range osImageCACertConfigMap.Data {
+			trustedCAKey = k
+			break
+		}
+
+		if err = validateCABundle(osImageCACertConfigMap.Data[trustedCAKey]); err != nil {
+			err = fmt.Errorf("file %s does not contain a valid PEM certificate, %s", trustedCAKey, err.Error())
+			return false, registerCACertFailureCondition(ctx, log, err, asc)
+		}
+	}
+	return true, nil
+}
+
+func validateCABundle(bundle string) error {
+	data := []byte(bundle)
+	if len(bytes.TrimSpace(data)) == 0 {
+		return fmt.Errorf("certificate bundle is empty")
+	}
+
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			if len(bytes.TrimSpace(data)) > 0 {
+				return fmt.Errorf("trailing content found after the last certificate block")
+			}
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return fmt.Errorf("unexpected PEM block type found %q, expected CERTIFICATE", block.Type)
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return fmt.Errorf("failed to parse x509 certificate block with error %q", err.Error())
+		}
+	}
+	return nil
+}
+
+// validateImmutableAnnotations ensures that prefix annotations are immutable once set
+// Returns true if the immutable annotations are valid, false if they are invalid, and an error if there is an error
+func validateImmutableAnnotations(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error) {
+	if _, ok := asc.Object.(*aiv1beta1.AgentServiceConfig); !ok {
+		// if it's not AgentServiceConfig object, we don't need to validate immutable annotations
+		return true, nil
+	}
+	immutableAnnotations := []string{
+		aiv1beta1.PVCPrefixAnnotation,
+		aiv1beta1.SecretsPrefixAnnotation,
+		enableImageServiceAnnotation,
+	}
+
+	// Check if we have stored the initial state in a special annotation
+	currentAnnotations := asc.Object.GetAnnotations()
+	if currentAnnotations == nil {
+		currentAnnotations = make(map[string]string)
+	}
+
+	if asc.status.ImmutableAnnotations == nil {
+		asc.status.ImmutableAnnotations = make(map[string]string)
+		// if the immutable annotations are not set, we store the current annotations as the initial state
+
+		for _, annotation := range immutableAnnotations {
+			asc.status.ImmutableAnnotations[annotation] = currentAnnotations[annotation]
+		}
+		if err := asc.Client.Status().Update(ctx, asc.Object); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// Validate each immutable annotation against the initial state
+	for _, annotation := range immutableAnnotations {
+		initialValue := asc.status.ImmutableAnnotations[annotation]
+		initialExists := initialValue != ""
+		currentValue, currentExists := currentAnnotations[annotation]
+
+		// If the annotation was not set initially, it can never be added
+		if !initialExists && currentExists {
+			err := fmt.Errorf("annotation %s cannot be added after AgentServiceConfig creation", annotation)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+
+		// If the annotation exists, its value cannot change
+		if initialExists && currentExists && initialValue != currentValue {
+			err := fmt.Errorf("annotation %s value cannot be changed from %q to %q", annotation, initialValue, currentValue)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+
+		// If the annotation was set, it cannot be removed
+		if initialExists && !currentExists {
+			err := fmt.Errorf("annotation %s cannot be removed once set", annotation)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+	}
+
+	return true, nil
+}
+
+// registerImmutableAnnotationFailureCondition registers a failure condition for immutable annotation validation
+func registerImmutableAnnotationFailureCondition(ctx context.Context, log logrus.FieldLogger, err error, asc ASC) error {
+	conditionsv1.SetStatusConditionNoHeartbeat(
+		asc.conditions, conditionsv1.Condition{
+			Type:    aiv1beta1.ConditionReconcileCompleted,
+			Status:  corev1.ConditionFalse,
+			Reason:  aiv1beta1.ReasonImmutableAnnotationFailure,
+			Message: err.Error(),
+		},
+	)
+	updateErr := asc.Client.Status().Update(ctx, asc.Object)
+	if updateErr != nil {
+		return updateErr
+	}
+	return nil
+}
+
+func validate(ctx context.Context, log logrus.FieldLogger, asc ASC, supportsCertManager bool) (bool, error) {
+	if valid, err := validateOSImageCACertRef(ctx, log, asc); !valid {
+		return false, err
+	}
+
+	if valid, err := validateImmutableAnnotations(ctx, log, asc); !valid {
+		return false, err
 	}
 
 	if asc.spec.OSImageAdditionalParamsRef != nil && asc.spec.OSImageAdditionalParamsRef.Name != "" {
@@ -2568,13 +3394,46 @@ func validate(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error
 		return false, nil
 	}
 
-	// If we are here then the storage configuration validation succeeded, so we may need to
-	// remove a previous failure condition:
+	if !asc.rec.IsOpenShift {
+		message := ""
+		reason := ""
+		// validate kubernetes ingress config if not running on OpenShift
+		// Ingress must not be nil and both hostnames must be provided
+		if asc.spec.Ingress == nil || asc.spec.Ingress.AssistedServiceHostname == "" || asc.spec.Ingress.ImageServiceHostname == "" {
+			message = "ingress configuration is required for non-OpenShift deployment"
+			reason = aiv1beta1.ReasonKubernetesIngressMissing
+		} else if !supportsCertManager {
+			message = "cert-manager is a required dependency for non-OpenShift deployments"
+			reason = aiv1beta1.ReasonCertificateFailure
+		}
+
+		if message != "" && reason != "" {
+			log.Error(message)
+			conditionsv1.SetStatusConditionNoHeartbeat(
+				asc.conditions, conditionsv1.Condition{
+					Type:    aiv1beta1.ConditionReconcileCompleted,
+					Status:  corev1.ConditionFalse,
+					Reason:  reason,
+					Message: message,
+				},
+			)
+			err = asc.Client.Status().Update(ctx, asc.Object)
+			if err != nil {
+				log.WithError(err).Error("Failed to update status")
+				return false, err
+			}
+			return false, nil
+		}
+	}
+
+	// If we are here then all the validations succeeded, so we may need to
+	// remove previous failure conditions:
 	condition := conditionsv1.FindStatusCondition(
 		*asc.conditions,
 		aiv1beta1.ConditionReconcileCompleted,
 	)
-	if condition != nil && condition.Reason == aiv1beta1.ReasonStorageFailure {
+	if condition != nil && (condition.Reason == aiv1beta1.ReasonStorageFailure ||
+		condition.Reason == aiv1beta1.ReasonImmutableAnnotationFailure) {
 		conditionsv1.RemoveStatusCondition(
 			asc.conditions,
 			aiv1beta1.ConditionReconcileCompleted,
@@ -2609,7 +3468,7 @@ func validateStorage(ctx context.Context, log logrus.FieldLogger, asc ASC) (warn
 		warnings = append(warnings, message)
 		key := client.ObjectKey{
 			Namespace: asc.namespace,
-			Name:      databaseName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), databaseName),
 		}
 		var tmp corev1.PersistentVolumeClaim
 		err = asc.Client.Get(ctx, key, &tmp)
@@ -2632,7 +3491,7 @@ func validateStorage(ctx context.Context, log logrus.FieldLogger, asc ASC) (warn
 		warnings = append(warnings, message)
 		key := client.ObjectKey{
 			Namespace: asc.namespace,
-			Name:      serviceName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), serviceName),
 		}
 		var tmp corev1.PersistentVolumeClaim
 		err = asc.Client.Get(ctx, key, &tmp)

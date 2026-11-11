@@ -57,30 +57,31 @@ type InstructionManager struct {
 type InstructionConfig struct {
 	feature.Flags
 
-	AuthType                 auth.AuthType     `envconfig:"AUTH_TYPE" default:""`
-	ServiceBaseURL           string            `envconfig:"SERVICE_BASE_URL"`
-	ServiceCACertPath        string            `envconfig:"SERVICE_CA_CERT_PATH" default:""`
-	ServiceIPs               string            `envconfig:"SERVICE_IPS" default:""`
-	ImageServiceBaseURL      string            `envconfig:"IMAGE_SERVICE_BASE_URL"`
-	ImageExpirationTime      time.Duration     `envconfig:"IMAGE_EXPIRATION_TIME" default:"4h"`
-	InstallerImage           string            `envconfig:"INSTALLER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer:latest"`
-	ControllerImage          string            `envconfig:"CONTROLLER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer-controller:latest"`
-	AgentImage               string            `envconfig:"AGENT_DOCKER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer-agent:latest"`
-	SkipCertVerification     bool              `envconfig:"SKIP_CERT_VERIFICATION" default:"false"`
-	DiskCheckTimeout         time.Duration     `envconfig:"DISK_CHECK_TIMEOUT" default:"8m"`
-	ImageAvailabilityTimeout time.Duration     `envconfig:"IMAGE_AVAILABILITY_TIMEOUT" default:"16m"`
-	DisabledSteps            []models.StepType `envconfig:"DISABLED_STEPS" default:""`
-	ReleaseImageMirror       string
-	CheckClusterVersion      bool
-	HostFSMountDir           string
+	AuthType                  auth.AuthType     `envconfig:"AUTH_TYPE" default:""`
+	ServiceBaseURL            string            `envconfig:"SERVICE_BASE_URL"`
+	ServiceCACertPath         string            `envconfig:"SERVICE_CA_CERT_PATH" default:""`
+	ImageServiceBaseURL       string            `envconfig:"IMAGE_SERVICE_BASE_URL"`
+	ImageExpirationTime       time.Duration     `envconfig:"IMAGE_EXPIRATION_TIME" default:"4h"`
+	InstallerImage            string            `envconfig:"INSTALLER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer:latest"`
+	ControllerImage           string            `envconfig:"CONTROLLER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer-controller:latest"`
+	AgentImage                string            `envconfig:"AGENT_DOCKER_IMAGE" default:"quay.io/edge-infrastructure/assisted-installer-agent:latest"`
+	AgentInventoryMaxSize     int64             `envconfig:"AGENT_INVENTORY_MAX_SIZE" default:"0"`
+	AgentInventoryDiskMinSize int64             `envconfig:"AGENT_INVENTORY_DISK_MIN_SIZE" default:"0"`
+	SkipCertVerification      bool              `envconfig:"SKIP_CERT_VERIFICATION" default:"false"`
+	DiskCheckTimeout          time.Duration     `envconfig:"DISK_CHECK_TIMEOUT" default:"8m"`
+	ImageAvailabilityTimeout  time.Duration     `envconfig:"IMAGE_AVAILABILITY_TIMEOUT" default:"16m"`
+	DisabledSteps             []models.StepType `envconfig:"DISABLED_STEPS" default:""`
+	ReleaseImageMirror        string
+	CheckClusterVersion       bool
+	HostFSMountDir            string
 }
 
 func NewInstructionManager(log logrus.FieldLogger, db *gorm.DB, hwValidator hardware.Validator, ocRelease oc.Release,
 	instructionConfig InstructionConfig, connectivityValidator connectivity.Validator, eventsHandler eventsapi.Handler,
 	versionHandler versions.Handler, osImages versions.OSImages, kubeApiEnabled bool) *InstructionManager {
 	connectivityCmd := NewConnectivityCheckCmd(log, db, connectivityValidator, instructionConfig.AgentImage)
-	installCmd := NewInstallCmd(log, db, hwValidator, ocRelease, instructionConfig, eventsHandler, versionHandler, instructionConfig.EnableSkipMcoReboot)
-	inventoryCmd := NewInventoryCmd(log, instructionConfig.AgentImage)
+	installCmd := NewInstallCmd(log, db, hwValidator, ocRelease, instructionConfig, eventsHandler, versionHandler, instructionConfig.EnableSkipMcoReboot, !kubeApiEnabled)
+	inventoryCmd := NewInventoryCmd(log, instructionConfig.AgentInventoryMaxSize, instructionConfig.AgentInventoryDiskMinSize)
 	freeAddressesCmd := newFreeAddressesCmd(log, kubeApiEnabled)
 	stopCmd := NewStopInstallationCmd(log)
 	logsCmd := NewLogsCmd(log, db, instructionConfig)
@@ -157,7 +158,7 @@ func (i *InstructionManager) GetNextSteps(ctx context.Context, host *models.Host
 	InfraEnvID := host.InfraEnvID
 	hostID := host.ID
 	hostStatus := swag.StringValue(host.Status)
-	log.Infof("GetNextSteps infra_env: <%s>, host: <%s>, host status: <%s>", InfraEnvID, hostID, hostStatus)
+	log.Debugf("GetNextSteps infra_env: <%s>, host: <%s>, host status: <%s>", InfraEnvID, hostID, hostStatus)
 
 	returnSteps := models.Steps{}
 	stateToSteps := i.installingClusterStateToSteps
@@ -281,7 +282,7 @@ func createStepID(stepType models.StepType) string {
 
 func logSteps(steps models.Steps, infraEnvId strfmt.UUID, hostId *strfmt.UUID, log logrus.FieldLogger) {
 	if len(steps.Instructions) == 0 {
-		log.Infof("No steps required for infraEnv <%s> host <%s>", infraEnvId, hostId)
+		log.Debugf("No steps required for infraEnv <%s> host <%s>", infraEnvId, hostId)
 	}
 	for _, step := range steps.Instructions {
 		log.Infof("Submitting step <%s> id <%s> to infra_env <%s> host <%s>  Arguments: <%+v>", step.StepType, step.StepID, infraEnvId, hostId, step.Args)

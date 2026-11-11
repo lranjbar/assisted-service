@@ -50,7 +50,7 @@ var _ = Describe("Agent service config controller storage validation", func() {
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -60,7 +60,7 @@ var _ = Describe("Agent service config controller storage validation", func() {
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -70,7 +70,7 @@ var _ = Describe("Agent service config controller storage validation", func() {
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -88,13 +88,23 @@ var _ = Describe("Agent service config controller storage validation", func() {
 		// Create the reconciler:
 		reconciler = &AgentServiceConfigReconciler{
 			AgentServiceConfigReconcileContext: AgentServiceConfigReconcileContext{
-				Scheme:   cluster.Scheme(),
-				Log:      logrusLogger,
-				Recorder: cluster.Recorder(),
+				Scheme:          cluster.Scheme(),
+				Log:             logrusLogger,
+				Recorder:        cluster.Recorder(),
+				IsOpenShift:     true,
+				PodIntrospector: &mockPodIntrospector{imagePullSecrets: nil},
 			},
 			Client:    client,
 			Namespace: "assisted-installer",
 		}
+		clusterTrustedCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: reconciler.Namespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
+		Expect(client.Create(ctx, clusterTrustedCM)).To(Succeed())
 	})
 
 	AfterEach(func() {

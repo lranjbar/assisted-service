@@ -11,9 +11,17 @@ import (
 type validationID models.HostValidationID
 
 const (
-	IsMediaConnected                               = validationID(models.HostValidationIDMediaConnected)
-	IsConnected                                    = validationID(models.HostValidationIDConnected)
-	HasInventory                                   = validationID(models.HostValidationIDHasInventory)
+	IsMediaConnected = validationID(models.HostValidationIDMediaConnected)
+	IsConnected      = validationID(models.HostValidationIDConnected)
+	HasInventory     = validationID(models.HostValidationIDHasInventory)
+	// InventoryNotPartiallyTruncated reports whether the agent has partially truncated the inventory,
+	// because it was too large compared to AGENT_INVENTORY_MAX_SIZE.
+	// This should not block the host from being installed, but it should be reported to the user as a warning.
+	InventoryNotPartiallyTruncated = validationID(models.HostValidationIDInventoryNotPartiallyTruncated)
+	// InventoryNotFullyTruncated reports whether the agent has fully truncated the inventory,
+	// because it was too large compared to AGENT_INVENTORY_MAX_SIZE, event after trying to truncate it partially.
+	// This should block the host from being installed, and the user should be notified that the inventory is too large.
+	InventoryNotFullyTruncated                     = validationID(models.HostValidationIDInventoryNotFullyTruncated)
 	IsMachineCidrDefined                           = validationID(models.HostValidationIDMachineCidrDefined)
 	BelongsToMachineCidr                           = validationID(models.HostValidationIDBelongsToMachineCidr)
 	HasMinCPUCores                                 = validationID(models.HostValidationIDHasMinCPUCores)
@@ -34,6 +42,8 @@ const (
 	AreCnvRequirementsSatisfied                    = validationID(models.HostValidationIDCnvRequirementsSatisfied)
 	AreLvmRequirementsSatisfied                    = validationID(models.HostValidationIDLvmRequirementsSatisfied)
 	AreMceRequirementsSatisfied                    = validationID(models.HostValidationIDMceRequirementsSatisfied)
+	AreMtvRequirementsSatisfied                    = validationID(models.HostValidationIDMtvRequirementsSatisfied)
+	AreOscRequirementsSatisfied                    = validationID(models.HostValidationIDOscRequirementsSatisfied)
 	SufficientOrUnknownInstallationDiskSpeed       = validationID(models.HostValidationIDSufficientInstallationDiskSpeed)
 	HasSufficientNetworkLatencyRequirementForRole  = validationID(models.HostValidationIDSufficientNetworkLatencyRequirementForRole)
 	HasSufficientPacketLossRequirementForRole      = validationID(models.HostValidationIDSufficientPacketLossRequirementForRole)
@@ -51,6 +61,29 @@ const (
 	NoSkipInstallationDisk                         = validationID(models.HostValidationIDNoSkipInstallationDisk)
 	NoSkipMissingDisk                              = validationID(models.HostValidationIDNoSkipMissingDisk)
 	NoIPCollisionsInNetwork                        = validationID(models.HostValidationIDNoIPCollisionsInNetwork)
+	NoIscsiNicBelongsToMachineCidr                 = validationID(models.HostValidationIDNoIscsiNicBelongsToMachineCidr)
+	AreNodeFeatureDiscoveryRequirementsSatisfied   = validationID(models.HostValidationIDNodeFeatureDiscoveryRequirementsSatisfied)
+	AreNvidiaGPURequirementsSatisfied              = validationID(models.HostValidationIDNvidiaGpuRequirementsSatisfied)
+	ArePipelinesRequirementsSatisfied              = validationID(models.HostValidationIDPipelinesRequirementsSatisfied)
+	AreServiceMeshRequirementsSatisfied            = validationID(models.HostValidationIDServicemeshRequirementsSatisfied)
+	AreServerLessRequirementsSatisfied             = validationID(models.HostValidationIDServerlessRequirementsSatisfied)
+	AreOpenShiftAIRequirementsSatisfied            = validationID(models.HostValidationIDOpenshiftAiRequirementsSatisfied)
+	AreAuthorinoRequirementsSatisfied              = validationID(models.HostValidationIDAuthorinoRequirementsSatisfied)
+	IsMtuValid                                     = validationID(models.HostValidationIDMtuValid)
+	AreNmstateRequirementsSatisfied                = validationID(models.HostValidationIDNmstateRequirementsSatisfied)
+	AreAMDGPURequirementsSatisfied                 = validationID(models.HostValidationIDAmdGpuRequirementsSatisfied)
+	AreKMMRequirementsSatisfied                    = validationID(models.HostValidationIDKmmRequirementsSatisfied)
+	AreNodeHealthcheckRequirementsSatisfied        = validationID(models.HostValidationIDNodeHealthcheckRequirementsSatisfied)
+	AreSelfNodeRemediationRequirementsSatisfied    = validationID(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied)
+	AreFenceAgentsRemediationRequirementsSatisfied = validationID(models.HostValidationIDFenceAgentsRemediationRequirementsSatisfied)
+	AreNodeMaintenanceRequirementsSatisfied        = validationID(models.HostValidationIDNodeMaintenanceRequirementsSatisfied)
+	AreKubeDeschedulerRequirementsSatisfied        = validationID(models.HostValidationIDKubeDeschedulerRequirementsSatisfied)
+	AreClusterObservabilityRequirementsSatisfied   = validationID(models.HostValidationIDClusterObservabilityRequirementsSatisfied)
+	AreNUMAResourcesRequirementsSatisfied          = validationID(models.HostValidationIDNumaResourcesRequirementsSatisfied)
+	AreOADPRequirementsSatisfied                   = validationID(models.HostValidationIDOadpRequirementsSatisfied)
+	AreMetalLBRequirementsSatisfied                = validationID(models.HostValidationIDMetallbRequirementsSatisfied)
+	AreLokiRequirementsSatisfied                   = validationID(models.HostValidationIDLokiRequirementsSatisfied)
+	AreOpenShiftLoggingRequirementsSatisfied       = validationID(models.HostValidationIDOpenshiftLoggingRequirementsSatisfied)
 )
 
 func (v validationID) category() (string, error) {
@@ -74,9 +107,13 @@ func (v validationID) category() (string, error) {
 		IsDNSWildcardNotConfigured,
 		NonOverlappingSubnets,
 		IsReleaseDomainNameResolvedCorrectly,
-		NoIPCollisionsInNetwork:
+		NoIPCollisionsInNetwork,
+		IsMtuValid,
+		NoIscsiNicBelongsToMachineCidr:
 		return "network", nil
 	case HasInventory,
+		InventoryNotPartiallyTruncated,
+		InventoryNotFullyTruncated,
 		HasMinCPUCores,
 		HasMinValidDisks,
 		HasMinMemory,
@@ -96,7 +133,30 @@ func (v validationID) category() (string, error) {
 		AreOdfRequirementsSatisfied,
 		AreCnvRequirementsSatisfied,
 		AreLvmRequirementsSatisfied,
-		AreMceRequirementsSatisfied:
+		AreMceRequirementsSatisfied,
+		AreMtvRequirementsSatisfied,
+		AreNodeFeatureDiscoveryRequirementsSatisfied,
+		AreNvidiaGPURequirementsSatisfied,
+		ArePipelinesRequirementsSatisfied,
+		AreServiceMeshRequirementsSatisfied,
+		AreServerLessRequirementsSatisfied,
+		AreOpenShiftAIRequirementsSatisfied,
+		AreAuthorinoRequirementsSatisfied,
+		AreOscRequirementsSatisfied,
+		AreNmstateRequirementsSatisfied,
+		AreAMDGPURequirementsSatisfied,
+		AreKMMRequirementsSatisfied,
+		AreNodeHealthcheckRequirementsSatisfied,
+		AreSelfNodeRemediationRequirementsSatisfied,
+		AreFenceAgentsRemediationRequirementsSatisfied,
+		AreNodeMaintenanceRequirementsSatisfied,
+		AreKubeDeschedulerRequirementsSatisfied,
+		AreClusterObservabilityRequirementsSatisfied,
+		AreNUMAResourcesRequirementsSatisfied,
+		AreOADPRequirementsSatisfied,
+		AreMetalLBRequirementsSatisfied,
+		AreLokiRequirementsSatisfied,
+		AreOpenShiftLoggingRequirementsSatisfied:
 		return "operators", nil
 	}
 	return "", common.NewApiError(http.StatusInternalServerError, errors.Errorf("Unexpected validation id %s", string(v)))

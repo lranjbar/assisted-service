@@ -8,7 +8,7 @@ kind: Template
 metadata:
   name: assisted-installer
 objects:
-- apiVersion: monitoring.coreos.com/v1
+- apiVersion: monitoring.rhobs/v1
   kind: ServiceMonitor
   metadata:
     labels:
@@ -26,7 +26,7 @@ objects:
     selector:
       matchLabels:
         app: assisted-service
-- apiVersion: monitoring.coreos.com/v1
+- apiVersion: monitoring.rhobs/v1
   kind: ServiceMonitor
   metadata:
     labels:

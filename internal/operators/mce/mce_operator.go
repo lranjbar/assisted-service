@@ -8,10 +8,16 @@ import (
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
-	logutil "github.com/openshift/assisted-service/pkg/log"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID = string(models.ClusterValidationIDMceRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDMceRequirementsSatisfied)
 )
 
 // operator is an MCE OLM operator plugin.
@@ -52,51 +58,61 @@ func (o *operator) GetName() string {
 	return Operator.Name
 }
 
+// GetFullName reports the full name of the Operator.
 func (o *operator) GetFullName() string {
 	return "multicluster engine"
 }
 
 // GetDependencies provides a list of dependencies of the Operator
-func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	return make([]string, 0), nil
+func (o *operator) GetDependencies(cluster *common.Cluster) []string {
+	return []string{}
 }
 
-// GetClusterValidationID returns cluster validation ID for the operator.
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDMceRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the operator.
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the operator.
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDMceRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster checks if the cluster satisfies the requirements to install the operator.
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
-	var ocpVersion, minOpenshiftVersionForMce *version.Version
-	var err error
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	result := []api.ValidationResult{{
+		Status:       api.Success,
+		ValidationId: clusterValidationID,
+	}}
 
-	ocpVersion, err = version.NewVersion(cluster.OpenshiftVersion)
+	ocpVersion, err := version.NewVersion(cluster.OpenshiftVersion)
 	if err != nil {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{err.Error()}}, nil
+		return nil, fmt.Errorf("failed to parse openshift version %s: %w", cluster.OpenshiftVersion, err)
 	}
 
-	minOpenshiftVersionForMce, err = version.NewVersion(o.config.MceMinOpenshiftVersion)
-
+	minOpenshiftVersionForMce, err := version.NewVersion(o.config.MceMinOpenshiftVersion)
 	if err != nil {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{err.Error()}}, nil
+		return nil, fmt.Errorf("failed to parse minimum openshift version for MCE %s: %w", o.config.MceMinOpenshiftVersion, err)
 	}
 
 	if ocpVersion.LessThan(minOpenshiftVersionForMce) {
-		message := fmt.Sprintf("multicluster engine is only supported for openshift versions %s and above", o.config.MceMinOpenshiftVersion)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+		result[0].Status = api.Failure
+		result[0].Reasons = []string{
+			fmt.Sprintf("multicluster engine is only supported for openshift versions %s and above", o.config.MceMinOpenshiftVersion),
+		}
+
+		return result, nil
 	}
 
-	return api.ValidationResult{Status: api.Success, ValidationId: o.GetClusterValidationID()}, nil
+	return result, nil
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and cpu
-func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host) (result api.ValidationResult, err error) {
+func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host, _ *models.ClusterHostRequirementsDetails) (result api.ValidationResult, err error) {
 	if host.Inventory == "" {
 		message := "Missing Inventory in the host"
 		return api.ValidationResult{Status: api.Pending, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
@@ -115,16 +131,18 @@ func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, ho
 		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message, err.Error()}}, err
 	}
 
+	effectiveRole := operatorscommon.EffectiveRoleForRequirementMessage(host)
+
 	cpu := requirements.CPUCores
 	if inventory.CPU.Count < cpu {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient CPU to deploy multicluster engine. Required CPU count is %d but found %d ", cpu, inventory.CPU.Count)}}, nil
+		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient CPU to deploy multicluster engine on the %s role, requires an additional %d CPU cores (included in the total required for the %s role) but found %d.", effectiveRole, cpu, effectiveRole, inventory.CPU.Count)}}, nil
 	}
 
 	mem := requirements.RAMMib
 	memBytes := conversions.MibToBytes(mem)
 	if inventory.Memory.UsableBytes < memBytes {
 		usableMemory := conversions.BytesToMib(inventory.Memory.UsableBytes)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient memory to deploy multicluster engine. Required memory is %d MiB but found %d MiB", mem, usableMemory)}}, nil
+		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient memory to deploy multicluster engine on the %s role, requires an additional %d MiB (included in the total required for the %s role) but found %d MiB.", effectiveRole, mem, effectiveRole, usableMemory)}}, nil
 	}
 
 	result = api.ValidationResult{
@@ -151,12 +169,7 @@ func (o *operator) GetMonitoredOperator() *models.MonitoredOperator {
 
 // GetHostRequirements provides the requirements that the host needs to satisfy in order to be able to install the operator.
 func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error) {
-	log := logutil.FromContext(ctx, o.log)
-	preflightRequirements, err := o.GetPreflightRequirements(ctx, cluster)
-	if err != nil {
-		log.WithError(err).Errorf("Cannot retrieve preflight requirements for cluster %s", cluster.ID)
-		return nil, err
-	}
+	preflightRequirements := o.GetPreflightRequirements(ctx, cluster)
 
 	if common.IsSingleNodeCluster(cluster) {
 		// SNO req
@@ -166,18 +179,18 @@ func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Clus
 		}, nil
 	}
 
+	if host.Role == models.HostRoleArbiter {
+		return &models.ClusterHostRequirementsDetails{}, nil
+	}
+
 	return preflightRequirements.Requirements.Worker.Quantitative, nil
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error) {
-	dependencies, err := o.GetDependencies(cluster)
-	if err != nil {
-		return &models.OperatorHardwareRequirements{}, err
-	}
+func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
 	return &models.OperatorHardwareRequirements{
 		OperatorName: o.GetName(),
-		Dependencies: dependencies,
+		Dependencies: o.GetDependencies(cluster),
 		Requirements: &models.HostTypeHardwareRequirementsWrapper{
 			Master: &models.HostTypeHardwareRequirements{
 				Qualitative: []string{},
@@ -194,16 +207,27 @@ func (o *operator) GetPreflightRequirements(context context.Context, cluster *co
 				},
 			},
 		},
-	}, nil
+	}
 }
 
 func (o *operator) GetSupportedArchitectures() []string {
 	return []string{common.X86CPUArchitecture, common.PowerCPUArchitecture,
 		common.S390xCPUArchitecture, common.ARM64CPUArchitecture, common.AMD64CPUArchitecture,
 	}
-
 }
 
 func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDMCE
+}
+
+func GetMinDiskSizeGB(cluster *models.Cluster) int64 {
+	if common.IsSingleNodeCluster(&common.Cluster{Cluster: *cluster}) {
+		return lo.Sum(lo.Values(storageSizeGi))
+	}
+	return lo.Max(lo.Values(storageSizeGi))
+}
+
+// GetBundleLabels returns the bundle labels for the LSO operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	return []string(Operator.Bundles)
 }

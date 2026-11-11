@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 
+	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
 )
@@ -25,6 +26,7 @@ const ByTokenPath ShortImageURLPrefix = "bytoken"
 
 const MinimalISOFilename string = "minimal.iso"
 const FullISOFilename string = "full.iso"
+const DisconnectedISOFilename string = "disconnected.iso"
 
 func KernelURL(baseURL, version, arch string, insecure bool) (string, error) {
 	return buildURL(baseURL, fmt.Sprintf("%s/kernel", BootArtifactsPath), insecure, map[string]string{
@@ -65,6 +67,8 @@ func ShortImageURL(baseURL string, prefix ShortImageURLPrefix, token, version, a
 		isoFilename = FullISOFilename
 	case string(models.ImageTypeMinimalIso):
 		isoFilename = MinimalISOFilename
+	case string(models.ImageTypeDisconnectedIso):
+		isoFilename = DisconnectedISOFilename
 	default:
 		return "", fmt.Errorf("failed generating image url: %s iso type does not exist", isoType)
 	}
@@ -73,8 +77,38 @@ func ShortImageURL(baseURL string, prefix ShortImageURLPrefix, token, version, a
 	return buildURL(baseURL, path, false, map[string]string{})
 }
 
+// OsImageVersion returns the version string to use in image-service URLs.
+// For disconnected ISOs, prefers openshift_version so multiple z-stream OVE
+// images that share an RHCOS build can be selected unambiguously.
+// For other image types, prefers the RHCOS build ID so multiple OS streams
+// for the same OpenShift version can be disambiguated.
+func OsImageVersion(osImage *models.OsImage) (string, error) {
+	if osImage == nil {
+		return "", errors.New("OS image is nil")
+	}
+	if osImage.Type == models.OsImageTypeDisconnectedIso {
+		if v := swag.StringValue(osImage.OpenshiftVersion); v != "" {
+			return v, nil
+		}
+		if v := swag.StringValue(osImage.Version); v != "" {
+			return v, nil
+		}
+	} else {
+		if v := swag.StringValue(osImage.Version); v != "" {
+			return v, nil
+		}
+		if v := swag.StringValue(osImage.OpenshiftVersion); v != "" {
+			return v, nil
+		}
+	}
+	return "", errors.Errorf("OS image entry '%+v' missing Version and OpenshiftVersion fields", osImage)
+}
+
 func GetBootArtifactURLs(baseURL, imageID string, osImage *models.OsImage, insecure bool) (*BootArtifactURLs, error) {
-	version := *osImage.OpenshiftVersion
+	version, err := OsImageVersion(osImage)
+	if err != nil {
+		return nil, err
+	}
 	arch := *osImage.CPUArchitecture
 	kernelUrl, err := KernelURL(baseURL, version, arch, insecure)
 	if err != nil {
@@ -149,6 +183,8 @@ func ParseDownloadURL(downloadURL string) (string, string, string, error) {
 		imageType = string(models.ImageTypeFullIso)
 	case MinimalISOFilename:
 		imageType = string(models.ImageTypeMinimalIso)
+	case DisconnectedISOFilename:
+		imageType = string(models.ImageTypeDisconnectedIso)
 	}
 
 	return imageType, arch, version, nil

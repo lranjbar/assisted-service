@@ -4,9 +4,9 @@ import (
 	"fmt"
 
 	"github.com/filanov/stateswitch"
-	"github.com/golang/mock/gomock"
 	"github.com/openshift/assisted-service/internal/cluster"
 	"github.com/openshift/assisted-service/internal/host"
+	"go.uber.org/mock/gomock"
 )
 
 func main() {
@@ -43,6 +43,14 @@ func hostStateMachine() stateswitch.StateMachine {
 		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
 	).AnyTimes()
 
+	mockTransitionHandler.EXPECT().PostRefreshHostDisconnection(gomock.Any(), gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().PostHostStageTimeout(gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
 	return host.NewHostStateMachine(stateswitch.NewStateMachine(), mockTransitionHandler)
 }
 
@@ -55,6 +63,26 @@ func clusterStateMachine() stateswitch.StateMachine {
 	).AnyTimes()
 
 	mockTransitionHandler.EXPECT().PostRefreshLogsProgress(gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().SendClusterInstallationFailedEvent(gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().PostRefreshCluster(gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().PostRefreshCluster(gomock.Any(), gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().SendClusterInstallationFailedEvent(gomock.Any()).Return(
+		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
+	).AnyTimes()
+
+	mockTransitionHandler.EXPECT().SendClusterInstallationFailedEvent(gomock.Any(), gomock.Any()).Return(
 		func(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) error { return nil },
 	).AnyTimes()
 

@@ -3,48 +3,52 @@ package lvm
 import (
 	"context"
 	"fmt"
+	"slices"
 
-	"github.com/go-openapi/swag"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/internal/common"
-	"github.com/openshift/assisted-service/internal/oc"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
 	"github.com/openshift/assisted-service/models"
-	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID = string(models.ClusterValidationIDLvmRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDLvmRequirementsSatisfied)
 )
 
 // operator is an ODF LVM OLM operator plugin; it implements api.Operator
 type operator struct {
-	log       logrus.FieldLogger
-	Config    *Config
-	extracter oc.Extracter
+	log    logrus.FieldLogger
+	Config *Config
 }
+
+const defaultStorageClassName = "lvms-" + defaultDeviceName
 
 var Operator = models.MonitoredOperator{
 	Name:             "lvm",
 	OperatorType:     models.OperatorTypeOlm,
 	Namespace:        "openshift-storage",
-	SubscriptionName: "",
+	SubscriptionName: "lvms-operator",
 	TimeoutSeconds:   30 * 60,
 }
 
 // NewLvmOperator creates new LvmOperator
-func NewLvmOperator(log logrus.FieldLogger, extracter oc.Extracter) *operator {
+func NewLvmOperator(log logrus.FieldLogger) *operator {
 	cfg := Config{}
 	err := envconfig.Process(common.EnvConfigPrefix, &cfg)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	return newLvmOperatorWithConfig(log, &cfg, extracter)
+	return newLvmOperatorWithConfig(log, &cfg)
 }
 
 // newOdfOperatorWithConfig creates new ODFOperator with given configuration
-func newLvmOperatorWithConfig(log logrus.FieldLogger, config *Config, extracter oc.Extracter) *operator {
+func newLvmOperatorWithConfig(log logrus.FieldLogger, config *Config) *operator {
 	return &operator{
-		log:       log,
-		Config:    config,
-		extracter: extracter,
+		log:    log,
+		Config: config,
 	}
 }
 
@@ -57,39 +61,61 @@ func (o *operator) GetFullName() string {
 	return "Logical Volume Management"
 }
 
-// GetDependencies provides a list of dependencies of the Operator
-func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	return make([]string, 0), nil
+func (o *operator) StorageClassName() string {
+	return defaultStorageClassName
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDLvmRequirementsSatisfied)
+// GetDependencies provides a list of dependencies of the Operator
+func (o *operator) GetDependencies(cluster *common.Cluster) []string {
+	return []string{}
+}
+
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDLvmRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster always return "valid" result
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
-	if ok, _ := common.BaseVersionLessThan(o.Config.LvmMinOpenshiftVersion, cluster.OpenshiftVersion); ok {
-		message := fmt.Sprintf("Logical Volume Manager is only supported for openshift versions %s and above", o.Config.LvmMinOpenshiftVersion)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	result := []api.ValidationResult{{
+		Status:       api.Success,
+		ValidationId: clusterValidationID,
+	}}
+
+	if ok, _ := common.BaseVersionLessThan(LvmoMinOpenshiftVersion, cluster.OpenshiftVersion); ok {
+		result[0].Status = api.Failure
+		result[0].Reasons = []string{
+			fmt.Sprintf("Logical Volume Manager is only supported for openshift versions %s and above", LvmoMinOpenshiftVersion),
+		}
+
+		return result, nil
 	}
 
-	if swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeFull {
+	if !common.IsSingleNodeCluster(cluster) {
 		if ok, _ := common.BaseVersionLessThan(LvmMinMultiNodeSupportVersion, cluster.OpenshiftVersion); ok {
-			message := fmt.Sprintf("Logical Volume Manager is only supported for highly available openshift with version %s or above", LvmMinMultiNodeSupportVersion)
-			return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
+			result[0].Status = api.Failure
+			result[0].Reasons = []string{
+				fmt.Sprintf("Logical Volume Manager is only supported for highly available openshift with version %s or above", LvmMinMultiNodeSupportVersion),
+			}
+
+			return result, nil
 		}
 	}
-	return api.ValidationResult{Status: api.Success, ValidationId: o.GetClusterValidationID()}, nil
+
+	return result, nil
 }
 
 // ValidateHost always return "valid" result
-func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host) (api.ValidationResult, error) {
+func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host, additionalOperatorRequirements *models.ClusterHostRequirementsDetails) (api.ValidationResult, error) {
 	if host.Inventory == "" {
 		message := "Missing Inventory in the host"
 		return api.ValidationResult{Status: api.Pending, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
@@ -101,13 +127,21 @@ func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, ho
 		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, err
 	}
 
-	diskCount := o.getValidDiskCount(inventory.Disks, host.InstallationDiskID)
+	minDiskSizeGb := int64(0)
+	if additionalOperatorRequirements != nil {
+		minDiskSizeGb = additionalOperatorRequirements.DiskSizeGb
+	}
+	diskCount, _ := operatorscommon.NonInstallationDiskCount(inventory.Disks, host.InstallationDiskID, minDiskSizeGb)
 
 	role := common.GetEffectiveRole(host)
-	areSchedulable := common.AreMastersSchedulable(cluster)
+	areSchedulable := common.ShouldMastersBeSchedulable(&cluster.Cluster)
+	minSizeMessage := ""
+	if minDiskSizeGb > 0 {
+		minSizeMessage = fmt.Sprintf(" of %dGB minimum", minDiskSizeGb)
+	}
+	message := fmt.Sprintf("Logical Volume Manager requires at least one non-installation HDD/SSD disk%s on the host", minSizeMessage)
 
-	message := "Logical Volume Manager requires at least one non-installation HDD/SSD disk on the host"
-	if role == models.HostRoleWorker || areSchedulable {
+	if role == models.HostRoleWorker || (areSchedulable && role != models.HostRoleArbiter) {
 		if diskCount == 0 {
 			return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
 		}
@@ -137,15 +171,12 @@ func (o *operator) GetMonitoredOperator() *models.MonitoredOperator {
 
 // GetHostRequirements provides operator's requirements towards the host
 func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error) {
-	log := logutil.FromContext(ctx, o.log)
-	preflightRequirements, err := o.GetPreflightRequirements(ctx, cluster)
-	if err != nil {
-		log.WithError(err).Errorf("Cannot retrieve preflight requirements for host %s", host.ID)
-		return nil, err
-	}
+	preflightRequirements := o.GetPreflightRequirements(ctx, cluster)
 
 	role := common.GetEffectiveRole(host)
-	if role == models.HostRoleMaster && !swag.BoolValue(cluster.SchedulableMasters) {
+	areSchedulable := common.ShouldMastersBeSchedulable(&cluster.Cluster)
+
+	if (role == models.HostRoleMaster && !areSchedulable) || role == models.HostRoleArbiter {
 		return &models.ClusterHostRequirementsDetails{
 			CPUCores: 0,
 			RAMMib:   0,
@@ -156,39 +187,54 @@ func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Clus
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error) {
-	dependecies, err := o.GetDependencies(cluster)
-	if err != nil {
-		return &models.OperatorHardwareRequirements{}, err
-	}
-
+func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
 	memoryRequirements := o.Config.LvmMemoryPerHostMiB
 	if ok, _ := common.BaseVersionLessThan(LvmsMinOpenshiftVersion_ForNewResourceRequirements, cluster.OpenshiftVersion); ok {
 		memoryRequirements = o.Config.LvmMemoryPerHostMiBBefore4_13
 	}
 
+	if ok, _ := common.BaseVersionGreaterOrEqual(LvmNewResourcesOpenshiftVersion4_16, cluster.OpenshiftVersion); ok {
+		memoryRequirements = o.Config.LvmMemoryPerHostMiBFrom4_16
+	}
+	requirementMessage := []string{
+		"At least 1 non-boot disk per host",
+		fmt.Sprintf("%d MiB of additional RAM", memoryRequirements),
+		fmt.Sprintf("%d additional CPUs for each non-boot disk", o.Config.LvmCPUPerHost),
+	}
+
 	return &models.OperatorHardwareRequirements{
 		OperatorName: o.GetName(),
-		Dependencies: dependecies,
+		Dependencies: o.GetDependencies(cluster),
 		Requirements: &models.HostTypeHardwareRequirementsWrapper{
 			Master: &models.HostTypeHardwareRequirements{
-				Qualitative: []string{
-					"At least 1 non-boot disk on one or more host",
-					fmt.Sprintf("%d GiB of additional RAM", memoryRequirements),
-					fmt.Sprintf("%d additional CPUs for each non-boot disk", memoryRequirements),
-				},
+				Qualitative: requirementMessage,
 				Quantitative: &models.ClusterHostRequirementsDetails{
 					CPUCores: o.Config.LvmCPUPerHost,
 					RAMMib:   memoryRequirements,
 				},
 			},
 			Worker: &models.HostTypeHardwareRequirements{
-				Quantitative: &models.ClusterHostRequirementsDetails{},
+				Qualitative: requirementMessage,
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores: o.Config.LvmCPUPerHost,
+					RAMMib:   memoryRequirements,
+				},
 			},
 		},
-	}, nil
+	}
 }
 
 func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDLVM
+}
+
+// GetBundleLabels returns the bundle labels for the LVM operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	// For SNO feature, include in openshift-ai bundle
+	if slices.Contains(featureIDs, models.FeatureSupportLevelIDSNO) {
+		return []string{"openshift-ai"}
+	}
+
+	// For non-SNO deployments, LVM is not in any bundle by default
+	return []string{}
 }

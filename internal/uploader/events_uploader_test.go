@@ -17,11 +17,9 @@ import (
 	"time"
 
 	"github.com/go-openapi/strfmt"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"github.com/openshift/assisted-service/internal/cluster/validations"
 	"github.com/openshift/assisted-service/internal/common"
 	commontesting "github.com/openshift/assisted-service/internal/common/testing"
 	"github.com/openshift/assisted-service/internal/events"
@@ -30,7 +28,9 @@ import (
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/k8sclient"
+	eventModels "github.com/openshift/assisted-service/pkg/uploader/models"
 	"github.com/pkg/errors"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,6 +42,13 @@ const (
 	emailDomain      = "example.com"
 	pullSecretFormat = `{"auths":{"cloud.openshift.com":{"auth":"%s","email":"user@example.com"}}}` // #nosec
 	username         = "theUsername"
+)
+
+var (
+	identity = Identity{
+		Username:    username,
+		EmailDomain: emailDomain,
+	}
 )
 
 var _ = Describe("setHeaders", func() {
@@ -78,6 +85,7 @@ var _ = Describe("setHeaders", func() {
 	})
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
 	})
 
 	It("correctly sets the request header with a valid auth token", func() {
@@ -155,7 +163,6 @@ var _ = Describe("prepareFiles", func() {
 		ctx            context.Context
 		db             *gorm.DB
 		dbName         string
-		token          string
 		clusterID      strfmt.UUID
 		mockEvents     *eventsapi.MockHandler
 		hostID         strfmt.UUID
@@ -172,7 +179,6 @@ var _ = Describe("prepareFiles", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		infraEnvID = strfmt.UUID(uuid.New().String())
 		hostID = strfmt.UUID(uuid.New().String())
-		token = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, "thePassword")))
 		serviceVersion = versions.Versions{
 			SelfVersion:     "self-version",
 			AgentDockerImg:  "agent-image",
@@ -187,6 +193,7 @@ var _ = Describe("prepareFiles", func() {
 
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
 	})
 
 	It("successfully prepares all files", func() {
@@ -194,8 +201,7 @@ var _ = Describe("prepareFiles", func() {
 			ctx, common.GetDefaultV2GetEventsParams(&clusterID, nil, nil, models.EventCategoryMetrics, models.EventCategoryUser)).Return(&common.V2GetEventsResponse{}, nil).Times(1)
 
 		cluster := createTestObjects(db, &clusterID, &hostID, &infraEnvID)
-		pullSecret := validations.PullSecretCreds{AuthRaw: token, Email: fmt.Sprintf("testemail@%s", emailDomain), Username: username}
-		buf, err := prepareFiles(ctx, db, cluster, mockEvents, &pullSecret, cfg)
+		buf, err := prepareFiles(ctx, db, cluster, mockEvents, identity, cfg)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(buf.Bytes()).NotTo(BeEmpty())
 		testFiles := map[string]*testFile{
@@ -222,8 +228,7 @@ var _ = Describe("prepareFiles", func() {
 		eventsHandler.V2AddEvent(ctx, &clusterID2, &hostID, &infraEnvID, models.ClusterStatusError, models.EventSeverityInfo, "fake event", time.Now())
 		cluster := createTestObjects(db, &clusterID, &hostID, &infraEnvID)
 		createTestObjects(db, &clusterID2, nil, nil)
-		pullSecret := validations.PullSecretCreds{AuthRaw: token, Email: fmt.Sprintf("testemail@%s", emailDomain), Username: username}
-		buf, err := prepareFiles(ctx, db, cluster, eventsHandler, &pullSecret, cfg)
+		buf, err := prepareFiles(ctx, db, cluster, eventsHandler, identity, cfg)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(buf.Bytes()).NotTo(BeEmpty())
 		testFiles := map[string]*testFile{
@@ -248,8 +253,7 @@ var _ = Describe("prepareFiles", func() {
 			ctx, common.GetDefaultV2GetEventsParams(&clusterID, nil, nil, models.EventCategoryMetrics, models.EventCategoryUser)).Return(&common.V2GetEventsResponse{}, nil).Times(1)
 
 		cluster := createTestObjects(db, &clusterID, &hostID, nil)
-		pullSecret := validations.PullSecretCreds{AuthRaw: token, Email: fmt.Sprintf("testemail@%s", emailDomain), Username: username}
-		buf, err := prepareFiles(ctx, db, cluster, mockEvents, &pullSecret, cfg)
+		buf, err := prepareFiles(ctx, db, cluster, mockEvents, identity, cfg)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(buf.Bytes()).NotTo(BeEmpty())
 		testFiles := map[string]*testFile{
@@ -272,8 +276,7 @@ var _ = Describe("prepareFiles", func() {
 	It("fails to prepare files when there is no data", func() {
 		mockEvents.EXPECT().V2GetEvents(ctx, common.GetDefaultV2GetEventsParams(nil, nil, nil, models.EventCategoryMetrics, models.EventCategoryUser)).Return(
 			nil, errors.New("no events found")).Times(1)
-		pullSecret := validations.PullSecretCreds{AuthRaw: token, Email: fmt.Sprintf("testemail@%s", emailDomain)}
-		buf, err := prepareFiles(ctx, db, &common.Cluster{}, mockEvents, &pullSecret, cfg)
+		buf, err := prepareFiles(ctx, db, &common.Cluster{}, mockEvents, identity, cfg)
 		Expect(err).To(HaveOccurred())
 		Expect(buf).To(BeNil())
 		testFiles := map[string]*testFile{
@@ -376,6 +379,7 @@ var _ = Describe("UploadEvents", func() {
 	})
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
 	})
 	It("successfully uploads event data", func() {
 		event := models.Event{
@@ -418,23 +422,15 @@ var _ = Describe("UploadEvents", func() {
 	})
 	It("fails to uploads event data when malformed pullsecret", func() {
 		createOCMPullSecretWithEmptyToken(*mockK8sClient)
-		mockEvents.EXPECT().V2GetEvents(
-			ctx, common.GetDefaultV2GetEventsParams(&clusterID, nil, nil, models.EventCategoryMetrics, models.EventCategoryUser)).
-			Return(&common.V2GetEventsResponse{}, nil).Times(1)
-
 		cluster := createTestObjects(db, &clusterID, &hostID, &infraEnvID)
 		err := uploader.UploadEvents(ctx, cluster, mockEvents)
-		Expect(err.Error()).To(MatchRegexp(`failed to get pull secret to upload event data for cluster .*`))
+		Expect(err.Error()).To(MatchRegexp(`.*failed to get pull secrets to upload event data for cluster.*`))
 	})
 	It("fails to uploads event data when pullsecret not found", func() {
 		createOCMPullSecretNotFound(*mockK8sClient)
-		mockEvents.EXPECT().V2GetEvents(
-			ctx, common.GetDefaultV2GetEventsParams(&clusterID, nil, nil, models.EventCategoryMetrics, models.EventCategoryUser)).
-			Return(&common.V2GetEventsResponse{}, nil).Times(1)
-
 		cluster := createTestObjects(db, &clusterID, &hostID, &infraEnvID)
 		err := uploader.UploadEvents(ctx, cluster, mockEvents)
-		Expect(err.Error()).To(MatchRegexp(`failed to get pull secret to upload event data for cluster .*`))
+		Expect(err.Error()).To(MatchRegexp(`.*failed to get pull secrets to upload event data for cluster.*`))
 	})
 	It("returns error when upload request is not 2XX", func() {
 		event := models.Event{
@@ -669,5 +665,14 @@ func checkMetadataFile(metadataFile *testFile, cfg Config) {
 		expectedMetadata["deployment-version"] = cfg.DeploymentVersion
 		expectedMetadata["git-ref"] = cfg.AssistedServiceVersion
 		Expect(metadataContents).To(BeEquivalentTo(expectedMetadata))
+	}
+}
+
+func generateExpectedEvents(clusterID string, config Config) eventModels.Events {
+	meta := createMetadataContent(config)
+
+	return eventModels.Events{
+		ClusterID: clusterID,
+		Metadata:  &meta,
 	}
 }

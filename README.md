@@ -95,19 +95,13 @@ If you want to update the underlying operating system image used by the discover
 
 ## Deployment
 
-### Deploy to minikube
+### Deploy to k8s
 
 The deployment is a system deployment, it contains all the components the service need for all the operations to work (if implemented).
 S3 service (minio), DB and will use the image generator to create the images in the deployed S3 and create relevant bucket in S3.
 
 ```shell
-skipper make deploy-all
-```
-
-Note: when deployed in minikube, we need to be running [minikube tunnel](https://minikube.sigs.k8s.io/docs/handbook/accessing/#using-minikube-tunnel), as some services are type `LoadBalancer` and need to be exposed.
-
-```shell
-nohup minikube tunnel &>/dev/null
+make deploy-on-k8s
 ```
 
 
@@ -147,46 +141,8 @@ For OpenShift users, look at the service deployment options on OpenShift platfor
 
 ### Deploy Monitoring
 
-Note: This target is only for development purpose.
+See - [deploy monitoring](./docs/user-guide/deploy-assisted-monitoring.md)
 
-This will allow you to deploy Prometheus and Grafana already integrated with Assisted installer:
-
-- On Minikube
-
-```shell
-# Step by step
-make deploy-olm
-make deploy-prometheus
-make deploy-grafana
-
-# Or just all-in
-make deploy-monitoring
-```
-
-- On Openshift
-
-```shell
-# Step by step
-make deploy-prometheus TARGET=oc-ingress APPLY_NAMESPACE=false
-make deploy-grafana TARGET=oc-ingress APPLY_NAMESPACE=false
-
-# Or just all-in
-make deploy-monitoring TARGET=oc-ingress APPLY_NAMESPACE=false
-```
-
-NOTE: To expose the monitoring UI's on your local environment you could follow these steps
-
-```shell
-kubectl config set-context $(kubectl config current-context) --namespace assisted-installer
-
-# To expose Prometheus
-kubectl port-forward svc/prometheus-k8s 9090:9090
-
-# To expose Grafana
-kubectl port-forward svc/grafana 3000:3000
-```
-
-Now you just need to access [http://127.0.0.1:3000](http://127.0.0.1:3000) to access to your Grafana deployment or [http://127.0.0.1:9090](http://127.0.0.1:9090) for Prometheus.
 
 ### Deploy by tag
 
@@ -242,6 +198,32 @@ allowing it to be effective most of the time.
 ## Troubleshooting
 
 A document that can assist troubleshooting: [link](https://docs.google.com/document/d/1WDc5LQjNnqpznM9YFTGb9Bg1kqPVckgGepS4KBxGSqw)
+
+### Monitoring deadlines and blacklisting ([MGMT-21268](https://issues.redhat.com/browse/MGMT-21268))
+
+When certain monitoring deadlines are exceeded, monitoring cancels the overrun work and continues, emitting internal events, instead of causing the liveness probe to fail. If monitoring appears to “skip” certain clusters or hosts, or you see warnings about deadlines being exceeded, use the following guidance.
+
+- **Symptoms**
+  - Logs include messages such as:
+    - `cluster monitor cycle exceeded deadline <X>; ending cycle early`
+    - `cluster monitoring exceeded deadline <X>; blacklisting for <TTL>`
+    - `skipping blacklisted cluster in monitor`
+    - `host monitor deadline exceeded for host <host-id> in cluster <cluster-id>`
+    - `infra-env host monitor deadline exceeded for host <host-id> in infra-env <infraenv-id>`
+  - Health probe remains OK; service no longer restarts due to long monitoring cycles.
+
+- **Diagnosis**
+  - These messages indicate the monitoring loop canceled work that exceeded configured deadlines and, for clusters, temporarily blacklisted further processing.
+  - Internal events are emitted for each condition. Check the events stream for entries matching the above messages.
+
+- **Remediation**
+  - Reduce load on the service if possible (large number of clusters/hosts, heavy validations).
+  - Tune the following environment variables to fit your environment:
+    - `CLUSTER_MONITOR_PER_CLUSTER_DEADLINE` (default `2m`): max time to spend monitoring a single cluster in one cycle. When exceeded, the cluster is temporarily blacklisted.
+    - `CLUSTER_MONITOR_BLACKLIST_DURATION` (default `15m`): duration to temporarily skip clusters that exceeded the per-cluster deadline.
+    - `CLUSTER_MONITOR_CYCLE_DEADLINE` (default `4m`): max overall time budget for one cluster-monitoring cycle. When exceeded, the cycle ends early and resumes on the next tick.
+    - `HOST_MONITOR_PER_HOST_TIMEOUT` (default `2m`): max time to spend monitoring a single host (cluster-bound or infra-env) before canceling.
+  - The blacklist is in-memory; waiting for the TTL to expire or restarting the service clears it. Prefer adjusting the TTL instead of restarting, when possible.
 
 ## Documentation
 

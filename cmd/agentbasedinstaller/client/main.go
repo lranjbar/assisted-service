@@ -35,6 +35,8 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/client"
+	"github.com/openshift/assisted-service/models"
+	"github.com/openshift/assisted-service/pkg/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -42,6 +44,7 @@ const failureOutputPath = "/var/run/agent-installer/host-config-failures"
 
 var Options struct {
 	ServiceBaseUrl string `envconfig:"SERVICE_BASE_URL" default:""`
+	UserAuthToken  string `envconfig:"USER_AUTH_TOKEN" default:""`
 }
 
 var RegisterOptions struct {
@@ -54,11 +57,20 @@ var RegisterOptions struct {
 	ImageTypeISO            string `envconfig:"IMAGE_TYPE_ISO" default:"full-iso"`
 	ReleaseImageMirror      string `envconfig:"OPENSHIFT_INSTALL_RELEASE_IMAGE_MIRROR" default:""`
 	ExtraManifests          string `envconfig:"EXTRA_MANIFESTS_PATH" default:"/extra-manifests"`
+	OperatorInstallFile     string `envconfig:"OPERATOR_INSTALL_FILE" default:"/manifests/operators.yaml"`
 }
 
 var ConfigureOptions struct {
-	InfraEnvID    string `envconfig:"INFRA_ENV_ID" default:""`
-	HostConfigDir string `envconfig:"HOST_CONFIG_DIR" default:"/etc/assisted/hostconfig"`
+	InfraEnvID    string                                `envconfig:"INFRA_ENV_ID" default:""`
+	HostConfigDir string                                `envconfig:"HOST_CONFIG_DIR" default:"/etc/assisted/hostconfig"`
+	WorkflowType  agentbasedinstaller.AgentWorkflowType `envconfig:"WORKFLOW_TYPE" default:"install"`
+}
+
+var ImportOptions struct {
+	ClusterID            string `envconfig:"CLUSTER_ID" default:""`
+	ClusterName          string `envconfig:"CLUSTER_NAME" default:""`
+	ClusterAPIVIPDNSName string `envconfig:"CLUSTER_API_VIP_DNS_NAME" default:""`
+	ClusterConfigDir     string `envconfig:"CLUSTER_CONFIG_DIR" default:"/clusterconfig"`
 }
 
 func main() {
@@ -75,25 +87,16 @@ func main() {
 	}
 	u.Path = path.Join(u.Path, client.DefaultBasePath)
 	clientConfig.URL = u
+	clientConfig.AuthInfo = auth.UserAuthHeaderWriter(Options.UserAuthToken)
+
 	bmInventory := client.New(clientConfig)
 	ctx := context.Background()
 	log.Info("SERVICE_BASE_URL: " + Options.ServiceBaseUrl)
-
-	// TODO: This is for backward compatibility and should be removed once the
-	// ephemeral ISO services are using the subcommands.
-	if path.Base(os.Args[0]) == "agent-based-installer-register-cluster-and-infraenv" {
-		register(ctx, log, bmInventory)
-		return
-	}
 
 	if len(os.Args) < 2 {
 		log.Fatal("No subcommand specified")
 	}
 	switch os.Args[1] {
-	case "register":
-		// registers both cluster and infraenv
-		infraEnvID := register(ctx, log, bmInventory)
-		os.WriteFile("/etc/assisted/client_config", []byte("INFRA_ENV_ID="+infraEnvID), 0644)
 	case "registerCluster":
 		clusterID := registerCluster(ctx, log, bmInventory)
 		os.WriteFile("/etc/assisted/client_config", []byte("CLUSTER_ID="+clusterID), 0644)
@@ -102,39 +105,11 @@ func main() {
 		os.WriteFile("/etc/assisted/client_config", []byte("INFRA_ENV_ID="+infraEnvID), 0644)
 	case "configure":
 		configure(ctx, log, bmInventory)
+	case "importCluster":
+		importCluster(ctx, log, bmInventory)
 	default:
 		log.Fatalf("Unknown subcommand %s", os.Args[1])
 	}
-}
-
-func register(ctx context.Context, log *log.Logger, bmInventory *client.AssistedInstall) string {
-	err := envconfig.Process("", &RegisterOptions)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	pullSecret, err := agentbasedinstaller.GetPullSecret(RegisterOptions.PullSecretFile)
-	if err != nil {
-		log.Fatal("Failed to get pull secret: ", err.Error())
-	}
-
-	modelsCluster, err := agentbasedinstaller.RegisterCluster(ctx, log, bmInventory, pullSecret,
-		RegisterOptions.ClusterDeploymentFile, RegisterOptions.AgentClusterInstallFile, RegisterOptions.ClusterImageSetFile, RegisterOptions.ReleaseImageMirror)
-	if err != nil {
-		log.Fatal("Failed to register cluster with assisted-service: ", err)
-	}
-
-	modelsInfraEnv, err := agentbasedinstaller.RegisterInfraEnv(ctx, log, bmInventory, pullSecret,
-		modelsCluster, RegisterOptions.InfraEnvFile, RegisterOptions.NMStateConfigFile, RegisterOptions.ImageTypeISO, "")
-	if err != nil {
-		log.Fatal("Failed to register infraenv with assisted-service: ", err)
-	}
-	err = agentbasedinstaller.RegisterExtraManifests(os.DirFS(RegisterOptions.ExtraManifests), ctx, log, bmInventory.Manifests, modelsCluster)
-	if err != nil {
-		log.Fatal("Failed to register extra manifests with assisted-service: ", err)
-	}
-
-	return modelsInfraEnv.ID.String()
 }
 
 func registerCluster(ctx context.Context, log *log.Logger, bmInventory *client.AssistedInstall) string {
@@ -144,22 +119,40 @@ func registerCluster(ctx context.Context, log *log.Logger, bmInventory *client.A
 	}
 
 	existingCluster, err := agentbasedinstaller.GetCluster(ctx, log, bmInventory)
-	if err == nil {
-		log.Infof("Skipping cluster registration. Found existing cluster with id: %s", existingCluster.ID.String())
-		return existingCluster.ID.String()
-	}
-
-	pullSecret, err := agentbasedinstaller.GetPullSecret(RegisterOptions.PullSecretFile)
 	if err != nil {
-		log.Fatal("Failed to get pull secret: ", err.Error())
+		log.Fatal(err.Error())
 	}
 
-	modelsCluster, err := agentbasedinstaller.RegisterCluster(ctx, log, bmInventory, pullSecret,
-		RegisterOptions.ClusterDeploymentFile, RegisterOptions.AgentClusterInstallFile, RegisterOptions.ClusterImageSetFile, RegisterOptions.ReleaseImageMirror)
+	var modelsCluster *models.Cluster
+	if existingCluster != nil {
+		log.Infof("Found existing cluster with id: %s", existingCluster.ID.String())
+		modelsCluster = existingCluster
+	} else {
+		pullSecret, err := agentbasedinstaller.GetPullSecret(RegisterOptions.PullSecretFile)
+		if err != nil {
+			log.Fatal("Failed to get pull secret: ", err.Error())
+		}
+
+		modelsCluster, err = agentbasedinstaller.RegisterCluster(ctx, log, bmInventory, pullSecret,
+			RegisterOptions.ClusterDeploymentFile, RegisterOptions.AgentClusterInstallFile, RegisterOptions.ClusterImageSetFile,
+			RegisterOptions.ReleaseImageMirror, RegisterOptions.OperatorInstallFile, false)
+		if err != nil {
+			log.Fatal("Failed to register cluster with assisted-service: ", err)
+		}
+	}
+
+	// Apply installConfig overrides if present (idempotent)
+	log.Info("Applying installConfig overrides...")
+	updatedCluster, err := agentbasedinstaller.ApplyInstallConfigOverrides(ctx, log, bmInventory, modelsCluster, RegisterOptions.AgentClusterInstallFile)
 	if err != nil {
-		log.Fatal("Failed to register cluster with assisted-service: ", err)
+		log.Fatal("Failed to apply installConfig overrides: ", err)
+	}
+	if updatedCluster != nil {
+		modelsCluster = updatedCluster
 	}
 
+	// Register extra manifests (idempotent)
+	log.Info("Registering extra manifests...")
 	err = agentbasedinstaller.RegisterExtraManifests(os.DirFS(RegisterOptions.ExtraManifests), ctx, log, bmInventory.Manifests, modelsCluster)
 	if err != nil {
 		log.Fatal("Failed to register extra manifests with assisted-service: ", err)
@@ -189,7 +182,11 @@ func registerInfraEnv(ctx context.Context, log *log.Logger, bmInventory *client.
 	if err != nil {
 		log.Fatal("Failed to find cluster when registering infraenv: ", err)
 	} else {
-		log.Infof("Reference to cluster id: %s", modelsCluster.ID.String())
+		if modelsCluster != nil {
+			log.Infof("Reference to cluster id: %s", modelsCluster.ID.String())
+		} else {
+			log.Info("No Cluster found, registering InfraEnv for late binding")
+		}
 	}
 
 	modelsInfraEnv, err := agentbasedinstaller.RegisterInfraEnv(ctx, log, bmInventory, pullSecret,
@@ -211,7 +208,7 @@ func configure(ctx context.Context, log *log.Logger, bmInventory *client.Assiste
 		log.Fatal("No INFRA_ENV_ID specified")
 	}
 
-	hostConfigs, err := agentbasedinstaller.LoadHostConfigs(ConfigureOptions.HostConfigDir)
+	hostConfigs, err := agentbasedinstaller.LoadHostConfigs(ConfigureOptions.HostConfigDir, ConfigureOptions.WorkflowType)
 	if err != nil {
 		log.Fatal("Failed to load host configuration: ", err)
 	}
@@ -237,6 +234,29 @@ func configure(ctx context.Context, log *log.Logger, bmInventory *client.Assiste
 		}
 	}
 	log.Info("Configured all hosts")
+}
+
+func importCluster(ctx context.Context, log *log.Logger, bmInventory *client.AssistedInstall) {
+	err := envconfig.Process("", &ImportOptions)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+
+	if ImportOptions.ClusterID == "" {
+		log.Fatal("No Cluster_ID specified")
+	}
+	if ImportOptions.ClusterName == "" {
+		log.Fatal("No Cluster_NAME specified")
+	}
+	if ImportOptions.ClusterAPIVIPDNSName == "" {
+		log.Fatal("No Cluster_API_VIP_DNS_Name specified")
+	}
+
+	clusterID := strfmt.UUID(ImportOptions.ClusterID)
+	_, err = agentbasedinstaller.ImportCluster(os.DirFS(ImportOptions.ClusterConfigDir), ctx, log, bmInventory, clusterID, ImportOptions.ClusterName, ImportOptions.ClusterAPIVIPDNSName)
+	if err != nil {
+		log.Fatal("Failed to import cluster with assisted-service: ", err)
+	}
 }
 
 func recordFailures(failures []agentbasedinstaller.Failure) error {

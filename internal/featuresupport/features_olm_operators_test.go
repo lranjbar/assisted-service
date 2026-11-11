@@ -5,12 +5,14 @@ import (
 
 	"github.com/go-openapi/swag"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
 )
 
 var _ = Describe("V2ListFeatureSupportLevels API", func() {
+	featureCNV := models.FeatureSupportLevelIDCNV
 	lVMavailableVersions := []string{"4.11", "4.12", "4.13", "4.14", "4.15"}
 	unspportedLVMVersions := []string{"4.10", "4.9", "4.8", "4.7", "4.6"}
 
@@ -105,10 +107,10 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				Expect(fmt.Sprintf("id: %d, result: %s", test.id, resultSupportLevel)).To(Equal(fmt.Sprintf("id: %d, result: %s", test.id, test.expected)))
 			}
 		})
-		It("Validate Compacompatible Features", func() {
-			incompatibleFeatures := make(map[string]*[]models.FeatureSupportLevelID)
+		It("Validate Incompatible Features", func() {
+			incompatibleFeatures := make(map[string][]models.FeatureSupportLevelID)
 
-			incompatibleFeatures["4.11"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.11"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
@@ -116,7 +118,7 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 			}
 
-			incompatibleFeatures["4.12"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.12"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
@@ -124,12 +126,12 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 			}
 
-			incompatibleFeatures["4.15"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.15"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
 			}
-			incompatibleFeatures["4.16.0-rc0"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.16.0-rc0"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
@@ -191,7 +193,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDCNV)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDCNV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
 
 		It("MCE should be unavailable", func() {
@@ -202,7 +211,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDMCE)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDMCE {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
 	})
 
@@ -215,7 +231,149 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDCNV)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDCNV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
+	})
+
+	DescribeTable("Validate CNV on Architecture", func(ocpVersion []string, cpuArch string, expectedResult bool) {
+		for _, v := range ocpVersion {
+			version := v
+			result := IsFeatureAvailable(featureCNV, version, swag.String(cpuArch))
+			Expect(result).Should(Equal(expectedResult),
+				fmt.Sprintf("Feature: %s, OCP version: %s, CpuArch: %s, should be %v", featureCNV, v, cpuArch, expectedResult))
+		}
+	},
+
+		Entry("on X86	is supported", []string{"4.8", "4.11", "4.14", "4.21"}, models.ClusterCPUArchitectureX8664, true),
+		Entry("on arm64 is supported", []string{"4.14", "4.15", "4.21"}, models.ClusterCPUArchitectureArm64, true),
+		Entry("on arm64 is    NOT supported", []string{"4.11", "4.12", "4.13"}, models.ClusterCPUArchitectureArm64, false),
+		Entry("on S390x is    NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitectureS390x, false),
+		Entry("on ppc64le is	NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitecturePpc64le, false),
+	)
+
+	Context("Test MTV feature", func() {
+		DescribeTable("Validate MTV on Architecture", func(ocpVersion []string, cpuArch string, expectedResult bool) {
+			for _, v := range ocpVersion {
+				version := v
+				result := IsFeatureAvailable(models.FeatureSupportLevelIDMTV, version, swag.String(cpuArch))
+				Expect(result).Should(Equal(expectedResult),
+					fmt.Sprintf("Feature: %s, OCP version: %s, CpuArch: %s, should be %v", models.FeatureSupportLevelIDMTV, v, cpuArch, expectedResult))
+			}
+		},
+			Entry("on X86	is supported above 4.14", []string{"4.14", "4.21"}, models.ClusterCPUArchitectureX8664, true),
+			Entry("on X86	is NOT supported", []string{"4.8", "4.11", "4.13"}, models.ClusterCPUArchitectureX8664, false),
+			Entry("on arm64 is    NOT supported", []string{"4.8", "4.11", "4.14", "4.21"}, models.ClusterCPUArchitectureArm64, false),
+			Entry("on S390x is    NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitectureS390x, false),
+			Entry("on ppc64le is	NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitecturePpc64le, false),
+		)
+
+		DescribeTable("Validate MTV on platform", func(ocpVersion string, cpuArch string, platformType models.PlatformType, expectedResult models.SupportLevel) {
+			featureSupportLevels := GetFeatureSupportList(
+				ocpVersion,
+				swag.String(cpuArch),
+				common.PlatformTypePtr(platformType),
+				nil,
+			)
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDMTV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
+		},
+			Entry("on Vsphere", "4.14", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelUnavailable),
+			Entry("on Nutanix", "4.14", common.X86CPUArchitecture, models.PlatformTypeNutanix, models.SupportLevelUnavailable),
+			Entry("on none", "4.14", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelSupported),
+			Entry("on baremetal", "4.14", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelSupported),
+			Entry("on baremetal", "4.13", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelUnavailable),
+		)
+	})
+
+	Context("Test OSC feature", func() {
+		DescribeTable("Validate OSC on Architecture", func(ocpVersion []string, cpuArch string, expectedResult bool) {
+			for _, v := range ocpVersion {
+				version := v
+				result := IsFeatureAvailable(models.FeatureSupportLevelIDOSC, version, swag.String(cpuArch))
+				Expect(result).Should(Equal(expectedResult),
+					fmt.Sprintf("Feature: %s, OCP version: %s, CpuArch: %s, should be %v", models.FeatureSupportLevelIDOSC, v, cpuArch, expectedResult))
+			}
+		},
+			Entry("on X86	is supported above 4.10", []string{"4.15", "4.16", "4.17", "4.21"}, models.ClusterCPUArchitectureX8664, true),
+			Entry("on arm64 is    NOT supported", []string{"4.8", "4.11", "4.14", "4.21"}, models.ClusterCPUArchitectureArm64, false),
+			Entry("on S390x is    NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitectureS390x, false),
+			Entry("on ppc64le is	NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitecturePpc64le, false),
+		)
+
+		DescribeTable("Validate OSC on platform", func(ocpVersion string, cpuArch string, platformType models.PlatformType, expectedResult models.SupportLevel) {
+			featureSupportLevels := GetFeatureSupportList(
+				ocpVersion,
+				swag.String(cpuArch),
+				common.PlatformTypePtr(platformType),
+				nil,
+			)
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDOSC {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
+		},
+			Entry("on Vsphere", "4.10", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelUnavailable),
+			Entry("on Nutanix", "4.10", common.X86CPUArchitecture, models.PlatformTypeNutanix, models.SupportLevelUnavailable),
+			Entry("on none", "4.10", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelSupported),
+			Entry("on baremetal", "4.10", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelSupported),
+		)
+	})
+
+	Context("Test NMState feature", func() {
+		DescribeTable("Validate NMState on Architecture", func(ocpVersion []string, cpuArch string, expectedResult bool) {
+			for _, v := range ocpVersion {
+				version := v
+				result := IsFeatureAvailable(models.FeatureSupportLevelIDNMSTATE, version, swag.String(cpuArch))
+				Expect(result).Should(Equal(expectedResult),
+					fmt.Sprintf("Feature: %s, OCP version: %s, CpuArch: %s, should be %v", models.FeatureSupportLevelIDNMSTATE, v, cpuArch, expectedResult))
+			}
+		},
+			Entry("on X86	is supported above 4.12", []string{"4.12", "4.16", "4.17", "4.21"}, models.ClusterCPUArchitectureX8664, true),
+			Entry("on X86 is 	NOT supported below 4.12", []string{"3.18", "4.1", "4.10", "4.11"}, models.ClusterCPUArchitectureX8664, false),
+			Entry("on arm64 is    NOT supported", []string{"4.8", "4.11", "4.14", "4.21"}, models.ClusterCPUArchitectureArm64, false),
+			Entry("on S390x is    NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitectureS390x, false),
+			Entry("on ppc64le is	NOT supported", []string{"4.11", "4.13", "4.14", "4.21"}, models.ClusterCPUArchitecturePpc64le, false),
+		)
+
+		DescribeTable("Validate NMState on platform", func(ocpVersion string, cpuArch string, platformType models.PlatformType, expectedResult models.SupportLevel) {
+			featureSupportLevels := GetFeatureSupportList(
+				ocpVersion,
+				swag.String(cpuArch),
+				common.PlatformTypePtr(platformType),
+				nil,
+			)
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDNMSTATE {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
+		},
+			Entry("on Vsphere", "4.12", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelSupported),
+			Entry("on none", "4.12", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelSupported),
+			Entry("on baremetal", "4.12", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelSupported),
+
+			Entry("on Nutanix", "4.12", common.X86CPUArchitecture, models.PlatformTypeNutanix, models.SupportLevelUnavailable),
+			Entry("on Nutanix", "4.12", common.X86CPUArchitecture, models.PlatformTypeExternal, models.SupportLevelUnavailable),
+		)
 	})
 })

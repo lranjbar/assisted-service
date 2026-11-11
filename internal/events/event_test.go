@@ -3,13 +3,13 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -26,7 +26,9 @@ import (
 	"github.com/openshift/assisted-service/restapi"
 	"github.com/openshift/assisted-service/restapi/operations/events"
 	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -53,7 +55,7 @@ var _ = Describe("Add event", func() {
 		cfg := &auth.Config{AuthType: auth.TypeRHSSO, EnableOrgTenancy: true}
 		authz_handler := auth.NewAuthzHandler(cfg, nil, logrus.New(), db)
 		theEvents.(*Events).authz = authz_handler
-		api = &Api{handler: theEvents, log: log}
+		api = &Api{handler: theEvents, log: log, db: db}
 		inputEvent = &models.Event{
 			Message:  swag.String(eventMessage),
 			Name:     eventName,
@@ -177,6 +179,8 @@ var _ = Describe("Events library", func() {
 		infraEnv2 = strfmt.UUID("705c994b-eaa0-4b77-880b-66d4cd34cb4e")
 		host      = strfmt.UUID("1e45d128-4a69-4e71-9b50-a0c627217f3e")
 		host2     = strfmt.UUID("ad647798-a7af-4b1d-b96e-69f1beb9b4c3")
+		i1        common.InfraEnv
+		i2        common.InfraEnv
 	)
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
@@ -186,9 +190,9 @@ var _ = Describe("Events library", func() {
 		Expect(db.Create(&c1).Error).ShouldNot(HaveOccurred())
 		c2 := common.Cluster{Cluster: models.Cluster{ID: &cluster2, OpenshiftClusterID: strfmt.UUID(uuid.New().String()), UserName: "user2", OrgID: "org1"}}
 		Expect(db.Create(&c2).Error).ShouldNot(HaveOccurred())
-		i1 := common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnv1, UserName: "user1", OrgID: "org1"}}
+		i1 = common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnv1, UserName: "user1", OrgID: "org1"}}
 		Expect(db.Create(&i1).Error).ShouldNot(HaveOccurred())
-		i2 := common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnv2, UserName: "user2", OrgID: "org1"}}
+		i2 = common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnv2, UserName: "user2", OrgID: "org1"}}
 		Expect(db.Create(&i2).Error).ShouldNot(HaveOccurred())
 	})
 	numOfEventsRetrieved := func(clusterID *strfmt.UUID, HostIds []strfmt.UUID, infraEnvID *strfmt.UUID) int {
@@ -272,6 +276,35 @@ var _ = Describe("Events library", func() {
 			Expect(evs[0]).Should(WithSeverity(swag.String(models.EventSeverityInfo)))
 
 			Expect(numOfEventsRetrieved(&cluster2, nil, nil)).Should(Equal(0))
+		})
+
+		It("Should only list host specific events if infraenv for that host is present", func() {
+			// Create a host and link it to an infraEnv
+			h := models.Host{InfraEnvID: infraEnv1, ID: &host}
+			Expect(db.Create(&h).Error).ShouldNot(HaveOccurred())
+
+			// Generate some events for this host and infraenv combination
+			for i := 1; i <= 10; i++ {
+				theEvents.V2AddEvent(context.TODO(), nil, &host, &infraEnv1,
+					eventgen.HostRegistrationFailedEventName, models.EventSeverityInfo, fmt.Sprintf("Registration failed event %d:", i), time.Now())
+			}
+			Expect(numOfEventsRetrieved(nil, []strfmt.UUID{host}, nil)).Should(Equal(10))
+
+			// Delete the infraenv
+			Expect(db.Delete(&i1).Error).ShouldNot(HaveOccurred())
+			// Delete the host
+			Expect(db.Delete(&h).Error).ShouldNot(HaveOccurred())
+			// Recreate the host with a different infraenv
+			h = models.Host{InfraEnvID: infraEnv2, ID: &host}
+			Expect(db.Create(&h).Error).ShouldNot(HaveOccurred())
+
+			// Generate some events for the same host under the new infraenv
+			for i := 1; i <= 9; i++ {
+				theEvents.V2AddEvent(context.TODO(), nil, &host, &infraEnv2,
+					eventgen.HostRegistrationFailedEventName, models.EventSeverityInfo, fmt.Sprintf("Registration failed event %d:", i), time.Now())
+			}
+			// We should expect only the events for the new infraenv under the same host id
+			Expect(numOfEventsRetrieved(nil, []strfmt.UUID{host}, nil)).Should(Equal(9))
 		})
 	})
 
@@ -537,6 +570,32 @@ var _ = Describe("Events library", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				evs := response.GetEvents()
 				Expect(len(evs)).To(Equal(0))
+			})
+
+			It("can fetch events by host id when org tenancy is not enabled", func() {
+				cfg := &auth.Config{AuthType: auth.TypeRHSSO, EnableOrgTenancy: false}
+				authz_handler := auth.NewAuthzHandler(cfg, nil, logrus.New(), db)
+				theEvents.(*Events).authz = authz_handler
+				response, err := theEvents.V2GetEvents(ctx, common.GetDefaultV2GetEventsParams(nil, []strfmt.UUID{host}, nil))
+				Expect(err).ShouldNot(HaveOccurred())
+				evs := response.GetEvents()
+				Expect(len(evs)).To(Equal(2))
+			})
+
+			It("can fetch events with deleted_hosts=true without ambiguity on deleted_at", func() {
+				cfg := &auth.Config{AuthType: auth.TypeRHSSO, EnableOrgTenancy: false}
+				authz_handler := auth.NewAuthzHandler(cfg, nil, logrus.New(), db)
+				theEvents.(*Events).authz = authz_handler
+
+				params := common.GetDefaultV2GetEventsParams(&cluster1, nil, nil)
+				trueVal := true
+				params.DeletedHosts = &trueVal
+
+				response, err := theEvents.V2GetEvents(ctx, params)
+				Expect(err).ShouldNot(HaveOccurred(), "expected no error when querying with deleted_hosts=true")
+
+				evs := response.GetEvents()
+				Expect(evs).NotTo(BeNil())
 			})
 		})
 	})
@@ -1918,6 +1977,238 @@ var _ = Describe("Events library", func() {
 	})
 })
 
+var _ = Describe("InitializeEventLimits", func() {
+	var (
+		log            *logrus.Logger
+		originalLimits map[string]time.Duration
+	)
+
+	BeforeEach(func() {
+		// Create a simple logger
+		log = logrus.New()
+
+		// Save original eventLimits to restore after test
+		originalLimits = make(map[string]time.Duration)
+		for k, v := range eventLimits {
+			originalLimits[k] = v
+		}
+
+		// Reset eventLimits to known hardcoded defaults
+		eventLimits = map[string]time.Duration{
+			eventgen.UpgradeAgentFailedEventName:   time.Hour,
+			eventgen.UpgradeAgentFinishedEventName: time.Hour,
+			eventgen.UpgradeAgentStartedEventName:  time.Hour,
+		}
+	})
+
+	AfterEach(func() {
+		// Restore original eventLimits
+		eventLimits = originalLimits
+	})
+
+	// verifyEventLimitDefaults verifies that all three default event limits are present with their default values
+	verifyEventLimitDefaults := func() {
+		Expect(eventLimits[eventgen.UpgradeAgentFailedEventName]).To(Equal(time.Hour))
+		Expect(eventLimits[eventgen.UpgradeAgentFinishedEventName]).To(Equal(time.Hour))
+		Expect(eventLimits[eventgen.UpgradeAgentStartedEventName]).To(Equal(time.Hour))
+	}
+
+	Context("with empty or default configuration", func() {
+		It("should succeed and preserve hardcoded defaults", func() {
+			err := InitializeEventLimits("", log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits).To(HaveLen(3))
+			verifyEventLimitDefaults()
+		})
+	})
+
+	Context("with valid custom configuration", func() {
+		It("should add new event limits", func() {
+			err := InitializeEventLimits(`{"new_event":"5m"}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits).To(HaveLen(4)) // 3 defaults + 1 new
+			Expect(eventLimits["new_event"]).To(Equal(5 * time.Minute))
+			// Verify defaults are still there
+			verifyEventLimitDefaults()
+		})
+
+		It("should override existing defaults", func() {
+			err := InitializeEventLimits(`{"upgrade_agent_failed":"2h"}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits).To(HaveLen(3)) // Same count
+			Expect(eventLimits[eventgen.UpgradeAgentFailedEventName]).To(Equal(2 * time.Hour))
+			// Verify other defaults unchanged
+			Expect(eventLimits[eventgen.UpgradeAgentFinishedEventName]).To(Equal(time.Hour))
+			Expect(eventLimits[eventgen.UpgradeAgentStartedEventName]).To(Equal(time.Hour))
+		})
+
+		It("should handle multiple events", func() {
+			err := InitializeEventLimits(`{"event1":"5m","event2":"1h"}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits).To(HaveLen(5)) // 3 defaults + 2 new
+			Expect(eventLimits["event1"]).To(Equal(5 * time.Minute))
+			Expect(eventLimits["event2"]).To(Equal(time.Hour))
+		})
+
+		It("should support various duration formats", func() {
+			err := InitializeEventLimits(`{"e1":"30s","e2":"5m","e3":"1h30m","e4":"2h"}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits["e1"]).To(Equal(30 * time.Second))
+			Expect(eventLimits["e2"]).To(Equal(5 * time.Minute))
+			Expect(eventLimits["e3"]).To(Equal(90 * time.Minute))
+			Expect(eventLimits["e4"]).To(Equal(2 * time.Hour))
+		})
+
+		It("should handle mix of override and new events", func() {
+			err := InitializeEventLimits(`{"upgrade_agent_failed":"2h","new_event":"30m"}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(eventLimits).To(HaveLen(4)) // 3 defaults (1 overridden) + 1 new
+			Expect(eventLimits[eventgen.UpgradeAgentFailedEventName]).To(Equal(2 * time.Hour))
+			Expect(eventLimits["new_event"]).To(Equal(30 * time.Minute))
+			// Verify other defaults unchanged
+			Expect(eventLimits[eventgen.UpgradeAgentFinishedEventName]).To(Equal(time.Hour))
+			Expect(eventLimits[eventgen.UpgradeAgentStartedEventName]).To(Equal(time.Hour))
+		})
+	})
+
+	Context("with invalid JSON", func() {
+		It("should fail with malformed JSON", func() {
+			err := InitializeEventLimits(`{bad json}`, log)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to parse EVENT_RATE_LIMITS json"))
+			Expect(err.Error()).To(ContainSubstring("{bad json}"))
+		})
+
+		It("should fail with incomplete JSON", func() {
+			err := InitializeEventLimits(`{"event":"5m"`, log)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to parse EVENT_RATE_LIMITS json"))
+		})
+
+		It("should succeed with empty JSON object", func() {
+			err := InitializeEventLimits(`{}`, log)
+
+			Expect(err).ToNot(HaveOccurred())
+			// Should still have defaults
+			Expect(eventLimits).To(HaveLen(3))
+		})
+	})
+
+	Context("with invalid durations", func() {
+		It("should fail with missing unit", func() {
+			err := InitializeEventLimits(`{"event":"5"}`, log)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid duration for event 'event'"))
+			Expect(err.Error()).To(ContainSubstring("5"))
+		})
+
+		It("should fail with wrong unit", func() {
+			err := InitializeEventLimits(`{"event":"5minutes"}`, log)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid duration for event 'event'"))
+			Expect(err.Error()).To(ContainSubstring("5minutes"))
+		})
+	})
+})
+
+var _ = Describe("logCurrentLimits", func() {
+	var (
+		log            *logrus.Logger
+		hook           *test.Hook
+		originalLimits map[string]time.Duration
+	)
+
+	BeforeEach(func() {
+		// Create logger with test hook to capture output
+		log, hook = test.NewNullLogger()
+		// Set log level to Debug to capture Debug level logs
+		log.SetLevel(logrus.DebugLevel)
+
+		// Save original eventLimits to restore after test
+		originalLimits = make(map[string]time.Duration)
+		for k, v := range eventLimits {
+			originalLimits[k] = v
+		}
+	})
+
+	AfterEach(func() {
+		// Restore original eventLimits
+		eventLimits = originalLimits
+		hook.Reset()
+	})
+
+	Context("with configured limits", func() {
+		It("should log at Debug level with all event limits", func() {
+			// Setup some event limits
+			eventLimits = map[string]time.Duration{
+				"event1": time.Hour,
+				"event2": 30 * time.Minute,
+			}
+
+			logCurrentLimits(log)
+
+			Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+			Expect(hook.LastEntry().Message).To(Equal("Event rate limits configured"))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("event1", "1h0m0s"))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("event2", "30m0s"))
+		})
+
+		It("should log hardcoded defaults", func() {
+			// Use hardcoded defaults
+			eventLimits = map[string]time.Duration{
+				eventgen.UpgradeAgentFailedEventName:   time.Hour,
+				eventgen.UpgradeAgentFinishedEventName: time.Hour,
+				eventgen.UpgradeAgentStartedEventName:  time.Hour,
+			}
+
+			logCurrentLimits(log)
+
+			Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+			Expect(hook.LastEntry().Message).To(Equal("Event rate limits configured"))
+			Expect(hook.LastEntry().Data).To(HaveLen(3))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue(eventgen.UpgradeAgentFailedEventName, "1h0m0s"))
+		})
+
+		It("should format durations correctly", func() {
+			eventLimits = map[string]time.Duration{
+				"seconds": 30 * time.Second,
+				"minutes": 5 * time.Minute,
+				"hours":   2 * time.Hour,
+				"mixed":   90 * time.Minute,
+			}
+
+			logCurrentLimits(log)
+
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("seconds", "30s"))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("minutes", "5m0s"))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("hours", "2h0m0s"))
+			Expect(hook.LastEntry().Data).To(HaveKeyWithValue("mixed", "1h30m0s"))
+		})
+	})
+
+	Context("with no limits configured", func() {
+		It("should log debug message when eventLimits is empty", func() {
+			eventLimits = map[string]time.Duration{}
+
+			logCurrentLimits(log)
+
+			Expect(hook.LastEntry().Level).To(Equal(logrus.DebugLevel))
+			Expect(hook.LastEntry().Message).To(Equal("No event rate limits configured"))
+			Expect(hook.LastEntry().Data).To(BeEmpty())
+		})
+	})
+})
+
 func WithRequestID(requestID string) types.GomegaMatcher {
 	return WithTransform(func(e *common.Event) string {
 		return e.RequestID.String()
@@ -1952,7 +2243,13 @@ func WithTime(t time.Time) types.GomegaMatcher {
 
 func TestEvents(t *testing.T) {
 	RegisterFailHandler(Fail)
-	common.InitializeDBTest()
-	defer common.TerminateDBTest()
 	RunSpecs(t, "Events test Suite")
 }
+
+var _ = BeforeSuite(func() {
+	common.InitializeDBTest()
+})
+
+var _ = AfterSuite(func() {
+	common.TerminateDBTest()
+})

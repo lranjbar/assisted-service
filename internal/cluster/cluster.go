@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/filanov/stateswitch"
@@ -26,16 +27,18 @@ import (
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/host"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
-	"github.com/openshift/assisted-service/internal/manifests"
+	"github.com/openshift/assisted-service/internal/installcfg"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
 	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/stream"
 	"github.com/openshift/assisted-service/internal/uploader"
+	"github.com/openshift/assisted-service/internal/usage"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
 	"github.com/openshift/assisted-service/pkg/commonutils"
+	"github.com/openshift/assisted-service/pkg/db/slowquery"
 	"github.com/openshift/assisted-service/pkg/leader"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/ocm"
@@ -50,14 +53,14 @@ import (
 )
 
 const (
-	DhcpLeaseTimeoutMinutes             = 2
-	ForceSchedulableMastersMaxHostCount = 5
+	DhcpLeaseTimeoutMinutes = 2
 )
 
 var S3FileNames = []string{
 	constants.Kubeconfig,
 	"bootstrap.ign",
 	"master.ign",
+	"arbiter.ign",
 	"worker.ign",
 	"metadata.json",
 	"kubeadmin-password",
@@ -76,12 +79,8 @@ var ClusterOwnerFileNames = []string{
 //go:generate mockgen -source=cluster.go -package=cluster -destination=mock_cluster_api.go
 
 type RegistrationAPI interface {
-	// Register a new cluster
+	// Register a new cluster (handles all cluster types based on Kind field)
 	RegisterCluster(ctx context.Context, c *common.Cluster) error
-	// Register a new add-host cluster
-	RegisterAddHostsCluster(ctx context.Context, c *common.Cluster) error
-	// Register a new add-host-ocp cluster
-	RegisterAddHostsOCPCluster(c *common.Cluster, db *gorm.DB) error
 	//deregister cluster
 	DeregisterCluster(ctx context.Context, c *common.Cluster) error
 }
@@ -103,7 +102,6 @@ type API interface {
 	// Refresh state in case of hosts update
 	RefreshStatus(ctx context.Context, c *common.Cluster, db *gorm.DB) (*common.Cluster, error)
 	ClusterMonitoring()
-	IsOperatorMonitored(c *common.Cluster, operatorName string) bool
 	IsOperatorAvailable(c *common.Cluster, operatorName string) bool
 	UploadIngressCert(c *common.Cluster) (err error)
 	VerifyClusterUpdatability(c *common.Cluster) (err error)
@@ -124,13 +122,15 @@ type API interface {
 	ResetClusterFiles(ctx context.Context, c *common.Cluster, objectHandler s3wrapper.API) error
 	UpdateLogsProgress(ctx context.Context, c *common.Cluster, progress string) error
 	GetClusterByKubeKey(key types.NamespacedName) (*common.Cluster, error)
+	GetHostCountByRole(clusterID strfmt.UUID, role models.HostRole, suggested bool) (*int64, error)
 	UpdateAmsSubscriptionID(ctx context.Context, clusterID, amsSubscriptionID strfmt.UUID) *common.ApiErrorResponse
 	GenerateAdditionalManifests(ctx context.Context, cluster *common.Cluster) error
 	CompleteInstallation(ctx context.Context, db *gorm.DB, cluster *common.Cluster, reason string) (*common.Cluster, error)
 	PermanentClustersDeletion(ctx context.Context, olderThan strfmt.DateTime, objectHandler s3wrapper.API) error
 	DeregisterInactiveCluster(ctx context.Context, maxDeregisterPerInterval int, inactiveSince strfmt.DateTime) error
 	TransformClusterToDay2(ctx context.Context, cluster *common.Cluster, db *gorm.DB) error
-	RefreshSchedulableMastersForcedTrue(ctx context.Context, clusterID strfmt.UUID) error
+	RefreshSchedulableMastersForcedTrue(ctx context.Context, cluster *common.Cluster) error
+	RefreshSchedulableMastersForcedTrueWithClusterID(ctx context.Context, clusterID strfmt.UUID) error
 	HandleVerifyVipsResponse(ctx context.Context, clusterID strfmt.UUID, stepReply string) error
 	UpdateFinalizingStage(ctx context.Context, clusterID strfmt.UUID, finalizingStage models.FinalizingStage) error
 }
@@ -149,6 +149,43 @@ type Config struct {
 	InstallationTimeout time.Duration `envconfig:"INSTALLATION_TIMEOUT" default:"24h"`
 	FinalizingTimeout   time.Duration `envconfig:"FINALIZING_TIMEOUT" default:"5h"`
 	MonitorBatchSize    int           `envconfig:"CLUSTER_MONITOR_BATCH_SIZE" default:"100"`
+	// MonitorPerClusterDeadline bounds how long we spend monitoring a single cluster in one cycle
+	MonitorPerClusterDeadline time.Duration `envconfig:"CLUSTER_MONITOR_PER_CLUSTER_DEADLINE" default:"2m"`
+	// MonitorBlacklistDuration is how long to blacklist a cluster after a deadline is exceeded
+	MonitorBlacklistDuration time.Duration `envconfig:"CLUSTER_MONITOR_BLACKLIST_DURATION" default:"15m"`
+	// MonitorCycleDeadline bounds the total time for one ClusterMonitoring cycle
+	MonitorCycleDeadline       time.Duration              `envconfig:"CLUSTER_MONITOR_CYCLE_DEADLINE" default:"4m"`
+	DisabledClusterValidations DisabledClusterValidations `envconfig:"DISABLED_CLUSTER_VALIDATIONS" default:""`
+}
+
+type DisabledClusterValidations map[string]struct{}
+
+// Decode parses a comma-separated string of cluster validation IDs into the
+// DisabledClusterValidations map. It implements the envconfig.Decoder interface
+// so that DISABLED_CLUSTER_VALIDATIONS can be loaded from environment variables.
+func (d *DisabledClusterValidations) Decode(value string) error {
+	disabledClusterValidations := DisabledClusterValidations{}
+	if value == `""` {
+		value = ""
+	}
+	validationIDs, err := common.ParseCommaSeparatedUniqueValues(value, "cluster validation ID")
+	if err != nil {
+		return err
+	}
+	for _, element := range validationIDs {
+		if err := models.ClusterValidationID(element).Validate(nil); err != nil {
+			return fmt.Errorf("disabled cluster validation ID '%s' is not a known cluster validation", element)
+		}
+		disabledClusterValidations[element] = struct{}{}
+	}
+	*d = disabledClusterValidations
+	return nil
+}
+
+// IsDisabled returns true if the given validation ID is present in the disabled set.
+func (d DisabledClusterValidations) IsDisabled(id ValidationID) bool {
+	_, ok := d[id.String()]
+	return ok
 }
 
 type Manager struct {
@@ -173,12 +210,18 @@ type Manager struct {
 	authHandler           auth.Authenticator
 	uploadClient          uploader.Client
 	manifestApi           manifestsapi.ManifestsAPI
+	// in-memory blacklist of clusters that exceeded monitoring deadline (key: cluster ID, value: expiration time)
+	blacklistedClusters sync.Map
+	// resumeAfterClusterID is a cursor used to avoid starvation: after a cycle timeout, the next cycle
+	// will skip clusters up to and including this ID and resume from the subsequent clusters.
+	resumeAfterClusterID *strfmt.UUID
 }
 
 func NewManager(cfg Config, log logrus.FieldLogger, db *gorm.DB, stream stream.Notifier, eventsHandler eventsapi.Handler,
 	uploadClient uploader.Client, hostAPI host.API, metricApi metrics.API, manifestsGeneratorAPI network.ManifestsGeneratorAPI,
 	leaderElector leader.Leader, operatorsApi operators.API, ocmClient *ocm.Client, objectHandler s3wrapper.API,
-	dnsApi dns.DNSApi, authHandler auth.Authenticator, manifestApi manifestsapi.ManifestsAPI, softTimeoutsEnabled bool) *Manager {
+	dnsApi dns.DNSApi, authHandler auth.Authenticator, manifestApi manifestsapi.ManifestsAPI, softTimeoutsEnabled bool,
+	usageApi usage.API) *Manager {
 	th := &transitionHandler{
 		log:                 log,
 		db:                  db,
@@ -200,13 +243,14 @@ func NewManager(cfg Config, log logrus.FieldLogger, db *gorm.DB, stream stream.N
 		sm:                    NewClusterStateMachine(th),
 		metricAPI:             metricApi,
 		manifestsGeneratorAPI: manifestsGeneratorAPI,
-		rp:                    newRefreshPreprocessor(log, hostAPI, operatorsApi),
 		hostAPI:               hostAPI,
+		rp:                    newRefreshPreprocessor(log, hostAPI, operatorsApi, usageApi, eventsHandler, cfg.DisabledClusterValidations),
 		leaderElector:         leaderElector,
-		prevMonitorInvokedAt:  time.Now(),
+		prevMonitorInvokedAt:  time.Time{},
 		ocmClient:             ocmClient,
 		objectHandler:         objectHandler,
 		dnsApi:                dnsApi,
+		monitorQueryGenerator: nil,
 		authHandler:           authHandler,
 		uploadClient:          uploadClient,
 		manifestApi:           manifestApi,
@@ -214,20 +258,15 @@ func NewManager(cfg Config, log logrus.FieldLogger, db *gorm.DB, stream stream.N
 }
 
 func (m *Manager) RegisterCluster(ctx context.Context, c *common.Cluster) error {
-	return m.registrationAPI.RegisterCluster(ctx, c)
-}
-
-func (m *Manager) RegisterAddHostsCluster(ctx context.Context, c *common.Cluster) error {
-	err := m.registrationAPI.RegisterAddHostsCluster(ctx, c)
+	err := m.registrationAPI.RegisterCluster(ctx, c)
 	if err != nil {
 		return err
 	}
-	eventgen.SendClusterRegistrationSucceededEvent(ctx, m.eventsHandler, *c.ID, models.ClusterKindAddHostsCluster)
+	// Send event only for add-hosts clusters
+	if c.Kind != nil && *c.Kind == models.ClusterKindAddHostsCluster {
+		eventgen.SendClusterRegistrationSucceededEvent(ctx, m.eventsHandler, *c.ID, models.ClusterKindAddHostsCluster)
+	}
 	return nil
-}
-
-func (m *Manager) RegisterAddHostsOCPCluster(c *common.Cluster, db *gorm.DB) error {
-	return m.registrationAPI.RegisterAddHostsOCPCluster(c, db)
 }
 
 func (m *Manager) DeregisterCluster(ctx context.Context, c *common.Cluster) error {
@@ -428,6 +467,13 @@ func (m *Manager) tryAssignMachineCidrDHCPMode(cluster *common.Cluster) error {
 }
 
 func (m *Manager) tryAssignMachineCidrNonDHCPMode(cluster *common.Cluster) error {
+	// With user-managed load balancer we can't calculate the
+	// machine network as the vips might be outside the hosts subnets.
+	// It should be set by the user manually.
+	if network.IsLoadBalancerUserManaged(cluster) {
+		return nil
+	}
+
 	primaryMachineNetwork, err := network.CalculateMachineNetworkCIDR(
 		network.GetApiVipById(cluster, 0), network.GetIngressVipById(cluster, 0), cluster.Hosts, false)
 	if err != nil {
@@ -522,7 +568,7 @@ func (m *Manager) autoAssignMachineNetworkCidr(c *common.Cluster) error {
 	var err error
 	if swag.BoolValue(c.VipDhcpAllocation) {
 		err = m.tryAssignMachineCidrDHCPMode(c)
-	} else if swag.StringValue(c.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+	} else if c.ControlPlaneCount == 1 {
 		err = m.tryAssignMachineCidrSNO(c)
 	} else if !swag.BoolValue(c.UserManagedNetworking) {
 		err = m.tryAssignMachineCidrNonDHCPMode(c)
@@ -551,7 +597,7 @@ func (m *Manager) triggerLeaseTimeoutEvent(ctx context.Context, c *common.Cluste
 
 func (m *Manager) SkipMonitoring(c *common.Cluster) bool {
 	// logs required monitoring on error state until IsLogCollectionTimedOut move the logs state to timeout,
-	// or remote controllers reports that their log colection has been completed. Then, monitoring should be
+	// or remote controllers reports that their log collection has been completed. Then, monitoring should be
 	// stopped to avoid excessive computation
 	skipMonitoringStates := []string{string(models.LogsStateCompleted), string(models.LogsStateTimeout)}
 	result := (swag.StringValue(c.Status) == models.ClusterStatusError || swag.StringValue(c.Status) == models.ClusterStatusCancelled) &&
@@ -564,6 +610,7 @@ func (m *Manager) initMonitorQueryGenerator() {
 		buildInitialQuery := func(db *gorm.DB) *gorm.DB {
 			noNeedToMonitorInStates := []string{
 				models.ClusterStatusInstalled,
+				models.ClusterStatusUnmonitored,
 			}
 
 			dbWithCondition := common.LoadClusterTablesFromDB(db)
@@ -579,81 +626,215 @@ func (m *Manager) ClusterMonitoring() {
 		m.log.Debugf("Not a leader, exiting ClusterMonitoring")
 		return
 	}
+	slowquery.SetGoroutineScope(slowquery.ScopeClusterMonitor, "")
+	defer slowquery.ClearGoroutineScope()
+
 	m.log.Debugf("Running ClusterMonitoring")
 	defer commonutils.MeasureOperation("ClusterMonitoring", m.log, m.metricAPI)()
-	var (
-		offset              int
-		limit               = m.MonitorBatchSize
-		monitored           int64
-		clusters            []*common.Cluster
-		clusterAfterRefresh *common.Cluster
-		requestID           = requestid.NewID()
-		ctx                 = requestid.ToContext(context.Background(), requestID)
-		log                 = requestid.RequestIDLogger(m.log, requestID)
-		err                 error
-	)
 
-	curMonitorInvokedAt := time.Now()
+	cycle := m.initMonitoringCycle()
+	defer func() { m.prevMonitorInvokedAt = cycle.startTime }()
+	defer cycle.cancel()
+
+	isFullScan := cycle.query.IsFullScan()
 	defer func() {
-		m.prevMonitorInvokedAt = curMonitorInvokedAt
+		m.metricAPI.MonitoredClustersCycleDurationMs(cycle.ctx, time.Since(cycle.startTime), isFullScan)
 	}()
-
-	//no need to refresh cluster status if the cluster is in the following statuses
-	//when cluster is in error. it should be still monitored until all the logs are collected.
-	//Then, SkipMonitoring() stops the logic from running forever
-	m.initMonitorQueryGenerator()
-
-	query := m.monitorQueryGenerator.NewClusterQuery()
 	for {
-		clusters, err = query.Next()
+		clusters, err := cycle.query.Next()
 		if err != nil {
-			log.WithError(err).Errorf("failed to get clusters")
+			cycle.log.WithError(err).Errorf("failed to get clusters")
 			return
 		}
 		if len(clusters) == 0 {
 			break
 		}
-		m.log.Debugf("We are going to monitor %d, query is: %+v", len(clusters), query)
+		m.log.Debugf("We are going to monitor %d, query is: %+v", len(clusters), cycle.query)
+
 		for _, cluster := range clusters {
-			if !m.leaderElector.IsLeader() {
-				m.log.Debugf("Not a leader, exiting ClusterMonitoring")
+			shouldSkip, shouldReturn := m.validateClusterForProcessing(cycle.ctx, cluster, &cycle.skipUntilAfterCursor, cycle.log, &cycle.lastProcessedClusterID)
+			if shouldReturn {
 				return
 			}
-			if !m.SkipMonitoring(cluster) {
-				monitored += 1
-				_ = m.autoAssignMachineNetworkCidr(cluster)
-				if err = m.setConnectivityMajorityGroupsForClusterInternal(cluster, m.db); err != nil {
-					log.WithError(err).Error("failed to set majority group for clusters")
-				}
-				err = m.detectAndStoreCollidingIPsForCluster(cluster, m.db)
-				if err != nil {
-					m.log.WithError(err).Errorf("Failed to detect and store colliding IPs for cluster %s", cluster.ID.String())
-				}
-				clusterAfterRefresh, err = m.refreshStatusInternal(ctx, cluster, m.db)
-				if err != nil {
-					log.WithError(err).Errorf("failed to refresh cluster %s state", cluster.ID)
-					continue
-				}
-
-				if swag.StringValue(clusterAfterRefresh.Status) != swag.StringValue(cluster.Status) {
-					log.Infof("cluster %s updated status from %s to %s via monitor", cluster.ID,
-						swag.StringValue(cluster.Status), swag.StringValue(clusterAfterRefresh.Status))
-				}
-
-				if m.shouldTriggerLeaseTimeoutEvent(cluster, curMonitorInvokedAt) {
-					m.triggerLeaseTimeoutEvent(ctx, cluster)
-				}
+			if shouldSkip {
+				continue
 			}
+
+			cycle.lastProcessedClusterID = cluster.ID
+
+			// Create per-cluster context with timeout. It inherits the parent cycle deadline and
+			// will be cancelled by whichever occurs first (cycle deadline or per-cluster timeout).
+			ctxCluster, cancel := context.WithTimeout(cycle.ctx, m.Config.MonitorPerClusterDeadline)
+
+			startTime := time.Now()
+			err := m.processClusterMonitoring(ctxCluster, cycle.ctx, cycle.log, cluster, cycle.startTime)
+			// Cancel the context promptly to avoid leaks
+			cancel()
+
+			// If the per-cluster context exceeded its deadline, we should not emit duration metrics
+			if errors.Is(ctxCluster.Err(), context.DeadlineExceeded) {
+				cycle.log.WithField("cluster", cluster.ID.String()).Errorf("cluster monitoring exceeded deadline %s; blacklisting for %s", m.Config.MonitorPerClusterDeadline, m.Config.MonitorBlacklistDuration)
+				m.blacklistCluster(*cluster.ID)
+				m.eventsHandler.NotifyInternalEvent(context.Background(), cluster.ID, nil, nil, fmt.Sprintf("cluster monitor deadline exceeded; blacklisting cluster %s for %s", cluster.ID.String(), m.Config.MonitorBlacklistDuration))
+				continue
+			}
+			if err != nil {
+				cycle.log.WithError(err).Errorf("failed to refresh cluster %s state", cluster.ID)
+				continue
+			}
+
+			m.metricAPI.MonitoredClustersDurationMs(cycle.ctx, *cluster.ID, time.Since(startTime))
 		}
-		offset += limit
 	}
-	m.log.Debugf("Monitored %d clusters", monitored)
-	m.metricAPI.MonitoredClusterCount(monitored)
+	// Completed a full cycle; reset resume cursor
+	m.resumeAfterClusterID = nil
 }
 
-func CanDownloadFiles(c *common.Cluster) (err error) {
-	clusterStatus := swag.StringValue(c.Status)
-	allowedStatuses := []string{
+// monitoringCycle holds the state and resources for a single monitoring cycle
+type monitoringCycle struct {
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	log                    logrus.FieldLogger
+	startTime              time.Time
+	deadline               time.Time
+	query                  common.MonitorQuery
+	skipUntilAfterCursor   bool
+	lastProcessedClusterID *strfmt.UUID
+}
+
+// initMonitoringCycle sets up the context, logging, deadlines, and query for a monitoring cycle
+func (m *Manager) initMonitoringCycle() *monitoringCycle {
+	requestID := requestid.NewID()
+	baseCtx := slowquery.WithScope(requestid.ToContext(context.Background(), requestID), slowquery.ScopeClusterMonitor)
+	log := requestid.RequestIDLogger(m.log, requestID)
+
+	startTime := time.Now()
+	deadline := startTime.Add(m.Config.MonitorCycleDeadline)
+
+	// Create a cycle-scoped context with timeout. All derived contexts inherit this deadline.
+	ctxWithDeadline, cancel := context.WithTimeout(baseCtx, m.Config.MonitorCycleDeadline) //nolint: gosec // false positive, cancel will be called
+
+	// Cleanup expired blacklist entries and update metrics at the start of each cycle
+	m.syncBlacklistStateAndMetrics(log)
+
+	// Starvation avoidance: if we timed out last cycle, skip until after the resume cursor
+	skipUntilAfterCursor := m.resumeAfterClusterID != nil
+
+	m.initMonitorQueryGenerator()
+	query := m.monitorQueryGenerator.NewClusterQuery()
+
+	return &monitoringCycle{
+		ctx:                    ctxWithDeadline,
+		cancel:                 cancel,
+		log:                    log,
+		startTime:              startTime,
+		deadline:               deadline,
+		query:                  query,
+		skipUntilAfterCursor:   skipUntilAfterCursor,
+		lastProcessedClusterID: nil,
+	}
+}
+
+// validateClusterForProcessing performs pre-cluster validation checks
+// Returns (shouldSkip, shouldReturn) where shouldSkip means skip this cluster, shouldReturn means exit the entire function
+func (m *Manager) validateClusterForProcessing(ctx context.Context, cluster *common.Cluster, skipUntilAfterCursor *bool, log logrus.FieldLogger, lastProcessedClusterID **strfmt.UUID) (bool, bool) {
+	// Starvation-avoidance: skip clusters until after the resume cursor
+	if skipUntilAfterCursor != nil && *skipUntilAfterCursor && m.resumeAfterClusterID != nil && cluster.ID != nil {
+		if *cluster.ID == *m.resumeAfterClusterID {
+			*skipUntilAfterCursor = false
+			return true, false
+		}
+		return true, false
+	}
+	// End cycle if cycle context is already cancelled (deadline exceeded)
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		log.Warnf("cluster monitor cycle exceeded deadline %s; ending cycle early", m.Config.MonitorCycleDeadline)
+		m.eventsHandler.NotifyInternalEvent(ctx, nil, nil, nil, fmt.Sprintf("cluster monitor cycle exceeded deadline %s; ending cycle early", m.Config.MonitorCycleDeadline))
+		m.resumeAfterClusterID = *lastProcessedClusterID
+		return true, true
+	}
+
+	// Ensure still leader
+	if !m.leaderElector.IsLeader() {
+		m.log.Debugf("Not a leader, exiting ClusterMonitoring")
+		return true, true
+	}
+
+	if cluster.ID == nil {
+		log.Error("cluster ID is nil")
+		return true, false
+	}
+
+	if m.isClusterBlacklisted(*cluster.ID) {
+		log.WithField("cluster", cluster.ID.String()).Warn("skipping blacklisted cluster in monitor")
+		return true, false
+	}
+
+	if m.SkipMonitoring(cluster) {
+		log.WithField("cluster", cluster.ID.String()).Warn("skipping monitoring due to cluster status")
+		return true, false
+	}
+
+	return false, false
+}
+
+// processClusterMonitoring encapsulates the per-cluster monitoring logic to keep ClusterMonitoring flat
+func (m *Manager) processClusterMonitoring(ctxWithDeadline context.Context, ctxBasic context.Context, log logrus.FieldLogger, cluster *common.Cluster, curMonitorInvokedAt time.Time) error {
+	// If the per-cluster context already expired, exit immediately to avoid any side effects
+	if err := ctxWithDeadline.Err(); err != nil {
+		return err
+	}
+	// Create context-aware database instance to respect monitoring deadlines
+	dbc := m.db.WithContext(ctxWithDeadline)
+
+	_ = m.autoAssignMachineNetworkCidr(cluster)
+	if err := m.setConnectivityMajorityGroupsForClusterInternal(cluster, dbc); err != nil {
+		log.WithError(err).Error("failed to set majority group for clusters")
+	}
+	if err := m.detectAndStoreCollidingIPsForCluster(cluster, dbc); err != nil {
+		m.log.WithError(err).Errorf("Failed to detect and store colliding IPs for cluster %s", cluster.ID.String())
+	}
+
+	clusterAfterRefresh, err := m.refreshStatusInternal(ctxWithDeadline, cluster, dbc)
+	if errors.Is(ctxWithDeadline.Err(), context.DeadlineExceeded) {
+		return ctxWithDeadline.Err()
+	}
+	if err != nil {
+		return err
+	}
+
+	// Handle re-registered hosts during preparation phase
+	// (the method will load hosts if needed)
+	clusterAfterRefresh, err = m.handleReRegisteredHostsDuringPreparation(ctxWithDeadline, log, dbc, clusterAfterRefresh)
+	if err != nil {
+		// Preserve cluster reference for logging in case method returned nil on error
+		clusterID := "unknown"
+		if clusterAfterRefresh != nil {
+			clusterID = clusterAfterRefresh.ID.String()
+		}
+		log.WithError(err).Warnf("Failed to handle re-registered hosts for cluster %s", clusterID)
+		// If clusterAfterRefresh is nil, use the original cluster to avoid nil pointer issues downstream
+		if clusterAfterRefresh == nil {
+			clusterAfterRefresh = cluster
+		}
+	}
+
+	if swag.StringValue(clusterAfterRefresh.Status) != swag.StringValue(cluster.Status) {
+		log.Infof("cluster %s updated status from %s to %s via monitor", cluster.ID, swag.StringValue(cluster.Status), swag.StringValue(clusterAfterRefresh.Status))
+	}
+
+	if m.shouldTriggerLeaseTimeoutEvent(cluster, curMonitorInvokedAt) {
+		m.triggerLeaseTimeoutEvent(ctxBasic, cluster)
+	}
+
+	if err := m.RefreshSchedulableMastersForcedTrue(ctxBasic, cluster); err != nil {
+		log.WithError(err).Errorf("failed to refresh cluster with ID '%s' masters schedulability", string(*cluster.ID))
+	}
+	return nil
+}
+
+func getDownloadFilesAllowedStatuses() []string {
+	return []string{
 		models.ClusterStatusInstalling,
 		models.ClusterStatusFinalizing,
 		models.ClusterStatusInstalled,
@@ -662,15 +843,18 @@ func CanDownloadFiles(c *common.Cluster) (err error) {
 		models.ClusterStatusCancelled,
 		models.ClusterStatusInstallingPendingUserAction,
 	}
-	if !funk.Contains(allowedStatuses, clusterStatus) {
-		err = errors.Errorf("cluster %s is in %s state, files can be downloaded only when status is one of: %s",
-			c.ID, clusterStatus, allowedStatuses)
+}
+
+func checkDownloadAllowed(c *common.Cluster, file string, allowed []string) (err error) {
+	clusterStatus := swag.StringValue(c.Status)
+	if !funk.Contains(allowed, clusterStatus) {
+		err = errors.Errorf("cluster %s is in %s state, %s can be downloaded only when status is one of: %s",
+			c.ID, clusterStatus, file, allowed)
 	}
 	return err
 }
 
 func CanDownloadKubeconfig(c *common.Cluster) (err error) {
-	clusterStatus := swag.StringValue(c.Status)
 	allowedStatuses := []string{
 		models.ClusterStatusFinalizing,
 		models.ClusterStatusInstalled,
@@ -679,21 +863,23 @@ func CanDownloadKubeconfig(c *common.Cluster) (err error) {
 		models.ClusterStatusCancelled,
 		models.ClusterStatusInstallingPendingUserAction,
 	}
-	if !funk.Contains(allowedStatuses, clusterStatus) {
-		err = errors.Errorf("cluster %s is in %s state, %s can be downloaded only when status is one of: %s",
-			c.ID, clusterStatus, constants.Kubeconfig, allowedStatuses)
-	}
-
-	return err
+	return checkDownloadAllowed(c, constants.Kubeconfig, allowedStatuses)
 }
 
-func (m *Manager) IsOperatorMonitored(c *common.Cluster, operatorName string) bool {
-	for _, o := range c.MonitoredOperators {
-		if o.Name == operatorName {
-			return true
-		}
+func CanDownloadFiles(c *common.Cluster) (err error) {
+	allowedStatuses := getDownloadFilesAllowedStatuses()
+	return checkDownloadAllowed(c, "files", allowedStatuses)
+}
+
+func CanDownloadKubeconfigFiles(c *common.Cluster, file string, ephemeralService bool) (err error) {
+	if !ephemeralService {
+		return CanDownloadFiles(c)
 	}
-	return false
+
+	// For agent installer, kubeconfig files can be generated, and retrieved, prior to cluster installation.
+	allowedStatuses := getDownloadFilesAllowedStatuses()
+	allowedStatuses = append(allowedStatuses, models.ClusterStatusReady, models.ClusterStatusPreparingForInstallation)
+	return checkDownloadAllowed(c, file, allowedStatuses)
 }
 
 func (m *Manager) IsOperatorAvailable(c *common.Cluster, operatorName string) bool {
@@ -730,9 +916,9 @@ func (m *Manager) AcceptRegistration(c *common.Cluster) (err error) {
 			msg := "Cannot add hosts to an existing cluster using the original Discovery ISO."
 			isSaaS := m.authHandler.AuthType() == auth.TypeRHSSO
 			if isSaaS {
-				msg = msg + " Try to add new hosts by using the Discovery ISO that can be found in console.redhat.com under your cluster “Add hosts“ tab."
+				msg = msg + " Try to add new hosts by using the Discovery ISO that can be found in console.redhat.com under your cluster \"Add hosts\" tab."
 			}
-			err = errors.Errorf(msg)
+			err = errors.New(msg)
 		} else {
 			err = errors.Errorf("Host can register only in one of the following states: %s", allowedStatuses)
 		}
@@ -812,7 +998,7 @@ func (m *Manager) UpdateInstallProgress(ctx context.Context, clusterID strfmt.UU
 		log.WithError(err).Error("Failed to host count from DB")
 		return err
 	}
-	isSno := swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone
+	isSno := cluster.ControlPlaneCount == 1
 	var totalHostsDoneStages, totalHostsStages float64
 	for _, h := range hostsCount {
 		stages := host.FindMatchingStages(h.Role, h.Bootstrap, isSno)
@@ -989,34 +1175,92 @@ func (m *Manager) UploadEvents() {
 func (m *Manager) HandlePreInstallError(ctx context.Context, c *common.Cluster, installErr error) {
 	log := logutil.FromContext(ctx, m.log)
 	log.WithError(installErr).Warnf("Failed to prepare installation of cluster %s", c.ID.String())
+	// Reasons are persisted in PostgreSQL UTF-8 text; upstream errors may embed non-UTF8 (e.g. JSON parse debris).
+	reason := strings.ToValidUTF8(installErr.Error(), "\uFFFD")
 	err := m.db.Model(&models.Cluster{}).Where("id = ?", c.ID.String()).Updates(&models.Cluster{
 		LastInstallationPreparation: models.LastInstallationPreparation{
 			Status: models.LastInstallationPreparationStatusFailed,
-			Reason: installErr.Error(),
+			Reason: reason,
 		},
 	}).Error
 	if err != nil {
 		log.WithError(err).Errorf("Failed to handle pre installation error for cluster %s", c.ID.String())
 	} else {
 		log.Infof("Successfully handled pre-installation error, cluster %s", c.ID.String())
-		eventgen.SendPrepareInstallationFailedEvent(ctx, m.eventsHandler, *c.ID, installErr.Error())
+		eventgen.SendPrepareInstallationFailedEvent(ctx, m.eventsHandler, *c.ID, reason)
 	}
 }
 
 func (m *Manager) HandlePreInstallSuccess(ctx context.Context, c *common.Cluster) {
 	log := logutil.FromContext(ctx, m.log)
+	previousStatus := c.LastInstallationPreparation.Status
+	log.Infof("HandlePreInstallSuccess called for cluster %s, previous LastInstallationPreparation.Status: %s",
+		c.ID.String(), previousStatus)
 	err := m.db.Model(&models.Cluster{}).Where("id = ?", c.ID.String()).Updates(&models.Cluster{
 		LastInstallationPreparation: models.LastInstallationPreparation{
 			Status: models.LastInstallationPreparationStatusSuccess,
-			Reason: "",
+			Reason: constants.InstallationPreparationReasonSuccess,
 		},
 	}).Error
 	if err != nil {
 		log.WithError(err).Errorf("Failed to handle pre installation success for cluster %s", c.ID.String())
 	} else {
-		log.Infof("Successfully handled pre-installation success, cluster %s", c.ID.String())
+		log.Infof("Successfully handled pre-installation success for cluster %s, status changed from %s to Success",
+			c.ID.String(), previousStatus)
 		eventgen.SendClusterPrepareInstallationStartedEvent(ctx, m.eventsHandler, *c.ID)
 	}
+}
+
+// handleReRegisteredHostsDuringPreparation handles the case where hosts re-register during cluster preparation.
+// When a host re-registers during preparing-for-installation, LastInstallationPreparation.Status is reset to NotStarted.
+// Once all hosts become preparing-successful again, we need to re-trigger HandlePreInstallSuccess to set the status
+// back to Success, enabling the transition to installing.
+func (m *Manager) handleReRegisteredHostsDuringPreparation(ctx context.Context, log logrus.FieldLogger, dbc *gorm.DB, cluster *common.Cluster) (*common.Cluster, error) {
+	if swag.StringValue(cluster.Status) != models.ClusterStatusPreparingForInstallation {
+		return cluster, nil
+	}
+
+	// Ensure cluster has hosts loaded
+	if len(cluster.Hosts) == 0 {
+		clusterWithHosts, err := common.GetClusterFromDBWithHosts(dbc, *cluster.ID)
+		if err != nil {
+			return cluster, errors.Wrapf(err, "failed to load cluster %s with hosts", cluster.ID.String())
+		}
+		cluster = clusterWithHosts
+	}
+
+	// Only check if cluster has hosts - prevent false re-trigger when hosts aren't loaded
+	allHostsPrepared := len(cluster.Hosts) > 0
+	for _, h := range cluster.Hosts {
+		if swag.StringValue(h.Status) != models.HostStatusPreparingSuccessful {
+			allHostsPrepared = false
+			break
+		}
+	}
+
+	// Re-trigger if all hosts are ready but LastInstallationPreparation.Status is still NotStarted
+	// (indicating it was reset during re-registration and needs to be set to Success again)
+	if allHostsPrepared && cluster.LastInstallationPreparation.Status == models.LastInstallationPreparationStatusNotStarted {
+		log.Infof("Cluster %s: all hosts are preparing-successful but LastInstallationPreparation.Status is NotStarted (likely reset after re-registration), re-triggering HandlePreInstallSuccess",
+			cluster.ID.String())
+		m.HandlePreInstallSuccess(ctx, cluster)
+		// Reload cluster from DB to get updated LastInstallationPreparation status
+		updatedCluster, err := common.GetClusterFromDBWithHosts(dbc, *cluster.ID)
+		if err != nil {
+			return cluster, errors.Wrapf(err, "failed to reload cluster %s after re-triggering HandlePreInstallSuccess", cluster.ID.String())
+		}
+		cluster = updatedCluster
+		// Preserve cluster reference before refresh in case refreshStatusInternal returns nil on error
+		clusterBeforeRefresh := cluster
+		// Refresh again to pick up the status change and potentially transition to installing
+		cluster, err = m.refreshStatusInternal(ctx, cluster, dbc)
+		if err != nil {
+			log.WithError(err).Warnf("Failed to refresh cluster %s after re-triggering HandlePreInstallSuccess", clusterBeforeRefresh.ID.String())
+			return clusterBeforeRefresh, err
+		}
+	}
+
+	return cluster, nil
 }
 
 func vipMismatchError(apiVip, ingressVip string, cluster *common.Cluster) error {
@@ -1030,6 +1274,16 @@ func (m *Manager) SetVipsData(ctx context.Context, c *common.Cluster, apiVip, in
 		db = m.db
 	}
 	log := logutil.FromContext(ctx, m.log)
+	if normalized, normalizeErr := models.IP(apiVip).Normalize(); normalizeErr == nil {
+		apiVip = string(normalized)
+	} else {
+		log.WithError(normalizeErr).Warnf("failed to normalize API VIP %s", apiVip)
+	}
+	if normalized, normalizeErr := models.IP(ingressVip).Normalize(); normalizeErr == nil {
+		ingressVip = string(normalized)
+	} else {
+		log.WithError(normalizeErr).Warnf("failed to normalize Ingress VIP %s", ingressVip)
+	}
 	formattedApiLease := network.FormatLease(apiVipLease)
 	formattedIngressLease := network.FormatLease(ingressVipLease)
 	clusterIngressVip := network.GetIngressVipById(c, 0)
@@ -1119,28 +1373,19 @@ func (m *Manager) createClusterDataFiles(ctx context.Context, c *common.Cluster,
 		if !exists {
 			continue
 		}
-		response, numberOfBytes, err := m.objectHandler.Download(ctx, objectName)
+		response, numberOfBytes, err := objectHandler.Download(ctx, objectName)
 		if err != nil {
 			log.WithError(err).Errorf("failed to download file %s from cluster while building log: %s", path, *c.ID)
 			continue
 		}
 		fileContent, err := io.ReadAll(response)
+		response.Close()
 		if err != nil {
 			log.WithError(err).Errorf("failed to read file data %s (%d) from cluster while building log: %s", path, numberOfBytes, *c.ID)
 			continue
 		}
-		// Determine the manifest type, this will determine where the file is uploaded to
-		isUserManifest, err := m.manifestApi.IsUserManifest(ctx, *c.ID, manifestEntry.Folder, manifestEntry.FileName)
-		manifest_prefix := "system-generated"
-		if err != nil {
-			log.WithError(err).Errorf("Unable to determine if manifest is user generated or not for %s/%s", manifestEntry.Folder, manifestEntry.FileName)
-			manifest_prefix = "unknown"
-		}
-		if isUserManifest {
-			manifest_prefix = "user-supplied"
-		}
-		fileName := fmt.Sprintf("%s/logs/cluster/manifest_%s_%s_%s", c.ID, manifest_prefix, manifestEntry.Folder, manifestEntry.FileName)
-		err = m.uploadDataAsFile(ctx, log, string(fileContent), fileName, objectHandler)
+		fileName := fmt.Sprintf("%s/logs/cluster/manifest_%s_%s_%s", c.ID, manifestEntry.ManifestSource, manifestEntry.Folder, manifestEntry.FileName)
+		err = objectHandler.Upload(ctx, fileContent, fileName)
 		if err != nil {
 			log.WithError(err).Errorf("Unable to upload %s to logs for cluster id %s", fileName, *c.ID)
 		}
@@ -1382,6 +1627,10 @@ func (m *Manager) setConnectivityMajorityGroupsForClusterInternal(cluster *commo
 	}
 
 	hosts := cluster.Hosts
+	minGroupSize := 3
+	if common.IsClusterTopologyTwoNodesWithFencing(cluster) {
+		minGroupSize = 2
+	}
 	/*
 		We want the resulting hosts to be always in the same order.  Otherwise, there might be cases that we will get different
 		connectivity string (see marshalledMajorityGroups below), for the same connectivity group result.
@@ -1389,25 +1638,32 @@ func (m *Manager) setConnectivityMajorityGroupsForClusterInternal(cluster *commo
 	sort.Slice(hosts, func(i, j int) bool {
 		return hosts[i].ID.String() < hosts[j].ID.String()
 	})
-	majorityGroups := make(map[string][]strfmt.UUID)
+	connectivity := network.Connectivity{
+		MajorityGroups: make(map[string][]strfmt.UUID),
+	}
 	for _, cidr := range network.GetInventoryNetworks(hosts, m.log) {
-		majorityGroup, err := network.CreateL2MajorityGroup(cidr, hosts)
+		majorityGroup, err := network.CreateL2MajorityGroup(cidr, hosts, minGroupSize)
 		if err != nil {
 			m.log.WithError(err).Warnf("Create majority group for %s", cidr)
 			continue
 		}
-		majorityGroups[cidr] = majorityGroup
+		connectivity.MajorityGroups[cidr] = majorityGroup
 	}
 
 	for _, family := range []network.AddressFamily{network.IPv4, network.IPv6} {
-		majorityGroup, err := network.CreateL3MajorityGroup(hosts, family)
+		majorityGroup, err := network.CreateL3MajorityGroup(hosts, family, minGroupSize)
 		if err != nil {
 			m.log.WithError(err).Warnf("Create L3 majority group for cluster %s failed", cluster.ID.String())
 		} else {
-			majorityGroups[family.String()] = majorityGroup
+			connectivity.MajorityGroups[family.String()] = majorityGroup
 		}
 	}
-	b, err := json.Marshal(&majorityGroups)
+	connectedAddresses, err := network.GatherL3ConnectedAddresses(hosts)
+	if err != nil {
+		return common.NewApiError(http.StatusInternalServerError, err)
+	}
+	connectivity.L3ConnectedAddresses = connectedAddresses
+	b, err := json.Marshal(&connectivity)
 	if err != nil {
 		return common.NewApiError(http.StatusInternalServerError, err)
 	}
@@ -1454,45 +1710,46 @@ func (m *Manager) SetConnectivityMajorityGroupsForCluster(clusterID strfmt.UUID,
 	return m.setConnectivityMajorityGroupsForClusterInternal(cluster, db)
 }
 
-func (m *Manager) getClusterFilesForFolder(ctx context.Context, c *common.Cluster, folder string, objectHandler s3wrapper.API) ([]string, error) {
+func (m *Manager) getClusterFilesForFolder(ctx context.Context, c *common.Cluster, folder string, objectHandler s3wrapper.API) ([]s3wrapper.ObjectInfo, error) {
 	path := filepath.Join(string(*c.ID), folder) + "/"
-	files, err := objectHandler.ListObjectsByPrefix(ctx, path)
+	files, err := objectHandler.ListObjectsByPrefixWithMetadata(ctx, path)
 	if err != nil {
 		msg := fmt.Sprintf("Failed to list files in %s", path)
-		m.log.WithError(err).Errorf(msg)
+		m.log.WithError(err).Error(msg)
 		return nil, common.NewApiError(
 			http.StatusInternalServerError,
-			errors.Errorf(msg))
+			errors.New(msg))
 	}
 	return files, err
 }
 
 func (m *Manager) ResetClusterFiles(ctx context.Context, c *common.Cluster, objectHandler s3wrapper.API) error {
+	legacyUserManifestPaths, err := m.manifestApi.FindUserManifestPathsByLegacyMetadata(ctx, *c.ID)
+	if err != nil {
+		return err
+	}
+
 	files, err := m.getClusterFilesForFolder(ctx, c, "", objectHandler)
 	if err != nil {
 		return err
 	}
 	var failedToDelete []string
 	for _, file := range files {
-		// Filter out any user generated manifests and prevent their deletion
-		if manifests.IsManifest(file) {
-			currentFolder, currentFileName, _ := manifests.ParsePath(file)
-			var isUserManifest bool
-			isUserManifest, err = m.manifestApi.IsUserManifest(ctx, *c.Cluster.ID, currentFolder, currentFileName)
-			if err != nil {
-				return err
-			}
-			if isUserManifest {
-				continue
-			}
+		// We should ensure that this file is not a legacy metadata file
+		pathParts := strings.Split(file.Path, "/")
+		if len(pathParts) >= 2 && pathParts[1] == constants.ManifestMetadataFolder {
+			continue
 		}
-		if strings.Contains(file, "logs") || strings.Contains(file, constants.ManifestMetadataFolder) {
-			// Also prevent the deletion of any logs, and don't allow the manifest metadata folder to be directly deleted.
+		// Filter out any user generated manifests and prevent their deletion
+		// Check whether file is represented as "user supplied" in legacy metadata
+		// Also prevent the deletion of any logs, and don't allow the manifest metadata folder to be directly deleted.
+		metadata, ok := file.Metadata[constants.ManifestSourceAttribute]
+		if (ok && metadata == constants.ManifestSourceUserSupplied) || swag.ContainsStrings(legacyUserManifestPaths, file.Path) || strings.Contains(file.Path, "logs") {
 			continue
 		}
 		// Delete anything else
-		if err = m.deleteClusterFile(ctx, c, file); err != nil {
-			failedToDelete = append(failedToDelete, file)
+		if err = m.deleteClusterFile(ctx, c, file.Path); err != nil {
+			failedToDelete = append(failedToDelete, file.Path)
 		}
 	}
 	if len(failedToDelete) > 0 {
@@ -1526,8 +1783,8 @@ func (m *Manager) deleteClusterFilesInFolder(ctx context.Context, c *common.Clus
 	}
 	var failedToDelete []string
 	for _, file := range files {
-		if err = m.deleteClusterFile(ctx, c, file); err != nil {
-			failedToDelete = append(failedToDelete, file)
+		if err = m.deleteClusterFile(ctx, c, file.Path); err != nil {
+			failedToDelete = append(failedToDelete, file.Path)
 		}
 	}
 	if len(failedToDelete) > 0 {
@@ -1549,7 +1806,7 @@ func (m *Manager) deleteClusterFile(ctx context.Context, c *common.Cluster, file
 	return nil
 }
 
-func (m Manager) DeregisterInactiveCluster(ctx context.Context, maxDeregisterPerInterval int, inactiveSince strfmt.DateTime) error {
+func (m *Manager) DeregisterInactiveCluster(ctx context.Context, maxDeregisterPerInterval int, inactiveSince strfmt.DateTime) error {
 	log := logutil.FromContext(ctx, m.log)
 
 	var clusters []*common.Cluster
@@ -1568,7 +1825,7 @@ func (m Manager) DeregisterInactiveCluster(ctx context.Context, maxDeregisterPer
 	return nil
 }
 
-func (m Manager) PermanentClustersDeletion(ctx context.Context, olderThan strfmt.DateTime, objectHandler s3wrapper.API) error {
+func (m *Manager) PermanentClustersDeletion(ctx context.Context, olderThan strfmt.DateTime, objectHandler s3wrapper.API) error {
 	m.log.Info("Call to PermanentClustersDeletion")
 	var clusters []*common.Cluster
 	if reply := m.db.Unscoped().Where("deleted_at < ?", olderThan).Find(&clusters); reply.Error != nil {
@@ -1618,11 +1875,16 @@ func (m *Manager) GetClusterByKubeKey(key types.NamespacedName) (*common.Cluster
 
 func (m *Manager) GenerateAdditionalManifests(ctx context.Context, cluster *common.Cluster) error {
 	log := logutil.FromContext(ctx, m.log)
+	clusterManagedDNS, err := installcfg.UsesClusterManagedDNS(cluster)
+	if err != nil {
+		return errors.Wrap(err, "failed to check cluster-managed DNS")
+	}
+
 	if err := m.manifestsGeneratorAPI.AddChronyManifest(ctx, log, cluster); err != nil {
 		return errors.Wrap(err, "failed to add chrony manifest")
 	}
 
-	if common.IsSingleNodeCluster(cluster) && m.manifestsGeneratorAPI.IsSNODNSMasqEnabled() {
+	if common.IsSingleNodeCluster(cluster) && !clusterManagedDNS && m.manifestsGeneratorAPI.IsSNODNSMasqEnabled() {
 		if err := m.manifestsGeneratorAPI.AddDnsmasqForSingleNode(ctx, log, cluster); err != nil {
 			return errors.Wrap(err, "failed to add dnsmasq manifest")
 		}
@@ -1645,6 +1907,9 @@ func (m *Manager) GenerateAdditionalManifests(ctx context.Context, cluster *comm
 		return errors.Wrap(err, "failed to add disk encryption manifest")
 	}
 
+	if err := m.manifestsGeneratorAPI.AddNicReapply(ctx, log, cluster); err != nil {
+		return errors.Wrap(err, "failed to add nic reapply manifest")
+	}
 	return nil
 }
 
@@ -1712,8 +1977,19 @@ func (m *Manager) TransformClusterToDay2(ctx context.Context, cluster *common.Cl
 	return nil
 }
 
-func (m *Manager) RefreshSchedulableMastersForcedTrue(ctx context.Context, clusterID strfmt.UUID) error {
+func (m *Manager) RefreshSchedulableMastersForcedTrue(ctx context.Context, cluster *common.Cluster) error {
 	// Refresh the value of SchedulableMastersForcedTrue which depends on the number of hosts registered with the cluster
+	var err error
+
+	newSchedulableMastersForcedTrue := common.ShouldMastersBeSchedulable(&cluster.Cluster)
+	if cluster.SchedulableMastersForcedTrue == nil || newSchedulableMastersForcedTrue != *cluster.SchedulableMastersForcedTrue {
+		err = m.updateSchedulableMastersForcedTrue(ctx, *cluster.ID, newSchedulableMastersForcedTrue)
+	}
+
+	return err
+}
+
+func (m *Manager) RefreshSchedulableMastersForcedTrueWithClusterID(ctx context.Context, clusterID strfmt.UUID) error {
 	log := logutil.FromContext(ctx, m.log)
 	var cluster *common.Cluster
 	var err error
@@ -1723,12 +1999,7 @@ func (m *Manager) RefreshSchedulableMastersForcedTrue(ctx context.Context, clust
 		return err
 	}
 
-	newSchedulableMastersForcedTrue := len(cluster.Hosts) < ForceSchedulableMastersMaxHostCount
-	if cluster.SchedulableMastersForcedTrue == nil || newSchedulableMastersForcedTrue != *cluster.SchedulableMastersForcedTrue {
-		err = m.updateSchedulableMastersForcedTrue(ctx, clusterID, newSchedulableMastersForcedTrue)
-	}
-
-	return err
+	return m.RefreshSchedulableMastersForcedTrue(ctx, cluster)
 }
 
 func (m *Manager) updateSchedulableMastersForcedTrue(ctx context.Context, clusterID strfmt.UUID, newSchedulableMastersForcedTrue bool) error {
@@ -1829,4 +2100,94 @@ func (m *Manager) UpdateFinalizingStage(ctx context.Context, clusterID strfmt.UU
 		eventgen.SendClusterFinalizingStageUpdatedEvent(ctx, m.eventsHandler, clusterID, string(finalizingStage))
 	}
 	return nil
+}
+
+func (m *Manager) GetHostCountByRole(clusterID strfmt.UUID, role models.HostRole, suggested bool) (*int64, error) {
+	return common.GetHostCountByRole(m.db, clusterID, role, suggested)
+}
+
+// isClusterBlacklisted returns true if the cluster is currently blacklisted and not yet expired
+func (m *Manager) isClusterBlacklisted(id strfmt.UUID) bool {
+	if v, ok := m.blacklistedClusters.Load(id); ok {
+		if exp, ok := v.(time.Time); ok {
+			if time.Now().After(exp) {
+				m.blacklistedClusters.Delete(id)
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// blacklistCluster adds the cluster to the blacklist until now + MonitorBlacklistDuration
+func (m *Manager) blacklistCluster(id strfmt.UUID) {
+	m.blacklistedClusters.Store(id, time.Now().Add(m.Config.MonitorBlacklistDuration))
+	// Emit metrics for blacklisting
+	m.metricAPI.BlacklistedClusterInc()
+	cnt, _, _, _ := m.getBlacklistedStats()
+	m.metricAPI.BlacklistedClustersCurrent(cnt)
+	// Log current number of blacklisted clusters to aid manual intervention
+	if cnt > 0 {
+		m.log.WithField("cluster", id.String()).Warnf("cluster blacklisted for %s; currently blacklisted: %d", m.Config.MonitorBlacklistDuration, cnt)
+	}
+}
+
+// syncBlacklistStateAndMetrics removes expired blacklist entries and updates related metrics
+func (m *Manager) syncBlacklistStateAndMetrics(log logrus.FieldLogger) {
+	now := time.Now()
+	m.blacklistedClusters.Range(func(key, value any) bool {
+		if exp, ok := value.(time.Time); ok {
+			if now.After(exp) {
+				m.blacklistedClusters.Delete(key)
+			}
+		} else {
+			// Unknown type: remove defensively
+			m.blacklistedClusters.Delete(key)
+		}
+		return true
+	})
+	cnt, minAge, avgAge, maxAge := m.getBlacklistedStats()
+	m.metricAPI.BlacklistedClustersCurrent(cnt)
+
+	// After cleanup, emit a summary of current blacklisted clusters to aid manual intervention/tuning
+	if cnt > 0 {
+		log.Warnf("blacklisted clusters currently: %d; age min/avg/max: %s/%s/%s; blacklist TTL: %s", cnt, minAge, avgAge, maxAge, m.Config.MonitorBlacklistDuration)
+	}
+}
+
+// getBlacklistedStats returns (count, minAge, avgAge, maxAge) for current blacklisted clusters.
+// Age is computed from the configured TTL and stored expiration.
+func (m *Manager) getBlacklistedStats() (int, time.Duration, time.Duration, time.Duration) {
+	now := time.Now()
+	count := 0
+	var minAge time.Duration
+	var maxAge time.Duration
+	var sumAge time.Duration
+	m.blacklistedClusters.Range(func(key, value any) bool {
+		exp, ok := value.(time.Time)
+		if !ok {
+			return true
+		}
+		// Derive the blacklist start time from expiration and configured TTL
+		start := exp.Add(-m.Config.MonitorBlacklistDuration)
+		age := now.Sub(start)
+		if age < 0 {
+			age = 0
+		}
+		if count == 0 || age < minAge {
+			minAge = age
+		}
+		if age > maxAge {
+			maxAge = age
+		}
+		sumAge += age
+		count++
+		return true
+	})
+	var avgAge time.Duration
+	if count > 0 {
+		avgAge = time.Duration(int64(sumAge) / int64(count))
+	}
+	return count, minAge, avgAge, maxAge
 }

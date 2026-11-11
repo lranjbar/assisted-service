@@ -1,29 +1,30 @@
 package common
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"strings"
 
-	"github.com/containers/image/v5/docker/reference"
+	"github.com/distribution/reference"
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	yamlpatch "github.com/krishicks/yaml-patch"
 	"github.com/openshift/assisted-service/models"
 	"github.com/thoas/go-funk"
+	"golang.org/x/sys/unix"
 	"gorm.io/gorm"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
 
 const (
 	EnvConfigPrefix = "myapp"
-
-	MinMasterHostsNeededForInstallation    = 3
-	AllowedNumberOfMasterHostsInNoneHaMode = 1
-	AllowedNumberOfWorkersInNoneHaMode     = 0
 
 	HostCACertPath = "/etc/assisted-service/service-ca-cert.crt"
 
@@ -31,7 +32,10 @@ const (
 
 	consoleUrlPrefix = "https://console-openshift-console.apps"
 
-	MirrorRegistriesCertificateFile = "tls-ca-bundle.pem"
+	SystemCertificateBundle     = "tls-ca-bundle.pem"
+	SystemCertificateBundlePath = "/etc/pki/ca-trust/extracted/pem/" + SystemCertificateBundle
+
+	MirrorRegistriesCertificateFile = "user-registry-ca-bundle.pem"
 	MirrorRegistriesCertificatePath = "/etc/pki/ca-trust/extracted/pem/" + MirrorRegistriesCertificateFile
 	MirrorRegistriesConfigDir       = "/etc/containers"
 	MirrorRegistriesConfigFile      = "registries.conf"
@@ -39,9 +43,6 @@ const (
 	MaximumAllowedTimeDiffMinutes   = 4
 
 	IgnitionTokenKeyInSecret = "ignition-token"
-
-	FamilyIPv4 int32 = 4
-	FamilyIPv6 int32 = 6
 
 	AMD64CPUArchitecture   = "amd64"
 	X86CPUArchitecture     = "x86_64"
@@ -54,7 +55,44 @@ const (
 	MultiCPUArchitecture   = "multi"
 
 	ExternalPlatformNameOci = "oci"
+
+	MaxMasterHostsNeededForInstallationInHaModeOfOCP418OrNewer       = 5
+	MinMasterHostsNeededForInstallationInHaMode                      = 3
+	MinMasterHostsNeededForInstallationInHaArbiterMode               = 2
+	AllowedNumberOfMasterHostsForInstallationInHaModeOfOCP417OrOlder = 3
+	AllowedNumberOfMasterHostsInNoneHaMode                           = 1
+	AllowedNumberOfWorkersInNoneHaMode                               = 0
+	AllowedNumberOfMasterHostsInTwoNodesWithFencing                  = 2
+	MinimumVersionForNonStandardHAOCPControlPlane                    = "4.18"
+	MinimumVersionForArbiterClusters                                 = "4.19"
+	MinimumVersionForTwoNodesWithFencing                             = "4.20"
+	MinimumVersionForArbiterClustersWithNonePlatform                 = "4.22"
+	MinimumNumberOfWorkersForNonSchedulableMastersClusterInHaMode    = 2
+
+	MinimumVersionForUserManagedLoadBalancerFeature = "4.16"
+
+	MinimalVersionForSKipMCOReboot = "4.15"
+
+	MinimalVersionForIPV6PrimaryWithDualStack = "4.12"
 )
+
+type AddressFamily int
+
+const (
+	IPv4 AddressFamily = unix.AF_INET
+	IPv6 AddressFamily = unix.AF_INET6
+)
+
+func (a AddressFamily) String() string {
+	switch a {
+	case IPv4:
+		return "IPv4"
+	case IPv6:
+		return "IPv6"
+	default:
+		return fmt.Sprintf("Unexpected family value %d", a)
+	}
+}
 
 var (
 	UnlimitedEvents *int64 = swag.Int64(-1)
@@ -163,7 +201,7 @@ func GetBootstrapHost(cluster *Cluster) *models.Host {
 }
 
 func IsSingleNodeCluster(cluster *Cluster) bool {
-	return swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone
+	return cluster.ControlPlaneCount == 1
 }
 
 func IsDay2Cluster(cluster *Cluster) bool {
@@ -174,15 +212,10 @@ func IsImportedCluster(cluster *Cluster) bool {
 	return swag.BoolValue(cluster.Imported)
 }
 
+// AreMastersSchedulable returns whether a given cluster masters will be schedulable
+// It will get correct result only when all hosts roles are assigned.
 func AreMastersSchedulable(cluster *Cluster) bool {
 	return swag.BoolValue(cluster.SchedulableMastersForcedTrue) || swag.BoolValue(cluster.SchedulableMasters)
-}
-
-func GetEffectiveRole(host *models.Host) models.HostRole {
-	if host.Role == models.HostRoleAutoAssign && host.SuggestedRole != "" {
-		return host.SuggestedRole
-	}
-	return host.Role
 }
 
 func GetConsoleUrl(clusterName, baseDomain string) string {
@@ -264,7 +297,7 @@ func IsSliceNonEmpty(arg interface{}) bool {
 	if reflect.ValueOf(arg).Kind() == reflect.Slice {
 		funk.ForEach(arg, func(elem interface{}) {
 			v := reflect.ValueOf(elem)
-			if v.Kind() == reflect.Ptr {
+			if v.Kind() == reflect.Pointer {
 				v = reflect.Indirect(v.Elem())
 			}
 			for i := 0; i < v.NumField(); i++ {
@@ -301,11 +334,13 @@ func GetClusterNTPSources(db *gorm.DB, clusterID strfmt.UUID) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if cluster.NtpSources != "" {
+		return cluster.NtpSources, nil
+	}
 	if cluster.AdditionalNtpSource != "" {
 		return cluster.AdditionalNtpSource, nil
-	} else {
-		return getUnifiedNTPSources(db, clusterID)
 	}
+	return getUnifiedNTPSources(db, clusterID)
 }
 
 func GetHostNTPSources(db *gorm.DB, host *models.Host) (string, error) {
@@ -319,6 +354,9 @@ func GetHostNTPSources(db *gorm.DB, host *models.Host) (string, error) {
 	infraEnv, err = GetInfraEnvFromDB(db, host.InfraEnvID)
 	if err != nil {
 		return "", err
+	}
+	if infraEnv.NtpSources != "" {
+		return infraEnv.NtpSources, nil
 	}
 	return infraEnv.AdditionalNtpSources, nil
 }
@@ -399,6 +437,43 @@ func VerifyCaBundle(pemCerts []byte) error {
 	}
 
 	return nil
+}
+
+// RemoveDuplicatesFromCaBundle removes duplicate certificates from a given CA bundle.
+func RemoveDuplicatesFromCaBundle(caBundle string) (string, int, error) {
+	// Parse certificates
+	certs, ok := ParsePemCerts([]byte(caBundle))
+	if !ok {
+		return "", 0, errors.New("failed to remove duplicate certificate")
+	}
+
+	// Remove duplicates by SHA-256 fingerprint of the certificate's raw bytes
+	uniqueCerts := funk.UniqBy(certs, func(cert x509.Certificate) string {
+		fingerprint := sha256.Sum256(cert.Raw)
+		return fmt.Sprintf("%x", fingerprint)
+	})
+
+	// Convert certs back to a string
+	certStrings := funk.Map(uniqueCerts, func(cert x509.Certificate) string {
+		// Encode certificate to PEM format
+		block := &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: cert.Raw,
+		}
+		var sb strings.Builder
+		if err := pem.Encode(&sb, block); err != nil {
+			// Error encoding certificate
+			return ""
+		}
+		return sb.String()
+	})
+
+	numOfCerts := len(certs)
+	numOfUniqueCerts := len(uniqueCerts.([]x509.Certificate))
+	numOfDuplicates := numOfCerts - numOfUniqueCerts
+
+	// Join the PEM-encoded certificates into a single string
+	return strings.Join(certStrings.([]string), "\n"), numOfDuplicates, nil
 }
 
 func CanonizeStrings(slice []string) (ret []string) {
@@ -608,4 +683,299 @@ func IsExternalIntegrationEnabled(platform *models.Platform, platformName string
 
 func IsOciExternalIntegrationEnabled(platform *models.Platform) bool {
 	return IsExternalIntegrationEnabled(platform, ExternalPlatformNameOci)
+}
+
+func IsMultiNodeNonePlatformCluster(cluster *Cluster) bool {
+	return !IsSingleNodeCluster(cluster) && swag.BoolValue(cluster.UserManagedNetworking)
+}
+
+func NumberOfWorkers(c *Cluster) int {
+	num := 0
+	for _, host := range c.Hosts {
+		if GetEffectiveRole(host) != models.HostRoleWorker {
+			continue
+		}
+		num += 1
+	}
+	return num
+}
+
+func GetEffectiveRole(host *models.Host) models.HostRole {
+	if host.Role == models.HostRoleAutoAssign && host.SuggestedRole != "" {
+		return host.SuggestedRole
+	}
+	return host.Role
+}
+
+// GetHostsByEachRole returns the 4 slices of hosts by their effective role for a given cluster:
+// 1. bootstrap/master hosts
+// 2. arbiter hosts
+// 3. worker hosts
+// 4. auto-assign hosts
+// Note - The hosts should be preloaded in the cluster
+func GetHostsByEachRole(cluster *models.Cluster, effectiveRoles bool) ([]*models.Host, []*models.Host, []*models.Host, []*models.Host) {
+	masterHosts := make([]*models.Host, 0)
+	arbiterHosts := make([]*models.Host, 0)
+	workerHosts := make([]*models.Host, 0)
+	autoAssignHosts := make([]*models.Host, 0)
+
+	roleFunction := func(host *models.Host) models.HostRole {
+		if effectiveRoles {
+			return GetEffectiveRole(host)
+		}
+
+		return host.Role
+	}
+
+	for _, host := range cluster.Hosts {
+		switch role := roleFunction(host); role {
+		case models.HostRoleMaster, models.HostRoleBootstrap:
+			masterHosts = append(masterHosts, host)
+		case models.HostRoleArbiter:
+			arbiterHosts = append(arbiterHosts, host)
+		case models.HostRoleWorker:
+			workerHosts = append(workerHosts, host)
+		case models.HostRoleAutoAssign:
+			autoAssignHosts = append(autoAssignHosts, host)
+		}
+	}
+
+	return masterHosts, arbiterHosts, workerHosts, autoAssignHosts
+}
+
+func ShouldMastersBeSchedulable(cluster *models.Cluster) bool {
+	if cluster.ControlPlaneCount == 1 {
+		return true
+	}
+
+	_, _, workers, _ := GetHostsByEachRole(cluster, true)
+	return len(workers) < MinimumNumberOfWorkersForNonSchedulableMastersClusterInHaMode
+}
+
+func IsMirrorConfigurationSet(conf *MirrorRegistryConfiguration) bool {
+	if conf == nil {
+		return false
+	}
+
+	if conf.RegistriesConf != "" {
+		return true
+	}
+
+	return false
+}
+
+func GetDefaultHighAvailabilityAndMasterCountParams(highAvailabilityMode *string, controlPlaneCount *int64) (*string, *int64) {
+	// Both not set, multi node by default
+	if highAvailabilityMode == nil && controlPlaneCount == nil {
+		return swag.String(models.ClusterCreateParamsHighAvailabilityModeFull),
+			swag.Int64(MinMasterHostsNeededForInstallationInHaMode)
+	}
+
+	// only highAvailabilityMode set
+	if controlPlaneCount == nil {
+		if *highAvailabilityMode == models.ClusterHighAvailabilityModeNone {
+			return highAvailabilityMode, swag.Int64(AllowedNumberOfMasterHostsInNoneHaMode)
+		}
+
+		return highAvailabilityMode, swag.Int64(MinMasterHostsNeededForInstallationInHaMode)
+	}
+
+	// only controlPlaneCount set
+	if highAvailabilityMode == nil {
+		if *controlPlaneCount == AllowedNumberOfMasterHostsInNoneHaMode {
+			return swag.String(models.ClusterHighAvailabilityModeNone), controlPlaneCount
+		}
+
+		return swag.String(models.ClusterHighAvailabilityModeFull), controlPlaneCount
+	}
+
+	// both are set
+	return highAvailabilityMode, controlPlaneCount
+}
+
+func IsClusterTopologyHighlyAvailableArbiter(cluster *Cluster) bool {
+	return funk.NotEmpty(GetHostsByRole(cluster, models.HostRoleArbiter))
+}
+
+func IsClusterTopologyTwoNodesWithFencing(cluster *Cluster) bool {
+	if cluster == nil {
+		return false
+	}
+	if cluster.ControlPlaneCount != AllowedNumberOfMasterHostsInTwoNodesWithFencing {
+		return false
+	}
+	if IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		return false
+	}
+	masters := GetHostsByRole(cluster, models.HostRoleMaster)
+	if len(masters) != AllowedNumberOfMasterHostsInTwoNodesWithFencing {
+		return false
+	}
+	for _, master := range masters {
+		if master.FencingCredentials == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// GetMultipleYamls decodes multiple YAML documents from contents into values of type T.
+// Useful when a byte stream contains several YAML docs separated by '---'.
+func GetMultipleYamls[T any](contents []byte) ([]T, error) {
+
+	r := bytes.NewReader(contents)
+	dec := yaml.NewYAMLToJSONDecoder(r)
+
+	var outputList []T
+	for {
+		var decodedData T
+		err := dec.Decode(&decodedData)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error reading multiple YAML documents: %w", err)
+		}
+
+		// Skip empty or null documents
+		v := reflect.ValueOf(decodedData)
+		if v.IsZero() {
+			continue
+		}
+		switch v.Kind() {
+		case reflect.Map, reflect.Slice, reflect.Array:
+			if v.Len() == 0 {
+				continue
+			}
+		}
+		outputList = append(outputList, decodedData)
+	}
+
+	return outputList, nil
+}
+
+// ValidateClusterSupportsArbiterHosts checks if the given cluster is allowed to have arbiter hosts.
+// A day1 cluster can have arbiter hosts if:
+// 1. Its OCP version is at least MinimumVersionForArbiterClusters
+// 2. Its platform is baremetal (for OCP < 4.22) or baremetal/none (for OCP >= 4.22)
+// Day2 clusters can also have arbiter hosts added to them if they were installed as TNA clusters, but we can't check that.
+func ValidateClusterSupportsArbiterHosts(cluster *Cluster) error {
+	if cluster == nil || IsDay2Cluster(cluster) {
+		return nil
+	}
+
+	arbiterClustersSupported, err := BaseVersionGreaterOrEqual(MinimumVersionForArbiterClusters, cluster.OpenshiftVersion)
+	if err != nil {
+		return err
+	}
+	if !arbiterClustersSupported {
+		return fmt.Errorf("cluster's openshift version must be at least %s", MinimumVersionForArbiterClusters)
+	}
+
+	platform := cluster.Platform
+	if platform == nil || platform.Type == nil {
+		return errors.New("cluster's platform must be set")
+	}
+
+	supportsNonePlatform, _ := BaseVersionGreaterOrEqual(MinimumVersionForArbiterClustersWithNonePlatform, cluster.OpenshiftVersion)
+
+	if supportsNonePlatform {
+		if *platform.Type != models.PlatformTypeBaremetal && *platform.Type != models.PlatformTypeNone {
+			return errors.New("cluster's platform must be baremetal or none")
+		}
+	} else {
+		if *platform.Type != models.PlatformTypeBaremetal {
+			return errors.New("cluster's platform must be baremetal")
+		}
+	}
+
+	return nil
+}
+
+// ValidateClusterSupportsFencingCredentials checks if the given cluster is allowed to have hosts with fencing credentials.
+// A day1 cluster can have hosts with fencing credentials if:
+// 1. Its OCP version is at least MinimumVersionForTwoNodesWithFencing
+// 2. Its platform is baremetal or none
+// Fencing credentials have no effect in day2 clusters, but we don't want to throw an error on it.
+func ValidateClusterSupportsFencingCredentials(cluster *Cluster) error {
+	if cluster == nil || IsDay2Cluster(cluster) {
+		return nil
+	}
+
+	fencingClustersSupported, err := BaseVersionGreaterOrEqual(MinimumVersionForTwoNodesWithFencing, cluster.OpenshiftVersion)
+	if err != nil {
+		return err
+	}
+	if !fencingClustersSupported {
+		return fmt.Errorf("cluster's openshift version must be at least %s", MinimumVersionForTwoNodesWithFencing)
+	}
+
+	platform := cluster.Platform
+	if platform == nil || platform.Type == nil || (*platform.Type != models.PlatformTypeBaremetal && *platform.Type != models.PlatformTypeNone) {
+		return errors.New("cluster's platform must be baremetal or none")
+	}
+
+	return nil
+}
+
+func HostsInStatus(c *Cluster, statuses []string) (masters, arbiters, workers int) {
+	for _, host := range c.Hosts {
+		if funk.ContainsString(statuses, swag.StringValue(host.Status)) {
+			switch GetEffectiveRole(host) {
+			case models.HostRoleMaster, models.HostRoleBootstrap:
+				masters++
+			case models.HostRoleArbiter:
+				arbiters++
+			case models.HostRoleWorker:
+				workers++
+			}
+		}
+	}
+	return
+}
+
+// HasEnoughMastersAndWorkers returns whether the number of master and worker nodes in the specified cluster with the given status
+// meets the required criteria. The conditions are as follows:
+//   - For SNO (Single Node OpenShift), there must be exactly one master node and zero worker nodes.
+//   - For High Availability cluster, the number of master nodes should match the user's request, and not less than the minimum. The worker node requirement depends on this request:
+//     If the user requested at least two workers, there must be at least two, indicating non-schedulable masters were intended.
+//     If the user requested fewer than two workers, any number of workers is acceptable.
+//   - For TNA Clusters the same conditions apply as for High Availability Clusters, but we also need to check that at least one arbiter node is in the correct status.
+func HasEnoughMastersAndWorkers(c *Cluster, statuses []string) bool {
+	mastersInStatus, arbitersInStatus, workersInStatus := HostsInStatus(c, statuses)
+
+	if c.ControlPlaneCount == 1 {
+		return mastersInStatus == AllowedNumberOfMasterHostsInNoneHaMode &&
+			workersInStatus == AllowedNumberOfWorkersInNoneHaMode
+	}
+
+	// hosts roles are known at this stage
+	masters, arbiters, workers, _ := GetHostsByEachRole(&c.Cluster, false)
+	numberOfExpectedMasters := len(masters)
+	numberOfExpectedArbiters := len(arbiters)
+
+	minMasterHostsNeeded := MinMasterHostsNeededForInstallationInHaMode
+	if numberOfExpectedArbiters != 0 {
+		minMasterHostsNeeded = MinMasterHostsNeededForInstallationInHaArbiterMode
+		// validate arbiters
+		if arbitersInStatus == 0 {
+			return false
+		}
+	}
+	if IsClusterTopologyTwoNodesWithFencing(c) {
+		minMasterHostsNeeded = AllowedNumberOfMasterHostsInTwoNodesWithFencing
+	}
+
+	// validate masters
+	if numberOfExpectedMasters < minMasterHostsNeeded ||
+		mastersInStatus < numberOfExpectedMasters {
+		return false
+	}
+
+	numberOfExpectedWorkers := len(workers)
+
+	// validate workers
+	return numberOfExpectedWorkers < MinimumNumberOfWorkersForNonSchedulableMastersClusterInHaMode ||
+		numberOfExpectedWorkers >= MinimumNumberOfWorkersForNonSchedulableMastersClusterInHaMode &&
+			workersInStatus >= MinimumNumberOfWorkersForNonSchedulableMastersClusterInHaMode
 }

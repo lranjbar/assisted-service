@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	common_api "github.com/openshift/assisted-service/api/common"
 	hiveext "github.com/openshift/assisted-service/api/hiveextension/v1beta1"
@@ -30,10 +30,13 @@ import (
 	"github.com/openshift/assisted-service/internal/spoke_k8s_client"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
+	"github.com/openshift/assisted-service/pkg/mirrorregistries"
 	"github.com/openshift/assisted-service/restapi/operations/installer"
+	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	"github.com/openshift/hive/apis/hive/v1/aws"
 	"github.com/pkg/errors"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -113,6 +116,105 @@ func newAgentClusterInstall(name, namespace string, spec hiveext.AgentClusterIns
 	}
 }
 
+const (
+	providedMirrorRegistryCMName = "user-provided-config-map"
+	mirrorRegistryCertificate    = "    -----BEGIN CERTIFICATE-----\n    certificate contents\n    -----END CERTIFICATE------"
+	sourceRegistry               = "quay.io"
+	mirrorRegistry               = "example-user-registry.com"
+	registryConfKey              = "registries.conf"
+	registryCertKey              = "ca-bundle.crt"
+)
+
+func newUserProvidedRegistryCM(registry, certificate string) *corev1.ConfigMap {
+	data := map[string]string{}
+	if registry != "" {
+		data[registryConfKey] = registry
+	}
+	if certificate != "" {
+		data[registryCertKey] = certificate
+	}
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      providedMirrorRegistryCMName,
+			Namespace: testNamespace,
+		},
+		Data: data,
+	}
+}
+
+func getSecureRegistryToml() string {
+	return fmt.Sprintf(`
+[[registry]]
+location = "%s"
+
+[[registry.mirror]]
+location = "%s"
+`,
+		sourceRegistry,
+		mirrorRegistry,
+	)
+}
+
+func getRegistryMissingSourceToml() string {
+	return fmt.Sprintf(`
+[[registry.mirror]]
+location = "%s"
+`,
+		mirrorRegistry,
+	)
+}
+
+func getRegistryMissingMirrorToml() string {
+	return fmt.Sprintf(`
+[[registry]]
+location = "%s"
+`,
+		sourceRegistry,
+	)
+}
+
+func getInsecureRegistryToml() string {
+	x := fmt.Sprintf(`
+[[registry]]
+location = "%s"
+
+[[registry.mirror]]
+location = "%s"
+insecure = true
+`,
+		sourceRegistry,
+		mirrorRegistry,
+	)
+	return x
+}
+
+func getSecureRegistryTagOnlyToml() string {
+	return fmt.Sprintf(`
+[[registry]]
+location = "%s"
+
+[[registry.mirror]]
+location = "%s"
+pull-from-mirror = "tag-only"
+`,
+		sourceRegistry,
+		mirrorRegistry,
+	)
+}
+
+func getInvalidRegistryToml() string {
+	// location has no quotes, will be parsed as double
+	return `
+[[registry]]
+	location = "%s"
+
+	[[registry.mirror]]
+	location = 192.168.1.1:5000
+	insecure = true
+`
+}
+
 func getDefaultAgentClusterInstallSpec(clusterName string) hiveext.AgentClusterInstallSpec {
 	return hiveext.AgentClusterInstallSpec{
 		APIVIP:      string(common.TestIPv4Networking.APIVips[0].IP),
@@ -157,6 +259,172 @@ func simulateACIDeletionWithFinalizer(ctx context.Context, c client.Client, aci 
 	Expect(c.Delete(ctx, aci)).Should(BeNil())
 }
 
+var _ = Describe("processMirrorRegistryConfig", func() {
+	var (
+		c                              client.Client
+		cr                             *ClusterDeploymentsReconciler
+		ctx                            = context.Background()
+		mockCtrl                       *gomock.Controller
+		mockInstallerInternal          *bminventory.MockInstallerInternals
+		mockClusterApi                 *cluster.MockAPI
+		mockHostApi                    *host.MockAPI
+		mockManifestsApi               *manifestsapi.MockClusterManifestsInternals
+		mockCRDEventsHandler           *MockCRDEventsHandler
+		mockVersions                   *versions.MockHandler
+		mockMirrorRegistries           *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
+		defaultClusterSpec             hivev1.ClusterDeploymentSpec
+		clusterName                    = "test-cluster"
+		agentClusterInstallName        = "test-cluster-aci"
+		defaultAgentClusterInstallSpec hiveext.AgentClusterInstallSpec
+		pullSecretName                 = "pull-secret"
+	)
+
+	BeforeEach(func() {
+		defaultClusterSpec = getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName)
+		defaultAgentClusterInstallSpec = getDefaultAgentClusterInstallSpec(clusterName)
+		c = fakeclient.NewClientBuilder().WithScheme(scheme.Scheme).
+			WithStatusSubresource(&hiveext.AgentClusterInstall{}).Build()
+		mockCtrl = gomock.NewController(GinkgoT())
+		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
+		mockClusterApi = cluster.NewMockAPI(mockCtrl)
+		mockHostApi = host.NewMockAPI(mockCtrl)
+		mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
+		mockManifestsApi = manifestsapi.NewMockClusterManifestsInternals(mockCtrl)
+		mockVersions = versions.NewMockHandler(mockCtrl)
+		mockMirrorRegistries = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(mockCtrl)
+		cr = &ClusterDeploymentsReconciler{
+			Client:                        c,
+			APIReader:                     c,
+			Scheme:                        scheme.Scheme,
+			Log:                           common.GetTestLog(),
+			Installer:                     mockInstallerInternal,
+			ClusterApi:                    mockClusterApi,
+			HostApi:                       mockHostApi,
+			CRDEventsHandler:              mockCRDEventsHandler,
+			Manifests:                     mockManifestsApi,
+			PullSecretHandler:             NewPullSecretHandler(c, c, mockInstallerInternal),
+			VersionsHandler:               mockVersions,
+			MirrorRegistriesConfigBuilder: mockMirrorRegistries,
+		}
+	})
+
+	createUserMirrorRegistryConfigmap := func(registryToml string, certificate string) {
+		registryCM := newUserProvidedRegistryCM(registryToml, certificate)
+		Expect(c.Create(ctx, registryCM)).ShouldNot(HaveOccurred())
+	}
+
+	getTestClusterInstall := func() *hiveext.AgentClusterInstall {
+		clusterInstall := &hiveext.AgentClusterInstall{}
+		Expect(c.Get(ctx,
+			types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      agentClusterInstallName,
+			},
+			clusterInstall)).To(BeNil())
+		return clusterInstall
+	}
+
+	createAgentClusterInstallForMirrorRegistry := func() *hiveext.AgentClusterInstall {
+		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+		defaultAgentClusterInstallSpec.MirrorRegistryRef = &hiveext.MirrorRegistryConfigMapReference{Name: providedMirrorRegistryCMName, Namespace: testNamespace}
+
+		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
+		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+		return getTestClusterInstall()
+	}
+
+	It("Providing a valid image registry - successfully parse and set the given user configmap", func() {
+		createUserMirrorRegistryConfigmap(getSecureRegistryToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		Expect(mirrorRegistryConfiguration).ShouldNot(BeNil())
+		Expect(mirrorRegistryConfiguration.CaBundleCrt).To(Equal(mirrorRegistryCertificate))
+	})
+
+	It("missing image registry configmap - processMirrorRegistryConfig fails to find the user configmap", func() {
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(mirrorRegistryConfiguration).To(BeNil())
+		Expect(err.Error()).To(Equal("Failed to get referenced ConfigMap: configmaps \"user-provided-config-map\" not found"))
+	})
+
+	It("ConfigMap contains an insecure registry - Successfully parse and set the given user configmap with the insecure registry", func() {
+		createUserMirrorRegistryConfigmap(getInsecureRegistryToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		Expect(mirrorRegistryConfiguration).ShouldNot(BeNil())
+		Expect(mirrorRegistryConfiguration.CaBundleCrt).To(Equal(mirrorRegistryCertificate))
+	})
+
+	It("ConfigMap pulls by tag - Successfully parse and set the given user configmap that pulls by tag", func() {
+		createUserMirrorRegistryConfigmap(getSecureRegistryTagOnlyToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		Expect(mirrorRegistryConfiguration).ShouldNot(BeNil())
+		Expect(mirrorRegistryConfiguration.CaBundleCrt).To(Equal(mirrorRegistryCertificate))
+	})
+
+	It("ConfigMap is missing the source in the registries.conf - Fails to create and set AgentClusterInstall image registry configurations", func() {
+		createUserMirrorRegistryConfigmap(getRegistryMissingSourceToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).To(HaveOccurred())
+		Expect(mirrorRegistryConfiguration).Should(BeNil())
+
+		Expect(err.Error()).To(Equal("failed to find registry key in toml tree, registriesConfToml: \n[[registry.mirror]]\nlocation = \"example-user-registry.com\"\n"))
+	})
+
+	It("ConfigMap is missing the mirror in the registries.conf - Fails to create and set AgentClusterInstall image registry configurations", func() {
+		createUserMirrorRegistryConfigmap(getRegistryMissingMirrorToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).To(HaveOccurred())
+		Expect(mirrorRegistryConfiguration).Should(BeNil())
+
+		Expect(err.Error()).To(Equal("failed to find any image mirrors in registry.conf"))
+	})
+
+	It("ConfigMap registries.conf toml is not well-formatted - Fails to create and set AgentClusterInstall image registry configurations", func() {
+		createUserMirrorRegistryConfigmap(fmt.Sprintf("location=%s", sourceRegistry), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).To(HaveOccurred())
+		Expect(mirrorRegistryConfiguration).Should(BeNil())
+
+		Expect(err.Error()).To(Equal("failed to load value of registries.conf into toml tree; incorrectly formatted toml: (1, 10): no value can start with q"))
+	})
+
+	It("ConfigMap has an invalid toml configuration - Fails to create and set AgentClusterInstall image registry configurations", func() {
+		createUserMirrorRegistryConfigmap(getInvalidRegistryToml(), mirrorRegistryCertificate)
+		aci := createAgentClusterInstallForMirrorRegistry()
+
+		mirrorRegistryConfiguration, err := cr.processMirrorRegistryConfig(ctx, common.GetTestLog(), aci)
+		Expect(err).To(HaveOccurred())
+		Expect(mirrorRegistryConfiguration).Should(BeNil())
+
+		Expect(err.Error()).To(Equal("failed to load value of registries.conf into toml tree; incorrectly formatted toml: (6, 13): cannot have two dots in one float"))
+	})
+
+	AfterEach(func() {
+		mockCtrl.Finish()
+	})
+})
+
 var _ = Describe("cluster reconcile", func() {
 	var (
 		c                              client.Client
@@ -169,6 +437,8 @@ var _ = Describe("cluster reconcile", func() {
 		mockManifestsApi               *manifestsapi.MockClusterManifestsInternals
 		mockCRDEventsHandler           *MockCRDEventsHandler
 		mockVersions                   *versions.MockHandler
+		mockMirrorRegistries           *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
+		listManifestsHandler           func(ctx context.Context, params operations.V2ListClusterManifestsParams) (models.ListManifests, error)
 		defaultClusterSpec             hivev1.ClusterDeploymentSpec
 		clusterName                    = "test-cluster"
 		agentClusterInstallName        = "test-cluster-aci"
@@ -230,18 +500,27 @@ var _ = Describe("cluster reconcile", func() {
 		mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
 		mockManifestsApi = manifestsapi.NewMockClusterManifestsInternals(mockCtrl)
 		mockVersions = versions.NewMockHandler(mockCtrl)
+		mockMirrorRegistries = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(mockCtrl)
+		listManifestsHandler = func(ctx context.Context, params operations.V2ListClusterManifestsParams) (models.ListManifests, error) {
+			return models.ListManifests{}, nil
+		}
+		mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(ctx context.Context, params operations.V2ListClusterManifestsParams) (models.ListManifests, error) {
+				return listManifestsHandler(ctx, params)
+			}).AnyTimes()
 		cr = &ClusterDeploymentsReconciler{
-			Client:            c,
-			APIReader:         c,
-			Scheme:            scheme.Scheme,
-			Log:               common.GetTestLog(),
-			Installer:         mockInstallerInternal,
-			ClusterApi:        mockClusterApi,
-			HostApi:           mockHostApi,
-			CRDEventsHandler:  mockCRDEventsHandler,
-			Manifests:         mockManifestsApi,
-			PullSecretHandler: NewPullSecretHandler(c, c, mockInstallerInternal),
-			VersionsHandler:   mockVersions,
+			Client:                        c,
+			APIReader:                     c,
+			Scheme:                        scheme.Scheme,
+			Log:                           common.GetTestLog(),
+			Installer:                     mockInstallerInternal,
+			ClusterApi:                    mockClusterApi,
+			HostApi:                       mockHostApi,
+			CRDEventsHandler:              mockCRDEventsHandler,
+			Manifests:                     mockManifestsApi,
+			PullSecretHandler:             NewPullSecretHandler(c, c, mockInstallerInternal),
+			VersionsHandler:               mockVersions,
+			MirrorRegistriesConfigBuilder: mockMirrorRegistries,
 		}
 	})
 
@@ -249,9 +528,193 @@ var _ = Describe("cluster reconcile", func() {
 		mockCtrl.Finish()
 	})
 
+	Context("Mirror Registry", func() {
+		createUserMirrorRegistryConfigmap := func(registryToml string, certificate string) {
+			registryCM := newUserProvidedRegistryCM(registryToml, certificate)
+			Expect(c.Create(ctx, registryCM)).ShouldNot(HaveOccurred())
+		}
+
+		getClusterInstallForMirrorRegistry := func(registryToml, certificate string, createMirrorRegistryCM bool) (*hivev1.ClusterDeployment, *hiveext.AgentClusterInstall) {
+			if createMirrorRegistryCM {
+				createUserMirrorRegistryConfigmap(registryToml, certificate)
+			}
+
+			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+			defaultAgentClusterInstallSpec.MirrorRegistryRef = &hiveext.MirrorRegistryConfigMapReference{Name: providedMirrorRegistryCMName, Namespace: testNamespace}
+
+			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
+			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+			return cluster, aci
+		}
+
+		Context("create cluster success", func() {
+			BeforeEach(func() {
+				mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+				pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+				Expect(c.Create(ctx, pullSecret)).To(BeNil())
+				imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+				Expect(c.Create(ctx, imageSet)).To(BeNil())
+			})
+
+			var clusterReply *common.Cluster
+
+			BeforeEach(func() {
+				id := strfmt.UUID(uuid.New().String())
+				clusterReply = &common.Cluster{
+					Cluster: models.Cluster{
+						Status:     swag.String(models.ClusterStatusPendingForInput),
+						StatusInfo: swag.String("User input required"),
+						ID:         &id,
+					},
+				}
+			})
+
+			validateCreation := func(cluster *hivev1.ClusterDeployment) {
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{}))
+
+				aci := getTestClusterInstall()
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterNotReadyReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(hiveext.ClusterNotReadyMsg))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+			}
+
+			getClusterInstallSuccess := func(registryToml, certificate string) *hiveext.AgentClusterInstall {
+				cluster, _ := getClusterInstallForMirrorRegistry(registryToml, certificate, true)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {}).Return(clusterReply, nil)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+				validateCreation(cluster)
+				clusterInstall := &hiveext.AgentClusterInstall{}
+				Expect(c.Get(ctx, types.NamespacedName{Namespace: testNamespace, Name: agentClusterInstallName}, clusterInstall))
+				return clusterInstall
+			}
+
+			It("successfully create a new cluster with mirror registry", func() {
+				getClusterInstallSuccess(getSecureRegistryToml(), mirrorRegistryCertificate)
+			})
+
+			It("successfully create a new cluster with insecure mirror registry", func() {
+				getClusterInstallSuccess(getInsecureRegistryToml(), mirrorRegistryCertificate)
+			})
+
+			It("successfully create a new cluster with mirror registry that pulls by tag", func() {
+				getClusterInstallSuccess(getSecureRegistryTagOnlyToml(), mirrorRegistryCertificate)
+			})
+
+			It("successfully create a new cluster with mirror registry without additional certificates", func() {
+				getClusterInstallSuccess(getSecureRegistryToml(), "")
+			})
+
+		})
+
+		Context("create cluster failure", func() {
+			BeforeEach(func() {
+				pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+				Expect(c.Create(ctx, pullSecret)).To(BeNil())
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+				Expect(c.Create(ctx, imageSet)).To(BeNil())
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+			})
+
+			getClusterInstallFailure := func(registryToml, certificate string, createMirrorRegistryCM bool) error {
+				cluster, _ := getClusterInstallForMirrorRegistry(registryToml, certificate, createMirrorRegistryCM)
+
+				request := newClusterDeploymentRequest(cluster)
+				_, err := cr.Reconcile(ctx, request)
+				Expect(err).ShouldNot(HaveOccurred())
+				return err
+			}
+
+			It("fails to create a new cluster with no mirror registry configmap ", func() {
+				err := getClusterInstallFailure(getRegistryMissingSourceToml(), mirrorRegistryCertificate, false)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				clusterInstall := &hiveext.AgentClusterInstall{}
+				agentClusterInstallKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				clusterDeployment := &hivev1.ClusterDeployment{}
+				ClusterDeploymentKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				Expect(c.Get(ctx, agentClusterInstallKey, clusterInstall)).ShouldNot(HaveOccurred())
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal("The Spec could not be synced due to an input error: Failed to get referenced ConfigMap: configmaps \"user-provided-config-map\" not found"))
+
+				err = c.Get(ctx, ClusterDeploymentKey, clusterDeployment)
+				Expect(err.Error()).To(Equal("clusterdeployments.hive.openshift.io \"test-cluster-aci\" not found"))
+			})
+
+			It("fails to create a new cluster with invalid mirror registry configmap missing the source in the registries.conf", func() {
+				err := getClusterInstallFailure(getRegistryMissingSourceToml(), mirrorRegistryCertificate, true)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				clusterInstall := &hiveext.AgentClusterInstall{}
+				agentClusterInstallKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				clusterDeployment := &hivev1.ClusterDeployment{}
+				ClusterDeploymentKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				Expect(c.Get(ctx, agentClusterInstallKey, clusterInstall)).ShouldNot(HaveOccurred())
+
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal("The Spec could not be synced due to an input error: failed to find registry key in toml tree, registriesConfToml: \n[[registry.mirror]]\nlocation = \"example-user-registry.com\"\n"))
+
+				err = c.Get(ctx, ClusterDeploymentKey, clusterDeployment)
+				Expect(err.Error()).To(Equal("clusterdeployments.hive.openshift.io \"test-cluster-aci\" not found"))
+			})
+
+			It("fails to create a new cluster with invalid mirror registry configmap missing the mirror in the registries.conf", func() {
+				err := getClusterInstallFailure(getRegistryMissingMirrorToml(), mirrorRegistryCertificate, true)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				clusterInstall := &hiveext.AgentClusterInstall{}
+				agentClusterInstallKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				clusterDeployment := &hivev1.ClusterDeployment{}
+				ClusterDeploymentKey := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      agentClusterInstallName,
+				}
+
+				Expect(c.Get(ctx, agentClusterInstallKey, clusterInstall)).ShouldNot(HaveOccurred())
+
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
+				Expect(FindStatusCondition(clusterInstall.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal("The Spec could not be synced due to an input error: failed to find any image mirrors in registry.conf"))
+
+				err = c.Get(ctx, ClusterDeploymentKey, clusterDeployment)
+				Expect(err.Error()).To(Equal("clusterdeployments.hive.openshift.io \"test-cluster-aci\" not found"))
+			})
+		})
+
+	})
+
 	Context("create cluster", func() {
 		BeforeEach(func() {
-			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound).AnyTimes()
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
 			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
@@ -273,7 +736,7 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			validateCreation := func(cluster *hivev1.ClusterDeployment) {
-				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 				request := newClusterDeploymentRequest(cluster)
 				result, err := cr.Reconcile(ctx, request)
 				Expect(err).To(BeNil())
@@ -287,11 +750,13 @@ var _ = Describe("cluster reconcile", func() {
 			}
 
 			It("create new cluster", func() {
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(*releaseImage.Version))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -305,13 +770,14 @@ var _ = Describe("cluster reconcile", func() {
 				httpProxy := "http://proxy.org"
 				httpsProxy := "https://secureproxy.org"
 				noProxy := "acme.com"
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.StringValue(params.NewClusterParams.HTTPProxy)).To(Equal(httpProxy))
 						Expect(swag.StringValue(params.NewClusterParams.HTTPSProxy)).To(Equal(httpsProxy))
 						Expect(swag.StringValue(params.NewClusterParams.NoProxy)).To(Equal(noProxy))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -322,12 +788,30 @@ var _ = Describe("cluster reconcile", func() {
 				validateCreation(cluster)
 			})
 
+			It("create new cluster with exclusive ntpSources", func() {
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
+						Expect(swag.StringValue(params.NewClusterParams.NtpSources)).To(Equal("ntp1.example.com,ntp2.example.com"))
+					}).Return(clusterReply, nil)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+				defaultAgentClusterInstallSpec.NTPSources = []string{"ntp1.example.com", "ntp2.example.com"}
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+				validateCreation(cluster)
+			})
+
 			It("create new cluster with IgnitionEndpoint CaCertificate", func() {
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(*releaseImage.Version))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -351,6 +835,7 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("create new cluster with arm cpu architecture", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 				clusterReply.Cluster.CPUArchitecture = CpuArchitectureArm
 				armReleaseImageUrl := "quay.io/openshift-release-dev/ocp-release:4.9.11-aarch64"
 				armOcpReleaseVersion := "4.9.11"
@@ -361,12 +846,13 @@ var _ = Describe("cluster reconcile", func() {
 					URL:              &armReleaseImageUrl,
 					Version:          &armOcpReleaseVersion,
 				}
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(*armReleaseImage.Version))
 						Expect(params.NewClusterParams.CPUArchitecture).To(Equal(CpuArchitectureArm))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(armReleaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -377,6 +863,7 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("create new cluster with disk encryption", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 				tangServersConfig := `[{"URL":"http://tang.example.com:7500","Thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`
 				id := strfmt.UUID(uuid.New().String())
 				clusterReply = &common.Cluster{
@@ -392,14 +879,15 @@ var _ = Describe("cluster reconcile", func() {
 					},
 				}
 
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(params.NewClusterParams.DiskEncryption).NotTo(BeNil())
 						Expect(swag.StringValue(params.NewClusterParams.DiskEncryption.EnableOn)).To(Equal(models.DiskEncryptionEnableOnMasters))
 						Expect(swag.StringValue(params.NewClusterParams.DiskEncryption.Mode)).To(Equal(models.DiskEncryptionModeTang))
 						Expect(params.NewClusterParams.DiskEncryption.TangServers).To(Equal(tangServersConfig))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -415,11 +903,13 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("create sno cluster", func() {
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(arg1, arg2 interface{}, params installer.V2RegisterClusterParams) {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(ocpReleaseVersion))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace,
@@ -434,13 +924,18 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("create single node cluster", func() {
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(ctx, kubeKey interface{}, params installer.V2RegisterClusterParams) {
-						Expect(swag.StringValue(params.NewClusterParams.HighAvailabilityMode)).
-							To(Equal(HighAvailabilityModeNone))
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(ctx, kubeKey, arg3 interface{}, params installer.V2RegisterClusterParams) {
+						Expect(swag.Int64Value(params.NewClusterParams.ControlPlaneCount)).
+							To(Equal(int64(1)))
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+				mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+				mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+				mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -454,12 +949,14 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("create none platform cluster", func() {
-				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(ctx, kubeKey interface{}, params installer.V2RegisterClusterParams) {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(ctx, kubeKey, arg3 interface{}, params installer.V2RegisterClusterParams) {
 						Expect(swag.BoolValue(params.NewClusterParams.UserManagedNetworking)).
 							To(BeTrue())
 					}).Return(clusterReply, nil)
 				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
 				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
@@ -475,7 +972,48 @@ var _ = Describe("cluster reconcile", func() {
 				validateCreation(cluster)
 			})
 
+			It("should succeed with cluster managed load balancer", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
+						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(*releaseImage.Version))
+					}).Return(clusterReply, nil)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+				cd := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+				Expect(c.Create(ctx, cd)).ShouldNot(HaveOccurred())
+
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cd)
+				aci.Spec.LoadBalancer = &hiveext.LoadBalancer{Type: hiveext.LoadBalancerTypeClusterManaged}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+				validateCreation(cd)
+			})
+
+			It("should succeed with user managed load balancer", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(arg1, arg2, arg3 interface{}, params installer.V2RegisterClusterParams) {
+						Expect(swag.StringValue(params.NewClusterParams.OpenshiftVersion)).To(Equal(*releaseImage.Version))
+					}).Return(clusterReply, nil)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+				mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+				cd := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+				Expect(c.Create(ctx, cd)).ShouldNot(HaveOccurred())
+
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cd)
+				aci.Spec.LoadBalancer = &hiveext.LoadBalancer{Type: hiveext.LoadBalancerTypeUserManaged}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+				validateCreation(cd)
+			})
+
+		})
+		Context("failed creation", func() {
 			It("no pull secret name when trying to create a cluster", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 				cluster := newClusterDeployment(clusterName, testNamespace,
 					getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, ""))
 				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -500,6 +1038,8 @@ var _ = Describe("cluster reconcile", func() {
 			})
 
 			It("no imagesetref when trying to create a day1 cluster", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 				cluster := newClusterDeployment(clusterName, testNamespace,
 					getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName))
 				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -514,7 +1054,7 @@ var _ = Describe("cluster reconcile", func() {
 				Expect(result).To(Equal(ctrl.Result{})) //missing ref is a user error and stops the reconcile
 
 				aci = getTestClusterInstall()
-				msg := "The Spec could not be synced due to an input error: missing ImageSetRef for cluster that is not installed"
+				msg := "The Spec could not be synced due to an input error: ClusterImageSet must be specified in AgentClusterInstall.Spec.ImageSetRef for cluster that is not installed"
 				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
 				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(msg))
 				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Status).To(Equal(corev1.ConditionFalse))
@@ -524,7 +1064,35 @@ var _ = Describe("cluster reconcile", func() {
 				Expect(aci.Status.DebugInfo.EventsURL).To(Equal(""))
 			})
 
-			It("no imagesetref when trying to create a day2 cluster", func() {
+			It("non-existing imagesetref when trying to create a day1 cluster", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				cluster := newClusterDeployment(clusterName, testNamespace,
+					getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName))
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				aci.Spec.ImageSetRef = &hivev1.ClusterImageSetReference{Name: "non-existing-imageset"}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+
+				aci = getTestClusterInstall()
+				msg := "The Spec could not be synced due to backend error: ClusterImageSet non-existing-imageset not found. Please ensure the ClusterImageSet exists"
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(msg))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Status).To(Equal(corev1.ConditionFalse))
+				Expect(aci.Status.DebugInfo.State).To(Equal(""))
+				Expect(aci.Status.DebugInfo.StateInfo).To(Equal(""))
+				Expect(aci.Status.DebugInfo.LogsURL).To(Equal(""))
+				Expect(aci.Status.DebugInfo.EventsURL).To(Equal(""))
+			})
+
+			It("no imagesetref when trying to create a day2 cluster should succeed", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 				cluster := newClusterDeployment(clusterName, testNamespace,
 					getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, ""))
 				cluster.Spec.Installed = true
@@ -542,9 +1110,34 @@ var _ = Describe("cluster reconcile", func() {
 				Expect(result).To(Equal(ctrl.Result{RequeueAfter: 0}))
 			})
 
+			It("stale ClusterImageSet reference when adding nodes to an installed cluster should succeed", func() {
+				// Regression test: an installed cluster may reference a ClusterImageSet that no longer
+				// exists (e.g. deleted after the cluster was installed, or never synced to this hub).
+				// Adding Day-2 workers must not fail with "ClusterImageSet not found".
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				cluster := newClusterDeployment(clusterName, testNamespace,
+					getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, ""))
+				cluster.Spec.Installed = true
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+
+				mockInstallerInternal.EXPECT().V2ImportClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				// ImageSetRef points to a ClusterImageSet that does not exist in Kubernetes
+				aci.Spec.ImageSetRef = &hivev1.ClusterImageSetReference{Name: "stale-imageset-that-does-not-exist"}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: 0}))
+			})
+
 			It("fail to get openshift version when trying to create a cluster", func() {
-				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.Errorf("some-error"))
-				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("some-error"))
+
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 
 				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -557,7 +1150,7 @@ var _ = Describe("cluster reconcile", func() {
 				request := newClusterDeploymentRequest(cluster)
 				result, err := cr.Reconcile(ctx, request)
 				Expect(err).To(BeNil())
-				Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
 				aci = getTestClusterInstall()
 				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
 				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterNotAvailableReason))
@@ -568,31 +1161,98 @@ var _ = Describe("cluster reconcile", func() {
 				Expect(aci.Status.DebugInfo.LogsURL).To(Equal(""))
 				Expect(aci.Status.DebugInfo.EventsURL).To(Equal(""))
 			})
-		})
 
-		It("create new cluster backend failure", func() {
-			errString := "internal error"
-			mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-				Return(nil, errors.Errorf(errString))
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+			It("should return appropriate error on failure to fetch OpenShiftVersion via oc if mirror registries enabled and ImageSetRef references a tagged image", func() {
+				clusterDeploymentSpec := getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName)
+				cluster := newClusterDeployment(clusterName, testNamespace, clusterDeploymentSpec)
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				imageSet := getDefaultTestImageSet("taggedImageSet-ocp-release:4.15.0-multi", "quay.io/openshift-release-dev/ocp-release:4.15.0-multi")
+				Expect(c.Create(ctx, imageSet)).To(BeNil())
+				aci.Spec.ImageSetRef = &hivev1.ClusterImageSetReference{Name: "taggedImageSet-ocp-release:4.15.0-multi"}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(true)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("some-error"))
 
-			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
-			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+				aci = getTestClusterInstall()
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring("this is usually unsupported in combination with mirror registries, try providing a digest-based image instead"))
+			})
 
-			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
-			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+			It("should return appropriate error on failure to fetch OpenShiftVersion via oc if mirror registries enabled and ImageSetRef references a digest image", func() {
+				clusterDeploymentSpec := getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName)
+				cluster := newClusterDeployment(clusterName, testNamespace, clusterDeploymentSpec)
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				imageSet := getDefaultTestImageSet("digestBased-ocp-release:4.15.0-multi", "quay.io/openshift-release-dev/ocp-release@sha256:b86422e972b9c838dfdb8b481a67ae08308437d6489ea6aaf150242b1d30fa1c")
+				Expect(c.Create(ctx, imageSet)).To(BeNil())
+				aci.Spec.ImageSetRef = &hivev1.ClusterImageSetReference{Name: "digestBased-ocp-release:4.15.0-multi"}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(true)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("some-error"))
 
-			request := newClusterDeploymentRequest(cluster)
-			result, err := cr.Reconcile(ctx, request)
-			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+				aci = getTestClusterInstall()
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).ToNot(ContainSubstring("this is usually unsupported in combination with mirror registries, try providing a digest-based image instead"))
+			})
 
-			aci = getTestClusterInstall()
-			expectedState := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, errString)
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Status).To(Equal(corev1.ConditionFalse))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(expectedState))
+			It("should return appropriate error on failure to fetch OpenShiftVersion via oc if mirror registries disabled and ImageSetRef references a tagged image", func() {
+				clusterDeploymentSpec := getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName)
+				cluster := newClusterDeployment(clusterName, testNamespace, clusterDeploymentSpec)
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				imageSet := getDefaultTestImageSet("taggedImageSet-ocp-release:4.15.0-multi", "quay.io/openshift-release-dev/ocp-release:4.15.0-multi")
+				Expect(c.Create(ctx, imageSet)).To(BeNil())
+				aci.Spec.ImageSetRef = &hivev1.ClusterImageSetReference{Name: "taggedImageSet-ocp-release:4.15.0-multi"}
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("some-error"))
+
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+				aci = getTestClusterInstall()
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).ToNot(ContainSubstring("this is usually unsupported in combination with mirror registries, try providing a digest-based image instead"))
+			})
+
+			It("create new cluster backend failure", func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+				errString := "internal error"
+				mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil, errors.New(errString))
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
+				cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+				Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+
+				aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
+				Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+				request := newClusterDeploymentRequest(cluster)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).To(BeNil())
+				Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+
+				aci = getTestClusterInstall()
+				expectedState := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, errString)
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Status).To(Equal(corev1.ConditionFalse))
+				Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(expectedState))
+			})
 		})
 	})
 
@@ -620,8 +1280,13 @@ var _ = Describe("cluster reconcile", func() {
 			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
 			Expect(c.Create(ctx, imageSet)).To(BeNil())
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil)
+
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(1), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
 		})
 
 		setupTestForStatusAndReason := func(status string, reason string) {
@@ -636,16 +1301,19 @@ var _ = Describe("cluster reconcile", func() {
 					},
 				},
 			}
-			mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-				Do(func(ctx, kubeKey interface{}, params installer.V2RegisterClusterParams) {
-					Expect(swag.StringValue(params.NewClusterParams.HighAvailabilityMode)).
-						To(Equal(HighAvailabilityModeNone))
+			mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx, kubeKey, arg3 interface{}, params installer.V2RegisterClusterParams) {
+					Expect(swag.Int64Value(params.NewClusterParams.ControlPlaneCount)).
+						To(Equal(int64(1)))
 				}).Return(clusterReply, nil)
+
 			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+
 			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 			aci.Spec.ProvisionRequirements.WorkerAgents = 0
 			aci.Spec.ProvisionRequirements.ControlPlaneAgents = 1
+
 			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
 			request := newClusterDeploymentRequest(cluster)
 			_, err := cr.Reconcile(ctx, request)
@@ -680,37 +1348,67 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	Context("CreateClusterParams", func() {
+		BeforeEach(func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+		})
+
 		It("create new param - success", func() {
 			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 
 			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 			pullSecretString := "my-pull-secret-string"
-			cpuArch := "x86_64"
-			openshiftVersion := "4.10.0-rc1"
+			releaseImageTest := &models.ReleaseImage{
+				URL:             swag.String("https://example.com/release-image:4.10.0-rc1"),
+				Version:         swag.String("4.10.0-rc1"),
+				CPUArchitecture: swag.String("x86_64"),
+			}
 
-			params := CreateClusterParams(cluster, aci, pullSecretString, openshiftVersion, cpuArch, nil)
+			params := CreateClusterParams(cluster, aci, pullSecretString, releaseImageTest, nil, nil)
 			Expect(params.Name).To(Equal(&cluster.Spec.ClusterName))
 			Expect(params.BaseDNSDomain).To(Equal(cluster.Spec.BaseDomain))
 			Expect(params.PullSecret).To(Equal(&pullSecretString))
 			Expect(string(params.IngressVips[0].IP)).To(Equal(aci.Spec.IngressVIPs[0]))
 			Expect(params.SSHPublicKey).To(Equal(aci.Spec.SSHPublicKey))
-			Expect(params.CPUArchitecture).To(Equal(cpuArch))
-			Expect(params.OpenshiftVersion).To(Equal(&openshiftVersion))
+			Expect(params.CPUArchitecture).To(Equal(*releaseImageTest.CPUArchitecture))
+			Expect(params.OpenshiftVersion).To(Equal(releaseImageTest.Version))
+			Expect(params.OcpReleaseImage).To(Equal(*releaseImageTest.URL))
+		})
+
+		It("create new param with consumer label and tags - success", func() {
+			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+
+			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
+			aci.Labels = map[string]string{hiveext.ClusterConsumerLabel: "CAPIOpenshiftAssisted"}
+
+			releaseImageTest := &models.ReleaseImage{
+				URL:             swag.String("https://example.com/release-image:4.10.0-rc1"),
+				Version:         swag.String("4.10.0-rc1"),
+				CPUArchitecture: swag.String("x86_64"),
+			}
+
+			params := CreateClusterParams(cluster, aci, "", releaseImageTest, nil, nil)
+			Expect(params.Name).To(Equal(&cluster.Spec.ClusterName))
+			Expect(params.Tags).NotTo(BeNil())
+			Expect(*params.Tags).To((Equal("CAPIOpenshiftAssisted")))
 		})
 	})
 
 	Context("Add validationsInfo to agentclusterinstall", func() {
 		BeforeEach(func() {
-			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+			pullSecret := getDefaultTestPullSecret(pullSecretName, testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
 			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
 			Expect(c.Create(ctx, imageSet)).To(BeNil())
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		})
 
 		It("Update agentclusterinstall::validationsInfo", func() {
-			cluster := newClusterDeployment(clusterName, testNamespace,
-				getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, ""))
+			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 
 			aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, getDefaultSNOAgentClusterInstallSpec(clusterName), cluster)
@@ -733,19 +1431,28 @@ var _ = Describe("cluster reconcile", func() {
 			bytesValidationInfo, err = json.Marshal(validationInfo)
 			Expect(err).To(BeNil())
 			stringifiedValidationInfo := string(bytesValidationInfo)
-
+			sId := strfmt.UUID(uuid.New().String())
 			dbCluster := &common.Cluster{
 				Cluster: models.Cluster{
+					ID:               &sId,
 					ValidationsInfo:  stringifiedValidationInfo,
 					OpenshiftVersion: arbitraryOCPVersion,
+					Status:           swag.String(models.ClusterStatusInsufficient),
+					Kind:             swag.String(models.ClusterKindCluster),
 				},
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(dbCluster, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(dbCluster, nil)
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil).AnyTimes()
+			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(false, "").AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleMaster, true).Return(swag.Int64(1), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleWorker, true).Return(swag.Int64(0), nil).AnyTimes()
 
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{}))
 
 			aci = getTestClusterInstall()
 			Expect(aci.Status.ValidationsInfo).ToNot(BeNil())
@@ -756,7 +1463,7 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("backend internal error when trying to retrieve cluster details", func() {
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, errors.New("internal error"))
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -780,6 +1487,7 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("not supported platform", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		spec := hivev1.ClusterDeploymentSpec{
 			ClusterName: clusterName,
 			Provisioning: &hivev1.Provisioning{
@@ -804,13 +1512,7 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("validate owner reference creation", func() {
-		sId := strfmt.UUID(uuid.New().String())
-		backEndCluster := &common.Cluster{
-			Cluster: models.Cluster{
-				ID: &sId,
-			},
-		}
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -826,8 +1528,8 @@ var _ = Describe("cluster reconcile", func() {
 			Name:      agentClusterInstallName,
 		}
 		ownref := metav1.OwnerReference{
-			APIVersion: cluster.APIVersion,
-			Kind:       cluster.Kind,
+			APIVersion: "hive.openshift.io/v1",
+			Kind:       "ClusterDeployment",
 			Name:       cluster.Name,
 			UID:        cluster.UID,
 		}
@@ -836,7 +1538,30 @@ var _ = Describe("cluster reconcile", func() {
 		Expect(clusterInstall.ObjectMeta.OwnerReferences[0]).To(Equal(ownref))
 	})
 
+	It("skips owner reference update when already set", func() {
+		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
+		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
+		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+		agentClusterInstallKey := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      agentClusterInstallName,
+		}
+		clusterInstallBefore := &hiveext.AgentClusterInstall{}
+		Expect(c.Get(ctx, agentClusterInstallKey, clusterInstallBefore)).To(BeNil())
+		resourceVersionBefore := clusterInstallBefore.ResourceVersion
+
+		err := cr.ensureOwnerRef(ctx, common.GetTestLog(), cluster, clusterInstallBefore)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		clusterInstallAfter := &hiveext.AgentClusterInstall{}
+		Expect(c.Get(ctx, agentClusterInstallKey, clusterInstallAfter)).To(BeNil())
+		Expect(clusterInstallAfter.ResourceVersion).To(Equal(resourceVersionBefore))
+	})
+
 	It("validate label on Pull Secret", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		sId := strfmt.UUID(uuid.New().String())
 		backEndCluster := &common.Cluster{
 			Cluster: models.Cluster{
@@ -857,10 +1582,15 @@ var _ = Describe("cluster reconcile", func() {
 			PullSecret: testPullSecretVal,
 		}
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(0, 0, nil).Times(1)
 		mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(false, "").Times(1)
 		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+		mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+		mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+		mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -869,6 +1599,9 @@ var _ = Describe("cluster reconcile", func() {
 
 		pullSecret := getDefaultTestPullSecret(pullSecretName, testNamespace)
 		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+
+		clusterimageset := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+		Expect(c.Create(ctx, clusterimageset)).To(BeNil())
 
 		secret := &corev1.Secret{}
 		secretKey := types.NamespacedName{
@@ -889,6 +1622,8 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("validate Event URL", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		_, priv, err := gencrypto.ECDSAKeyPairPEM()
 		Expect(err).NotTo(HaveOccurred())
 		os.Setenv("EC_PRIVATE_KEY_PEM", priv)
@@ -907,7 +1642,12 @@ var _ = Describe("cluster reconcile", func() {
 		expectedEventUrlPrefix := fmt.Sprintf("%s/api/assisted-install/v2/events?cluster_id=%s", serviceBaseURL, sId)
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+		imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+		Expect(c.Create(ctx, imageSet)).To(BeNil())
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
@@ -926,8 +1666,11 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("validate ignitionEndpoint override doesn't trigger clusterUpdate unless required", func() {
-		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil).Times(2)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil).AnyTimes()
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
 		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 		Expect(c.Create(ctx, pullSecret)).To(BeNil())
 		imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
@@ -961,6 +1704,8 @@ var _ = Describe("cluster reconcile", func() {
 			PullSecret: testPullSecretVal,
 		}
 
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 		// caCertificateReference := aci.Spec.IgnitionEndpoint.CaCertificateReference
 		caCertificateData := map[string][]byte{
 			corev1.TLSCertKey: ignitionCert,
@@ -993,7 +1738,7 @@ var _ = Describe("cluster reconcile", func() {
 		By("ignition override doesn't match")
 		backEndCluster.IgnitionEndpoint.URL = swag.String("https://anotherfakeurl:8080/config")
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 		_, err = cr.Reconcile(ctx, request)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(c.Get(ctx, agentClusterInstallKey, clusterInstall)).ShouldNot(HaveOccurred())
@@ -1003,6 +1748,13 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("validate Logs URL - before and after host log collection", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		kubeconfig := "kubeconfig content"
+		mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader(kubeconfig)), int64(len(kubeconfig)), nil).AnyTimes()
 		serviceBaseURL := "http://acme.com"
 		cr.ServiceBaseURL = serviceBaseURL
 		sId := strfmt.UUID(uuid.New().String())
@@ -1026,10 +1778,15 @@ var _ = Describe("cluster reconcile", func() {
 
 		expectedLogUrlPrefix := fmt.Sprintf("%s/api/assisted-install/v2/clusters/%s/logs", serviceBaseURL, sId)
 		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, errors.Errorf("failed to get host from db"))
+		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, errors.New("failed to get host from db"))
 		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(true, nil)
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 
 		By("before installation")
+		pullSecret := getDefaultTestPullSecret(pullSecretName, testNamespace)
+		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+		imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+		Expect(c.Create(ctx, imageSet)).To(BeNil())
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
@@ -1075,6 +1832,12 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("validate Logs URL - before and after controller log collection", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
+		kubeconfig := "kubeconfig content"
+		mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader(kubeconfig)), int64(len(kubeconfig)), nil).AnyTimes()
 		serviceBaseURL := "http://acme.com"
 		cr.ServiceBaseURL = serviceBaseURL
 		sId := strfmt.UUID(uuid.New().String())
@@ -1087,6 +1850,10 @@ var _ = Describe("cluster reconcile", func() {
 		}
 		expectedLogUrlPrefix := fmt.Sprintf("%s/api/assisted-install/v2/clusters/%s/logs", serviceBaseURL, sId)
 		By("before installation")
+		pullSecret := getDefaultTestPullSecret(pullSecretName, testNamespace)
+		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+		imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+		Expect(c.Create(ctx, imageSet)).To(BeNil())
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
@@ -1094,6 +1861,7 @@ var _ = Describe("cluster reconcile", func() {
 		request := newClusterDeploymentRequest(cluster)
 		mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 		_, err := cr.Reconcile(ctx, request)
 		Expect(err).ShouldNot(HaveOccurred())
 		clusterInstall := &hiveext.AgentClusterInstall{}
@@ -1130,8 +1898,8 @@ var _ = Describe("cluster reconcile", func() {
 		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
 
-		expectedErr := "expected-error"
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, errors.Errorf(expectedErr))
+		expectedErr := "failed to validate pull secret for ClusterDeployment test-cluster/test-namespace: failed to find secret pull-secret: failed to get secret test-namespace/pull-secret from API: secrets \"pull-secret\" not found"
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, errors.New(expectedErr)).AnyTimes()
 
 		request := newClusterDeploymentRequest(cluster)
 		result, err := cr.Reconcile(ctx, request)
@@ -1145,14 +1913,13 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("create cluster without pull secret reference", func() {
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 		cluster.Spec.PullSecretRef = nil
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 		aci := newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
 		request := newClusterDeploymentRequest(cluster)
-
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
 
 		_, err := cr.Reconcile(ctx, request)
 		Expect(err).To(BeNil())
@@ -1187,18 +1954,20 @@ var _ = Describe("cluster reconcile", func() {
 			mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
 			mockManifestsApi = manifestsapi.NewMockClusterManifestsInternals(mockCtrl)
 			mockVersions = versions.NewMockHandler(mockCtrl)
+			mockMirrorRegistries = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(mockCtrl)
 			cr = &ClusterDeploymentsReconciler{
-				Client:            c,
-				APIReader:         c,
-				Scheme:            scheme.Scheme,
-				Log:               common.GetTestLog(),
-				Installer:         mockInstallerInternal,
-				ClusterApi:        mockClusterApi,
-				HostApi:           mockHostApi,
-				CRDEventsHandler:  mockCRDEventsHandler,
-				Manifests:         mockManifestsApi,
-				PullSecretHandler: NewPullSecretHandler(c, c, mockInstallerInternal),
-				VersionsHandler:   mockVersions,
+				Client:                        c,
+				APIReader:                     c,
+				Scheme:                        scheme.Scheme,
+				Log:                           common.GetTestLog(),
+				Installer:                     mockInstallerInternal,
+				ClusterApi:                    mockClusterApi,
+				HostApi:                       mockHostApi,
+				CRDEventsHandler:              mockCRDEventsHandler,
+				Manifests:                     mockManifestsApi,
+				PullSecretHandler:             NewPullSecretHandler(c, c, mockInstallerInternal),
+				VersionsHandler:               mockVersions,
+				MirrorRegistriesConfigBuilder: mockMirrorRegistries,
 			}
 			Expect(c.Create(ctx, cd)).ShouldNot(HaveOccurred())
 			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
@@ -1206,6 +1975,7 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
 			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
 			Expect(c.Create(ctx, imageSet)).To(BeNil())
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		})
 
 		It("agentClusterInstall resource deleted - verify call to deregister cluster", func() {
@@ -1223,6 +1993,31 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(result).Should(Equal(ctrl.Result{}))
 		})
+
+		DescribeTable("deleting AgentClusterInstall resource cancels the installation",
+			func(clusterStatus string) {
+				backEndCluster := &common.Cluster{
+					Cluster: models.Cluster{
+						ID:     &sId,
+						Status: swag.String(models.ClusterStatusInstalling),
+					},
+				}
+				mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
+				mockInstallerInternal.EXPECT().DeregisterClusterInternal(gomock.Any(), gomock.Any()).Return(nil)
+				mockInstallerInternal.EXPECT().CancelInstallationInternal(gomock.Any(), gomock.Any()).Return(backEndCluster, nil).Times(1)
+
+				simulateACIDeletionWithFinalizer(ctx, c, aci)
+				request := newClusterDeploymentRequest(cd)
+				result, err := cr.Reconcile(ctx, request)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(result).Should(Equal(ctrl.Result{}))
+			},
+			Entry("in installing status", models.ClusterStatusInstalling),
+			Entry("in preparing-for-installation status", models.ClusterStatusPreparingForInstallation),
+			Entry("in installing-pending-user-action status", models.ClusterStatusInstallingPendingUserAction),
+			Entry("in finalizing status", models.ClusterStatusFinalizing),
+			Entry("in error status", models.ClusterStatusError),
+		)
 
 		It("agentClusterInstall resource deleted - verify call to cancel installation", func() {
 			backEndCluster := &common.Cluster{
@@ -1296,8 +2091,8 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(result).Should(Equal(ctrl.Result{}))
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-			mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().RegisterClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			aci = newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cd)
 			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
@@ -1356,6 +2151,9 @@ var _ = Describe("cluster reconcile", func() {
 				hosts = append(hosts, h)
 			}
 			backEndCluster.Hosts = hosts
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
 		})
 
 		It("success", func() {
@@ -1363,9 +2161,12 @@ var _ = Describe("cluster reconcile", func() {
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
 
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -1376,7 +2177,7 @@ var _ = Describe("cluster reconcile", func() {
 			}
 			mockInstallerInternal.EXPECT().InstallClusterInternal(gomock.Any(), gomock.Any()).
 				Return(installClusterReply, nil)
-
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -1391,11 +2192,15 @@ var _ = Describe("cluster reconcile", func() {
 		It("hold installation", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -1440,11 +2245,15 @@ var _ = Describe("cluster reconcile", func() {
 		It("hold installation by cluster deployment annotation", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -1489,11 +2298,15 @@ var _ = Describe("cluster reconcile", func() {
 		It("CVO status", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			cvoStatusInfo := "Working towards 4.8.0-rc.0: 654 of 676 done (96% complete)"
 			oper := make([]*models.MonitoredOperator, 1)
@@ -1530,11 +2343,15 @@ var _ = Describe("cluster reconcile", func() {
 		It("CVO empty status", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			oper := make([]*models.MonitoredOperator, 1)
 			oper[0] = &models.MonitoredOperator{
@@ -1571,11 +2388,13 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			kubeconfig := "kubeconfig content"
 			mockInstallerInternal.EXPECT().GetCredentialsInternal(gomock.Any(), gomock.Any()).Return(&models.Credentials{Password: "foo", Username: "bar"}, nil).Times(1)
 			mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader(kubeconfig)), int64(len(kubeconfig)), nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -1611,9 +2430,11 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(false, "").Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
 			password := "test"
 			username := "admin"
 			kubeconfigNoIngress := "kubeconfig content NOINGRESS"
@@ -1657,8 +2478,9 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 			password := "test"
 			username := "admin"
 			kubeconfig := "kubeconfig content"
@@ -1682,6 +2504,7 @@ var _ = Describe("cluster reconcile", func() {
 				},
 				PullSecret: testPullSecretVal,
 			}
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(day2backEndCluster, nil).AnyTimes()
 			mockInstallerInternal.EXPECT().TransformClusterToDay2Internal(gomock.Any(), gomock.Any()).Times(1).Return(day2backEndCluster, nil)
 			cluster = newClusterDeployment("test-cluster-sno", testNamespace, defaultClusterSpec)
 			cluster.Spec.BaseDomain = "hive.example.com"
@@ -1721,7 +2544,8 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			day2backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
@@ -1769,7 +2593,8 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			password := "test"
 			username := "admin"
 			cred := &models.Credentials{
@@ -1800,7 +2625,8 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.OpenshiftClusterID = openshiftID
 			backEndCluster.Kind = swag.String(models.ClusterKindCluster)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			expectedErr := "internal error"
 			mockInstallerInternal.EXPECT().GetCredentialsInternal(gomock.Any(), gomock.Any()).Return(nil, errors.New(expectedErr)).Times(1)
 			request := newClusterDeploymentRequest(cluster)
@@ -1822,13 +2648,17 @@ var _ = Describe("cluster reconcile", func() {
 			expectedErr := "internal error"
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().InstallClusterInternal(gomock.Any(), gomock.Any()).
-				Return(nil, errors.Errorf(expectedErr))
+				Return(nil, errors.New(expectedErr))
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
@@ -1850,8 +2680,9 @@ var _ = Describe("cluster reconcile", func() {
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(false, "").Times(1)
 			Expect(c.Update(ctx, cluster)).Should(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -1869,10 +2700,14 @@ var _ = Describe("cluster reconcile", func() {
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 0, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			Expect(c.Update(ctx, cluster)).Should(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -1890,10 +2725,14 @@ var _ = Describe("cluster reconcile", func() {
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 0, nil).Times(2)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			Expect(c.Update(ctx, cluster)).Should(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -1917,68 +2756,166 @@ var _ = Describe("cluster reconcile", func() {
 
 			Expect(c.Update(ctx, cluster)).Should(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(1), nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).Times(2)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
 			Expect(result).To(Equal(ctrl.Result{}))
 
 			aci = getTestClusterInstall()
-			expectedHosts := defaultAgentClusterInstallSpec.ProvisionRequirements.ControlPlaneAgents +
-				defaultAgentClusterInstallSpec.ProvisionRequirements.WorkerAgents
-			msg := fmt.Sprintf(hiveext.ClusterInsufficientAgentsMsg, expectedHosts, 0)
+
+			expectedMasterCount := defaultAgentClusterInstallSpec.ProvisionRequirements.ControlPlaneAgents
+			expectedArbiterCount := defaultAgentClusterInstallSpec.ProvisionRequirements.ArbiterAgents
+			expectedWorkerCount := defaultAgentClusterInstallSpec.ProvisionRequirements.WorkerAgents
+
+			actualMasterCount := 3
+			actualArbiterCount := 0
+			actualWorkerCount := 1
+
+			msg := fmt.Sprintf(hiveext.ClusterInsufficientAgentsMsg, expectedMasterCount, expectedArbiterCount, expectedWorkerCount, actualMasterCount, actualArbiterCount, actualWorkerCount)
+
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterInsufficientAgentsReason))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(msg))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
 		})
 
-		It("ready for installation - but too much approved hosts", func() {
+		It("ready for installation - but not all hosts are ready, failed counting masters and workers, fail updating status", func() {
+			backEndCluster.Status = swag.String(models.ClusterStatusReady)
+			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(0, 0, nil).Times(2)
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			// succeed in 'isReadyForInstallation'
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).
+				Return(swag.Int64(3), nil).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).
+				Return(swag.Int64(2), nil).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).
+				Return(swag.Int64(0), nil).
+				Times(1)
+
+			// fail in 'clusterRequirementsMet'
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'master'", string(*backEndCluster.ID))).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'worker'", string(*backEndCluster.ID))).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'arbiter'", string(*backEndCluster.ID))).
+				Times(1)
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+
+			expectedMasterCount := defaultAgentClusterInstallSpec.ProvisionRequirements.ControlPlaneAgents
+			expectedArbiterCount := defaultAgentClusterInstallSpec.ProvisionRequirements.ArbiterAgents
+			expectedWorkerCount := defaultAgentClusterInstallSpec.ProvisionRequirements.WorkerAgents
+
+			actualMasterCount := 0
+			actualArbuterCount := 0
+			actualWorkerCount := 0
+
+			msg := fmt.Sprintf(hiveext.ClusterInsufficientAgentsMsg, expectedMasterCount, expectedArbiterCount, expectedWorkerCount, actualMasterCount, actualArbuterCount, actualWorkerCount)
+
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(msg))
+		})
+
+		It("ready for installation - but not all hosts are ready, failed counting masters and workers, fail checking installation readiness", func() {
+			backEndCluster.Status = swag.String(models.ClusterStatusReady)
+			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(0, 0, nil).Times(2)
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			// fail in 'isReadyForInstallation'
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'master'", string(*backEndCluster.ID))).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'worker'", string(*backEndCluster.ID))).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).
+				Return(nil, fmt.Errorf("failed to count the number of hosts in cluster with ID '%s' and suggested role 'arbiter'", string(*backEndCluster.ID))).
+				Times(1)
+
+			// succeed in 'clusterRequirementsMet'
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).
+				Return(swag.Int64(3), nil).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).
+				Return(swag.Int64(2), nil).
+				Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).
+				Return(swag.Int64(0), nil).
+				Times(1)
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}))
+
+			aci = getTestClusterInstall()
+
+			expectedErr := fmt.Sprintf(
+				"failed to count the number of hosts in cluster with ID '%s' and suggested role 'master', failed to count the number of hosts in cluster with ID '%s' and suggested role 'arbiter', failed to count the number of hosts in cluster with ID '%s' and suggested role 'worker'",
+				string(*backEndCluster.ID),
+				string(*backEndCluster.ID),
+				string(*backEndCluster.ID),
+			)
+			expectedSyncMsg := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, expectedErr)
+
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(expectedSyncMsg))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterUnapprovedAgentsReason))
+		})
+
+		It("ready for installation - accurate amount of masters and workers", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(1), nil).Times(2)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).Times(2)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
-			aci.Spec.ProvisionRequirements.WorkerAgents = 0
+			aci.Spec.ProvisionRequirements.WorkerAgents = 1
 			Expect(c.Update(ctx, aci)).Should(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
 			Expect(result).To(Equal(ctrl.Result{}))
 
 			aci = getTestClusterInstall()
-			expectedHosts := aci.Spec.ProvisionRequirements.ControlPlaneAgents + aci.Spec.ProvisionRequirements.WorkerAgents
-			msg := fmt.Sprintf(hiveext.ClusterAdditionalAgentsMsg, expectedHosts, 5)
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterAdditionalAgentsReason))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(msg))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
-		})
 
-		It("ready for installation - but too much registered hosts", func() {
-			backEndCluster.Status = swag.String(models.ClusterStatusReady)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 3, nil).Times(2)
-			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-
-			aci.Spec.ProvisionRequirements.WorkerAgents = 0
-			Expect(c.Update(ctx, aci)).Should(BeNil())
-			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			request := newClusterDeploymentRequest(cluster)
-			result, err := cr.Reconcile(ctx, request)
-			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{}))
-
-			aci = getTestClusterInstall()
-			expectedHosts := aci.Spec.ProvisionRequirements.ControlPlaneAgents + aci.Spec.ProvisionRequirements.WorkerAgents
-			msg := fmt.Sprintf(hiveext.ClusterAdditionalAgentsMsg, expectedHosts, 5)
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterAdditionalAgentsReason))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(msg))
-			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionTrue))
 		})
 
 		It("install day2 host", func() {
@@ -2001,10 +2938,12 @@ var _ = Describe("cluster reconcile", func() {
 			backEndCluster.Hosts = []*models.Host{h}
 			commonHosts := []*common.Host{{Host: *h}}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().GetKnownApprovedHosts(gomock.Any()).Return(commonHosts, nil)
 			mockInstallerInternal.EXPECT().InstallSingleDay2HostInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -2032,10 +2971,12 @@ var _ = Describe("cluster reconcile", func() {
 			commonHosts := []*common.Host{{Host: *h}}
 			expectedErr := "internal error"
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 			mockInstallerInternal.EXPECT().GetKnownApprovedHosts(gomock.Any()).Return(commonHosts, nil)
 			mockInstallerInternal.EXPECT().InstallSingleDay2HostInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New(expectedErr))
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -2057,16 +2998,19 @@ var _ = Describe("cluster reconcile", func() {
 
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
 
 			aci = getTestClusterInstall()
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
@@ -2094,19 +3038,22 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, cm)).To(BeNil())
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockManifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), true).Return(nil, errors.Errorf("error")).Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			aci = getTestClusterInstall()
 			aci.Spec.ManifestsConfigMapRef = ref
 			Expect(c.Update(ctx, aci)).Should(BeNil())
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
 
 			aci = getTestClusterInstall()
 			expectedState := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, "error")
@@ -2121,11 +3068,16 @@ var _ = Describe("cluster reconcile", func() {
 		It("Update manifests - manifests exists , list failed", func() {
 			ref := &corev1.LocalObjectReference{Name: "cluster-install-config"}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(nil, errors.Errorf("error")).Times(1)
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
+			listManifestsHandler = func(ctx context.Context, params operations.V2ListClusterManifestsParams) (models.ListManifests, error) {
+				return nil, errors.Errorf("error")
+			}
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			request := newClusterDeploymentRequest(cluster)
 			cluster = getTestCluster()
@@ -2133,7 +3085,7 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Update(ctx, aci)).Should(BeNil())
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
 
 			aci = getTestClusterInstall()
 			expectedState := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, "error")
@@ -2162,12 +3114,17 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, cm)).To(BeNil())
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockManifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), true).Return(nil, nil).Times(1)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:         backEndCluster.ID,
@@ -2206,10 +3163,14 @@ var _ = Describe("cluster reconcile", func() {
 
 			By("no manifests")
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -2223,13 +3184,20 @@ var _ = Describe("cluster reconcile", func() {
 
 		It("Update manifests - delete old + error should be ignored", func() {
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{&models.Manifest{FileName: "test", Folder: "test"}, &models.Manifest{FileName: "test2", Folder: "test2"}}, nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			listManifestsHandler = func(ctx context.Context, params operations.V2ListClusterManifestsParams) (models.ListManifests, error) {
+				return models.ListManifests{&models.Manifest{FileName: "test", Folder: "test"}, &models.Manifest{FileName: "test2", Folder: "test2"}}, nil
+			}
 			mockManifestsApi.EXPECT().DeleteClusterManifestInternal(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockManifestsApi.EXPECT().DeleteClusterManifestInternal(gomock.Any(), gomock.Any()).Return(errors.Errorf("ignore it")).Times(1)
+			mockManifestsApi.EXPECT().DeleteClusterManifestInternal(gomock.Any(), gomock.Any()).Return(errors.New("ignore it")).Times(1)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:         backEndCluster.ID,
@@ -2287,12 +3255,17 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, cm2)).To(BeNil())
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockManifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), true).Return(nil, nil).Times(2)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:         backEndCluster.ID,
@@ -2352,11 +3325,14 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, cm2)).To(BeNil())
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			cluster = getTestCluster()
 			aci.Spec.ManifestsConfigMapRefs = refs
@@ -2364,7 +3340,7 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
 
 			aci = getTestClusterInstall()
 			expectedState := fmt.Sprintf("%s Conflict in manifest names ('%s' is not unique)", hiveext.ClusterBackendErrorMsg, manifestName)
@@ -2411,11 +3387,14 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(c.Create(ctx, cm2)).To(BeNil())
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
-			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			cluster = getTestCluster()
 			aci.Spec.ManifestsConfigMapRefs = refs
@@ -2423,7 +3402,7 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
-			Expect(result).To(Equal(ctrl.Result{Requeue: true, RequeueAfter: longerRequeueAfterOnError}))
+			Expect(result).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
 
 			aci = getTestClusterInstall()
 			expectedState := fmt.Sprintf("%s configmaps \"%s\" not found", hiveext.ClusterBackendErrorMsg, configMapName1)
@@ -2438,11 +3417,15 @@ var _ = Describe("cluster reconcile", func() {
 		It("install cluster with API VIP and Ingress VIP", func() {
 			backEndCluster.Status = swag.String(models.ClusterStatusReady)
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(1)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(true, "").Times(1)
 			mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(5, 5, nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockManifestsApi.EXPECT().ListClusterManifestsInternal(gomock.Any(), gomock.Any()).Return(models.ListManifests{}, nil).Times(1)
+
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleMaster, true).Return(swag.Int64(3), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleWorker, true).Return(swag.Int64(2), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(*backEndCluster.ID, models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			installClusterReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -2471,7 +3454,7 @@ var _ = Describe("cluster reconcile", func() {
 	})
 
 	It("reconcile on installed sno cluster should not return an error or requeue", func() {
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound).Times(1)
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		cluster := newClusterDeployment(clusterName, testNamespace,
 			getDefaultClusterDeploymentSpec(clusterName, agentClusterInstallName, pullSecretName))
 		Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -2482,7 +3465,7 @@ var _ = Describe("cluster reconcile", func() {
 		request := newClusterDeploymentRequest(cluster)
 		result, err := cr.Reconcile(ctx, request)
 		Expect(err).To(BeNil())
-		Expect(result.Requeue).To(BeFalse())
+		Expect(result.Requeue).To(BeFalse()) //nolint:staticcheck // Deprecated but require more changes
 	})
 
 	Context("cluster update", func() {
@@ -2524,6 +3507,9 @@ var _ = Describe("cluster reconcile", func() {
 
 			aci = newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+			Expect(c.Create(ctx, imageSet)).To(BeNil())
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		})
 
 		It("update pull-secret network cidr and cluster name", func() {
@@ -2542,8 +3528,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: "different-pull-secret",
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
 			updateReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:         &sId,
@@ -2552,8 +3539,8 @@ var _ = Describe("cluster reconcile", func() {
 				},
 				PullSecret: testPullSecretVal,
 			}
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-				Do(func(ctx context.Context, param installer.V2UpdateClusterParams) {
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(swag.StringValue(param.ClusterUpdateParams.PullSecret)).To(Equal(testPullSecretVal))
 					Expect(swag.StringValue(param.ClusterUpdateParams.Name)).To(Equal(defaultClusterSpec.ClusterName))
 					Expect(string(param.ClusterUpdateParams.ClusterNetworks[0].Cidr)).
@@ -2593,12 +3580,13 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
 			updateReply := getDefaultTestCluster()
 
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-				Do(func(ctx context.Context, param installer.V2UpdateClusterParams) {
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(swag.StringValue(param.ClusterUpdateParams.HTTPProxy)).To(Equal(httpProxy))
 					Expect(swag.StringValue(param.ClusterUpdateParams.HTTPSProxy)).To(Equal(httpsProxy))
 					Expect(swag.StringValue(param.ClusterUpdateParams.NoProxy)).To(Equal(noProxy))
@@ -2617,6 +3605,85 @@ var _ = Describe("cluster reconcile", func() {
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterNotReadyReason))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(hiveext.ClusterNotReadyMsg))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+		})
+
+		It("update cluster with exclusive ntpSources", func() {
+			backEndCluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &sId,
+					Name:             clusterName,
+					OpenshiftVersion: "4.8",
+					ClusterNetworks:  clusterNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ClusterNetwork),
+					ServiceNetworks:  serviceNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ServiceNetwork),
+					NetworkType:      swag.String(models.ClusterNetworkTypeOpenShiftSDN),
+					Status:           swag.String(models.ClusterStatusInsufficient),
+					IngressVips:      common.TestIPv4Networking.IngressVips,
+					APIVips:          common.TestIPv4Networking.APIVips,
+					BaseDNSDomain:    defaultClusterSpec.BaseDomain,
+					SSHPublicKey:     defaultAgentClusterInstallSpec.SSHPublicKey,
+				},
+				PullSecret: testPullSecretVal,
+			}
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			updateReply := getDefaultTestCluster()
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(swag.StringValue(param.ClusterUpdateParams.NtpSources)).To(Equal("ntp1.example.com,ntp2.example.com"))
+				}).Return(updateReply, nil)
+
+			aci.Spec.NTPSources = []string{"ntp1.example.com", "ntp2.example.com"}
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
+		})
+
+		It("remove ntpSources from spec clears ntpSources in backend", func() {
+			backEndCluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &sId,
+					Name:             clusterName,
+					OpenshiftVersion: "4.8",
+					ClusterNetworks:  clusterNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ClusterNetwork),
+					ServiceNetworks:  serviceNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ServiceNetwork),
+					NetworkType:      swag.String(models.ClusterNetworkTypeOpenShiftSDN),
+					Status:           swag.String(models.ClusterStatusInsufficient),
+					IngressVips:      common.TestIPv4Networking.IngressVips,
+					APIVips:          common.TestIPv4Networking.APIVips,
+					BaseDNSDomain:    defaultClusterSpec.BaseDomain,
+					SSHPublicKey:     defaultAgentClusterInstallSpec.SSHPublicKey,
+					NtpSources:       "old-ntp.example.com",
+				},
+				PullSecret: testPullSecretVal,
+			}
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			updateReply := getDefaultTestCluster()
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(param.ClusterUpdateParams.NtpSources).To(Equal(swag.String("")))
+				}).Return(updateReply, nil)
+
+			aci.Spec.NTPSources = nil
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
 		})
 
 		It("update disk encryption configuration", func() {
@@ -2638,8 +3705,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
 			updateReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:     &sId,
@@ -2653,8 +3721,8 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-				Do(func(ctx context.Context, param installer.V2UpdateClusterParams) {
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(param.ClusterUpdateParams.DiskEncryption).NotTo(BeNil())
 					Expect(swag.StringValue(param.ClusterUpdateParams.DiskEncryption.EnableOn)).To(Equal(models.DiskEncryptionEnableOnMasters))
 					Expect(swag.StringValue(param.ClusterUpdateParams.DiskEncryption.Mode)).To(Equal(models.DiskEncryptionModeTang))
@@ -2681,6 +3749,10 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		Context("Networks", func() {
+			BeforeEach(func() {
+				mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+			})
+
 			tests := []struct {
 				name                    string
 				specMachineNetworks     []hiveext.MachineNetworkEntry
@@ -2738,7 +3810,7 @@ var _ = Describe("cluster reconcile", func() {
 					}
 					backEndCluster.MachineNetworks = test.dbMachineNetworks
 					mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-					mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+					mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 					mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 
 					aci.Spec.Networking.MachineNetwork = test.specMachineNetworks
@@ -2748,11 +3820,13 @@ var _ = Describe("cluster reconcile", func() {
 						updateReply := getDefaultTestCluster()
 						updateReply.MachineNetworks = machineNetworksEntriesToArray(test.expectedMachineNetworks)
 
-						mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-							Do(func(ctx context.Context, param installer.V2UpdateClusterParams) {
+						mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+							Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 								Expect(param.ClusterUpdateParams.MachineNetworks).Should(
 									Equal(machineNetworksEntriesToArray(test.expectedMachineNetworks)))
 							}).Return(updateReply, nil)
+					} else {
+						mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 					}
 
 					request := newClusterDeploymentRequest(cluster)
@@ -2767,6 +3841,8 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("only state changed", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:               &sId,
@@ -2787,8 +3863,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			mockClusterApi.EXPECT().IsReadyForInstallation(gomock.Any()).Return(false, "").Times(1)
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
@@ -2804,9 +3881,12 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("failed getting cluster", func() {
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 			expectedErr := "some internal error"
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).
-				Return(nil, errors.Errorf(expectedErr))
+				Return(nil, errors.New(expectedErr))
 
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
@@ -2820,6 +3900,8 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("update internal error", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:               &sId,
@@ -2833,11 +3915,11 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: "different-pull-secret",
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 			errString := "update internal error"
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-				Return(nil, errors.Errorf(errString))
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, errors.New(errString))
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -2847,10 +3929,13 @@ var _ = Describe("cluster reconcile", func() {
 			expectedState := fmt.Sprintf("%s %s", hiveext.ClusterBackendErrorMsg, errString)
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterBackendErrorReason))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Status).To(Equal(corev1.ConditionFalse))
+			fmt.Fprintln(GinkgoWriter, FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message)
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(Equal(expectedState))
 		})
 
 		It("add install config overrides annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:               &sId,
@@ -2869,8 +3954,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			installConfigOverrides := `{"controlPlane": {"hyperthreading": "Disabled"}}`
 			updateReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -2895,6 +3981,8 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("Remove existing install config overrides annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:                     &sId,
@@ -2914,7 +4002,7 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			updateReply := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:                     &sId,
@@ -2923,6 +4011,7 @@ var _ = Describe("cluster reconcile", func() {
 				},
 				PullSecret: testPullSecretVal,
 			}
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			mockInstallerInternal.EXPECT().UpdateClusterInstallConfigInternal(gomock.Any(), gomock.Any()).
 				Do(func(ctx context.Context, param installer.V2UpdateClusterInstallConfigParams) {
 					Expect(param.ClusterID).To(Equal(sId))
@@ -2936,6 +4025,8 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("Update install config overrides annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:                     &sId,
@@ -2955,8 +4046,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			installConfigOverrides := `{"controlPlane": {"hyperthreading": "Enabled"}}`
 			updateReply := &common.Cluster{
 				Cluster: models.Cluster{
@@ -2981,6 +4073,8 @@ var _ = Describe("cluster reconcile", func() {
 		})
 
 		It("invalid install config overrides annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
 					ID:               &sId,
@@ -2999,8 +4093,9 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 			installConfigOverrides := `{{{"controlPlane": ""`
 			mockInstallerInternal.EXPECT().UpdateClusterInstallConfigInternal(gomock.Any(), gomock.Any()).
 				Do(func(ctx context.Context, param installer.V2UpdateClusterInstallConfigParams) {
@@ -3015,10 +4110,296 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(cluster)
 			_, err := cr.Reconcile(ctx, request)
 			Expect(err).ShouldNot(HaveOccurred())
-			aci := getTestClusterInstall()
+			aci = getTestClusterInstall()
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
 			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring(
 				"Failed to parse 'agent-install.openshift.io/install-config-overrides' annotation"))
+		})
+
+		It("update to user managed load balancer when there is no load balancer", func() {
+			backEndCluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &sId,
+					Name:             "different-cluster-name",
+					OpenshiftVersion: common.MinimumVersionForUserManagedLoadBalancerFeature,
+					Status:           swag.String(models.ClusterStatusPendingForInput),
+				},
+			}
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			updateReply := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:           &sId,
+					Status:       swag.String(models.ClusterStatusInsufficient),
+					StatusInfo:   swag.String(models.ClusterStatusInsufficient),
+					LoadBalancer: &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				},
+			}
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(param.ClusterUpdateParams.LoadBalancer).ToNot(BeNil())
+					Expect(param.ClusterUpdateParams.LoadBalancer.Type).To(Equal(models.LoadBalancerTypeUserManaged))
+				}).Return(updateReply, nil)
+
+			aci.Spec.LoadBalancer = &hiveext.LoadBalancer{Type: hiveext.LoadBalancerTypeUserManaged}
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterNotReadyReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(hiveext.ClusterNotReadyMsg))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+		})
+
+		It("update to user managed load balancer when there is cluster managed load balancer", func() {
+			backEndCluster := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:               &sId,
+					Name:             "different-cluster-name",
+					OpenshiftVersion: common.MinimumVersionForUserManagedLoadBalancerFeature,
+					Status:           swag.String(models.ClusterStatusPendingForInput),
+					LoadBalancer:     &models.LoadBalancer{Type: models.LoadBalancerTypeClusterManaged},
+				},
+			}
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
+			updateReply := &common.Cluster{
+				Cluster: models.Cluster{
+					ID:           &sId,
+					Status:       swag.String(models.ClusterStatusInsufficient),
+					StatusInfo:   swag.String(models.ClusterStatusInsufficient),
+					LoadBalancer: &models.LoadBalancer{Type: models.LoadBalancerTypeUserManaged},
+				},
+			}
+
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(param.ClusterUpdateParams.LoadBalancer).ToNot(BeNil())
+					Expect(param.ClusterUpdateParams.LoadBalancer.Type).To(Equal(models.LoadBalancerTypeUserManaged))
+				}).Return(updateReply, nil)
+
+			aci.Spec.LoadBalancer = &hiveext.LoadBalancer{Type: hiveext.LoadBalancerTypeUserManaged}
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterSyncedOkReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Reason).To(Equal(hiveext.ClusterNotReadyReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Message).To(Equal(hiveext.ClusterNotReadyMsg))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterRequirementsMetCondition).Status).To(Equal(corev1.ConditionFalse))
+		})
+
+		It("add ignored cluster validations annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
+					Expect(clusterID).To(Equal(sId))
+					Expect(ignoredCluster).To(Equal(`["dns-domain-defined","ntp-server-configured"]`))
+					Expect(ignoredHost).To(Equal(""))
+				}).Return(nil)
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredClusterValidationsAnnotation: "dns-domain-defined,ntp-server-configured",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("add ignored host validations annotation", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
+					Expect(clusterID).To(Equal(sId))
+					Expect(ignoredCluster).To(Equal(""))
+					Expect(ignoredHost).To(Equal(`["has-cpu-cores-for-role","has-memory-for-role"]`))
+				}).Return(nil)
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredHostValidationsAnnotation: "has-cpu-cores-for-role,has-memory-for-role",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("add both ignored cluster and host validations annotations", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
+					Expect(clusterID).To(Equal(sId))
+					Expect(ignoredCluster).To(Equal(`["dns-domain-defined"]`))
+					Expect(ignoredHost).To(Equal(`["has-cpu-cores-for-role"]`))
+				}).Return(nil)
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredClusterValidationsAnnotation: "dns-domain-defined",
+				IgnoredHostValidationsAnnotation:    "has-cpu-cores-for-role",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("remove ignored validations annotation clears ignored validations", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			backEndCluster.IgnoredClusterValidations = `["dns-domain-defined"]`
+			backEndCluster.IgnoredHostValidations = `["has-cpu-cores-for-role"]`
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
+					Expect(clusterID).To(Equal(sId))
+					Expect(ignoredCluster).To(Equal(""))
+					Expect(ignoredHost).To(Equal(""))
+				}).Return(nil)
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("empty annotation explicitly overrides with empty JSON array", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			backEndCluster.IgnoredClusterValidations = `["dns-domain-defined"]`
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, clusterID strfmt.UUID, ignoredCluster, ignoredHost string) {
+					Expect(clusterID).To(Equal(sId))
+					Expect(ignoredCluster).To(Equal("[]"))
+					Expect(ignoredHost).To(Equal(""))
+				}).Return(nil)
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredClusterValidationsAnnotation: "",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("no change in ignored validations does not call SetIgnoredValidationsInternal", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+		})
+
+		It("invalid ignored validations annotation reports an input error", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredClusterValidationsAnnotation: "dns-domain-defined,,ntp-server-configured",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring(
+				"Failed to parse 'agent-install.openshift.io/ignored-cluster-validations' annotation"))
+		})
+
+		It("unknown validation ID in annotation is rejected by the service", func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
+			backEndCluster := getDefaultTestCluster()
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+
+			mockInstallerInternal.EXPECT().SetIgnoredValidationsInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(common.NewApiError(http.StatusBadRequest, errors.New("Validation ID 'not-a-real-validation' is not a known cluster validation")))
+
+			aci.ObjectMeta.SetAnnotations(map[string]string{
+				IgnoredClusterValidationsAnnotation: "not-a-real-validation",
+			})
+			Expect(c.Update(ctx, aci)).Should(BeNil())
+
+			request := newClusterDeploymentRequest(cluster)
+			result, err := cr.Reconcile(ctx, request)
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			aci = getTestClusterInstall()
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Reason).To(Equal(hiveext.ClusterInputErrorReason))
+			Expect(FindStatusCondition(aci.Status.Conditions, hiveext.ClusterSpecSyncedCondition).Message).To(ContainSubstring(
+				"not a known cluster validation"))
 		})
 	})
 
@@ -3030,6 +4411,7 @@ var _ = Describe("cluster reconcile", func() {
 		BeforeEach(func() {
 			id := uuid.New()
 			sId = strfmt.UUID(id.String())
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		})
 
 		It("SSHPublicKey in ClusterDeployment has spaces in suffix", func() {
@@ -3051,11 +4433,14 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
+
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
-
+			imageSetName := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+			Expect(c.Create(ctx, imageSetName)).To(BeNil())
 			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
 
@@ -3074,28 +4459,28 @@ var _ = Describe("cluster reconcile", func() {
 			hostIP := "1.2.3.4"
 			backEndCluster := &common.Cluster{
 				Cluster: models.Cluster{
-					ID:                   &sId,
-					Name:                 clusterName,
-					OpenshiftVersion:     "4.8",
-					ClusterNetworks:      clusterNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ClusterNetwork),
-					ServiceNetworks:      serviceNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ServiceNetwork),
-					NetworkType:          swag.String(models.ClusterNetworkTypeOVNKubernetes),
-					Status:               swag.String(models.ClusterStatusInstalling),
-					IngressVips:          []*models.IngressVip{{ClusterID: sId, IP: models.IP(hostIP)}},
-					APIVips:              []*models.APIVip{{ClusterID: sId, IP: models.IP(hostIP)}},
-					BaseDNSDomain:        defaultClusterSpec.BaseDomain,
-					SSHPublicKey:         defaultAgentClusterInstallSpec.SSHPublicKey,
-					Hyperthreading:       models.ClusterHyperthreadingAll,
-					HighAvailabilityMode: swag.String(models.ClusterHighAvailabilityModeNone),
+					ID:                &sId,
+					Name:              clusterName,
+					OpenshiftVersion:  "4.8",
+					ClusterNetworks:   clusterNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ClusterNetwork),
+					ServiceNetworks:   serviceNetworksEntriesToArray(defaultAgentClusterInstallSpec.Networking.ServiceNetwork),
+					NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
+					Status:            swag.String(models.ClusterStatusInstalling),
+					IngressVips:       []*models.IngressVip{{ClusterID: sId, IP: models.IP(hostIP)}},
+					APIVips:           []*models.APIVip{{ClusterID: sId, IP: models.IP(hostIP)}},
+					BaseDNSDomain:     defaultClusterSpec.BaseDomain,
+					SSHPublicKey:      defaultAgentClusterInstallSpec.SSHPublicKey,
+					Hyperthreading:    models.ClusterHyperthreadingAll,
+					ControlPlaneCount: 1,
 				},
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader("kubeconfig")), int64(len("kubeconfig")), nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).
-				Do(func(ctx context.Context, param installer.V2UpdateClusterParams) {
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, param installer.V2UpdateClusterParams, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(len(param.ClusterUpdateParams.APIVips)).To(Equal(1))
 					Expect(len(param.ClusterUpdateParams.IngressVips)).To(Equal(1))
 					Expect(param.ClusterUpdateParams.APIVips[0].IP).To(Equal(common.TestIPv4Networking.APIVips[0].IP))
@@ -3104,6 +4489,8 @@ var _ = Describe("cluster reconcile", func() {
 
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
+			imageSetName := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+			Expect(c.Create(ctx, imageSetName)).To(BeNil())
 
 			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -3139,12 +4526,15 @@ var _ = Describe("cluster reconcile", func() {
 				PullSecret: testPullSecretVal,
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader("kubeconfig")), int64(len("kubeconfig")), nil).Times(1)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil)
 
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
+			imageSetName := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+			Expect(c.Create(ctx, imageSetName)).To(BeNil())
 
 			cluster := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			Expect(c.Create(ctx, cluster)).ShouldNot(HaveOccurred())
@@ -3168,15 +4558,15 @@ var _ = Describe("cluster reconcile", func() {
 		BeforeEach(func() {
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
-			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
-			Expect(c.Create(ctx, imageSet)).To(BeNil())
 			cluster = newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			cluster.Spec.Installed = true
 			Expect(c.Create(ctx, cluster)).To(BeNil())
 			aci = newAgentClusterInstall(agentClusterInstallName, testNamespace, defaultAgentClusterInstallSpec, cluster)
 			Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
 
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		})
 
 		It("success", func() {
@@ -3194,9 +4584,14 @@ var _ = Describe("cluster reconcile", func() {
 				},
 			}
 
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(clusterReply, nil).AnyTimes()
+
 			V2ImportClusterInternal := func(ctx context.Context, kubeKey *types.NamespacedName, id *strfmt.UUID,
 				params installer.V2ImportClusterParams) (*common.Cluster, error) {
 				Expect(string(*params.NewImportClusterParams.OpenshiftClusterID)).To(Equal(cid))
+				// OpenshiftVersion is not populated for installed clusters since ClusterImageSet
+				// resolution is skipped (the ImageSetRef may reference a stale/deleted ClusterImageSet)
+				Expect(params.NewImportClusterParams.OpenshiftVersion).To(Equal(""))
 				return clusterReply, nil
 			}
 			mockInstallerInternal.EXPECT().
@@ -3204,6 +4599,7 @@ var _ = Describe("cluster reconcile", func() {
 				DoAndReturn(V2ImportClusterInternal)
 
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
+
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -3216,7 +4612,7 @@ var _ = Describe("cluster reconcile", func() {
 		It("failure creating cluster", func() {
 			mockInstallerInternal.EXPECT().
 				V2ImportClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-				Return(nil, errors.Errorf("failed to import cluster"))
+				Return(nil, errors.New("failed to import cluster"))
 
 			request := newClusterDeploymentRequest(cluster)
 			result, err := cr.Reconcile(ctx, request)
@@ -3251,10 +4647,10 @@ var _ = Describe("cluster reconcile", func() {
 		}
 
 		BeforeEach(func() {
+			mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
+
 			pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 			Expect(c.Create(ctx, pullSecret)).To(BeNil())
-			imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
-			Expect(c.Create(ctx, imageSet)).To(BeNil())
 			clusterDeployment = newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
 			clusterDeployment.Spec.Installed = true
 			Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
@@ -3269,8 +4665,8 @@ var _ = Describe("cluster reconcile", func() {
 				},
 			}
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(cluster, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any()).Return(cluster, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(cluster, nil)
 			mockInstallerInternal.EXPECT().HostWithCollectedLogsExists(gomock.Any()).Return(false, nil)
 			mockClientFactory = spoke_k8s_client.NewMockSpokeK8sClientFactory(mockCtrl)
 			cr.SpokeK8sClientFactory = mockClientFactory
@@ -3348,7 +4744,7 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(clusterDeployment)
 			createKubeconfigSecret()
 			mockClient := spoke_k8s_client.NewMockSpokeK8sClient(mockCtrl)
-			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any()).Return(mockClient, nil).AnyTimes()
+			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any(), gomock.Any()).Return(mockClient, nil).AnyTimes()
 			mockClient.EXPECT().PatchMachineConfigPoolPaused(gomock.Any(), true, "worker").Return(nil)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -3376,7 +4772,7 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(clusterDeployment)
 			createKubeconfigSecret()
 			mockClient := spoke_k8s_client.NewMockSpokeK8sClient(mockCtrl)
-			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any()).Return(mockClient, nil).AnyTimes()
+			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any(), gomock.Any()).Return(mockClient, nil).AnyTimes()
 			mockClient.EXPECT().PatchMachineConfigPoolPaused(gomock.Any(), false, "worker").Return(nil)
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
@@ -3406,8 +4802,10 @@ var _ = Describe("cluster reconcile", func() {
 			request := newClusterDeploymentRequest(clusterDeployment)
 			createKubeconfigSecret()
 			mockClient := spoke_k8s_client.NewMockSpokeK8sClient(mockCtrl)
-			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any()).Return(mockClient, nil).AnyTimes()
+			mockClientFactory.EXPECT().CreateFromSecret(gomock.Any(), gomock.Any()).Return(mockClient, nil).AnyTimes()
 			mockClient.EXPECT().PatchMachineConfigPoolPaused(gomock.Any(), true, "worker").Return(nil)
+			mockVersions.EXPECT().GetReleaseImageByURL(gomock.Any(), gomock.Any(), gomock.Any()).Return(releaseImage, nil).AnyTimes()
+
 			result, err := cr.Reconcile(ctx, request)
 			Expect(err).To(BeNil())
 			Expect(result).To(Equal(ctrl.Result{}))
@@ -3426,27 +4824,41 @@ var _ = Describe("TestConditions", func() {
 		clusterKey             types.NamespacedName
 		agentClusterInstallKey types.NamespacedName
 		mockInstallerInternal  *bminventory.MockInstallerInternals
+		mockMirrorRegistries   *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
+		imageSetName           = "openshift-v4.8.0"
+		releaseImageUrl        = "quay.io/openshift-release-dev/ocp-release:4.8.0-x86_64"
+		mockVersions           *versions.MockHandler
+		mockClusterApi         *cluster.MockAPI
 	)
 
 	BeforeEach(func() {
 		c = fakeclient.NewClientBuilder().WithScheme(scheme.Scheme).
 			WithStatusSubresource(&hiveext.AgentClusterInstall{}).Build()
 		mockCtrl = gomock.NewController(GinkgoT())
+		mockVersions = versions.NewMockHandler(mockCtrl)
+		mockMirrorRegistries = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(mockCtrl)
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
-		mockClusterApi := cluster.NewMockAPI(mockCtrl)
+		mockClusterApi = cluster.NewMockAPI(mockCtrl)
 		cr = &ClusterDeploymentsReconciler{
-			Client:            c,
-			APIReader:         c,
-			Scheme:            scheme.Scheme,
-			Log:               common.GetTestLog(),
-			Installer:         mockInstallerInternal,
-			ClusterApi:        mockClusterApi,
-			PullSecretHandler: NewPullSecretHandler(c, c, mockInstallerInternal),
+			Client:                        c,
+			APIReader:                     c,
+			Scheme:                        scheme.Scheme,
+			Log:                           common.GetTestLog(),
+			Installer:                     mockInstallerInternal,
+			ClusterApi:                    mockClusterApi,
+			PullSecretHandler:             NewPullSecretHandler(c, c, mockInstallerInternal),
+			MirrorRegistriesConfigBuilder: mockMirrorRegistries,
+			VersionsHandler:               mockVersions,
 		}
+		clusterID := strfmt.UUID(uuid.New().String())
 		backEndCluster = &common.Cluster{
 			Cluster: models.Cluster{
 				OpenshiftVersion: arbitraryOCPVersion,
+				ID:               &clusterID,
 			}}
+
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(backEndCluster, nil).AnyTimes()
 		clusterKey = types.NamespacedName{
 			Namespace: testNamespace,
 			Name:      "clusterDeployment",
@@ -3463,6 +4875,14 @@ var _ = Describe("TestConditions", func() {
 		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
 		clusterRequest = newClusterDeploymentRequest(clusterDeployment)
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		kubeconfigNoIngress := "kubeconfig content NOINGRESS"
+		mockInstallerInternal.EXPECT().V2DownloadClusterCredentialsInternal(gomock.Any(), gomock.Any()).Return(io.NopCloser(strings.NewReader(kubeconfigNoIngress)), int64(len(kubeconfigNoIngress)), nil).AnyTimes()
+
+		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+		imageSetName := getDefaultTestImageSet(imageSetName, releaseImageUrl)
+		Expect(c.Create(ctx, imageSetName)).To(BeNil())
 	})
 
 	AfterEach(func() {
@@ -3758,6 +5178,11 @@ var _ = Describe("TestConditions", func() {
 			if t.clusterStatus == models.ClusterStatusReady {
 				mockInstallerInternal.EXPECT().GetKnownHostApprovedCounts(gomock.Any()).Return(0, 0, nil).Times(1)
 			}
+
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleMaster, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleWorker, true).Return(swag.Int64(0), nil).AnyTimes()
+			mockClusterApi.EXPECT().GetHostCountByRole(gomock.Any(), models.HostRoleArbiter, true).Return(swag.Int64(0), nil).AnyTimes()
+
 			_, err := cr.Reconcile(ctx, clusterRequest)
 			Expect(err).To(BeNil())
 			cluster := &hivev1.ClusterDeployment{}
@@ -3777,130 +5202,130 @@ var _ = Describe("TestConditions", func() {
 
 var _ = Describe("selectClusterNetworkType", func() {
 	tests := []struct {
-		clusterServiceNetworks    []*models.ServiceNetwork
-		paramServiceNetworks      []*models.ServiceNetwork
-		paramHighAvailabilityMode string
-		resultNetworkType         string
-		openShiftVersion          string
+		clusterServiceNetworks []*models.ServiceNetwork
+		paramServiceNetworks   []*models.ServiceNetwork
+		paramControlPlaneCount int64
+		resultNetworkType      string
+		openShiftVersion       string
 	}{
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      []*models.ServiceNetwork{},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.3-ec",
-			resultNetworkType:         models.ClusterNetworkTypeOpenShiftSDN,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   []*models.ServiceNetwork{},
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.3-ec",
+			resultNetworkType:      models.ClusterNetworkTypeOpenShiftSDN,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      []*models.ServiceNetwork{},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.10.7-fc.5",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   []*models.ServiceNetwork{},
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.10.7-fc.5",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      []*models.ServiceNetwork{},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.9-rc.4",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   []*models.ServiceNetwork{},
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.9-rc.4",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      []*models.ServiceNetwork{},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   []*models.ServiceNetwork{},
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOpenShiftSDN,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOpenShiftSDN,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOpenShiftSDN,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOpenShiftSDN,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOpenShiftSDN,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOpenShiftSDN,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv6Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv6Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    []*models.ServiceNetwork{{Cidr: "1002:db8::/119"}},
-			paramServiceNetworks:      []*models.ServiceNetwork{{Cidr: "1003:db8::/119"}},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: []*models.ServiceNetwork{{Cidr: "1002:db8::/119"}},
+			paramServiceNetworks:   []*models.ServiceNetwork{{Cidr: "1003:db8::/119"}},
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    []*models.ServiceNetwork{{Cidr: "1002:db8::/119"}},
-			paramServiceNetworks:      []*models.ServiceNetwork{{Cidr: "1003:db8::/119"}},
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: []*models.ServiceNetwork{{Cidr: "1002:db8::/119"}},
+			paramServiceNetworks:   []*models.ServiceNetwork{{Cidr: "1003:db8::/119"}},
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.12.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.12.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.12.0-0.0",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.12.0-0.0",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.12.0-ec.3",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.12.0-ec.3",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeFull,
-			openShiftVersion:          "4.11.0-ec.3",
-			resultNetworkType:         models.ClusterNetworkTypeOpenShiftSDN,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
+			openShiftVersion:       "4.11.0-ec.3",
+			resultNetworkType:      models.ClusterNetworkTypeOpenShiftSDN,
 		},
 		{
-			clusterServiceNetworks:    common.TestIPv4Networking.ServiceNetworks,
-			paramServiceNetworks:      common.TestIPv4Networking.ServiceNetworks,
-			paramHighAvailabilityMode: models.ClusterHighAvailabilityModeNone,
-			openShiftVersion:          "4.11.0-ec.3",
-			resultNetworkType:         models.ClusterNetworkTypeOVNKubernetes,
+			clusterServiceNetworks: common.TestIPv4Networking.ServiceNetworks,
+			paramServiceNetworks:   common.TestIPv4Networking.ServiceNetworks,
+			paramControlPlaneCount: 1,
+			openShiftVersion:       "4.11.0-ec.3",
+			resultNetworkType:      models.ClusterNetworkTypeOVNKubernetes,
 		},
 	}
 	for i := range tests {
@@ -3911,11 +5336,11 @@ var _ = Describe("selectClusterNetworkType", func() {
 			}
 
 			cluster := &common.Cluster{Cluster: models.Cluster{
-				ServiceNetworks:      t.clusterServiceNetworks,
-				ClusterNetworks:      common.TestIPv4Networking.ClusterNetworks,
-				MachineNetworks:      common.TestIPv4Networking.MachineNetworks,
-				HighAvailabilityMode: &t.paramHighAvailabilityMode,
-				OpenshiftVersion:     t.openShiftVersion,
+				ServiceNetworks:   t.clusterServiceNetworks,
+				ClusterNetworks:   common.TestIPv4Networking.ClusterNetworks,
+				MachineNetworks:   common.TestIPv4Networking.MachineNetworks,
+				ControlPlaneCount: t.paramControlPlaneCount,
+				OpenshiftVersion:  t.openShiftVersion,
 			}}
 			networkType, err := selectClusterNetworkType(ClusterUpdateParams, cluster)
 			Expect(err).To(BeNil())
@@ -4013,6 +5438,15 @@ var _ = Describe("unbindAgents", func() {
 		}
 		Expect(c.Create(ctx, infraEnv)).To(Succeed())
 
+		clusterDeployment := &hivev1.ClusterDeployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterReference.Namespace,
+				Name:      clusterReference.Name,
+			},
+			Spec: hivev1.ClusterDeploymentSpec{},
+		}
+		Expect(c.Create(ctx, clusterDeployment)).To(Succeed())
+
 		cdName := types.NamespacedName{
 			Name:      clusterReference.Name,
 			Namespace: clusterReference.Namespace,
@@ -4054,14 +5488,51 @@ var _ = Describe("unbindAgents", func() {
 		err = c.Get(ctx, types.NamespacedName{Name: "test-agent2", Namespace: testNamespace}, agent)
 		Expect(k8serrors.IsNotFound(err)).To(BeTrue())
 	})
+
+	It("deletes late bound agents when cluster deployment is preserved", func() {
+		infraEnv := &aiv1beta1.InfraEnv{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      infraEnvName,
+				Namespace: testNamespace,
+			},
+			Spec: aiv1beta1.InfraEnvSpec{ClusterRef: nil},
+		}
+		Expect(c.Create(ctx, infraEnv)).To(Succeed())
+
+		clusterDeployment := &hivev1.ClusterDeployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: clusterReference.Namespace,
+				Name:      clusterReference.Name,
+			},
+			Spec: hivev1.ClusterDeploymentSpec{
+				PreserveOnDelete: true,
+			},
+		}
+		Expect(c.Create(ctx, clusterDeployment)).To(Succeed())
+
+		cdName := types.NamespacedName{
+			Name:      clusterReference.Name,
+			Namespace: clusterReference.Namespace,
+		}
+		Expect(cr.unbindAgents(ctx, common.GetTestLog(), cdName)).To(Succeed())
+
+		agent := &aiv1beta1.Agent{}
+		err := c.Get(ctx, types.NamespacedName{Name: "test-agent1", Namespace: testNamespace}, agent)
+		Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+		agent = &aiv1beta1.Agent{}
+		err = c.Get(ctx, types.NamespacedName{Name: "test-agent2", Namespace: testNamespace}, agent)
+		Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	AfterEach(func() {
+		mockCtrl.Finish()
+	})
 })
 
 var _ = Describe("day2 cluster", func() {
 	var (
 		c                              client.Client
 		ctx                            = context.Background()
-		imageSetName                   = "openshift-v4.8.0"
-		releaseImageUrl                = "quay.io/openshift-release-dev/ocp-release:4.8.0-x86_64"
 		clusterKey                     types.NamespacedName
 		clusterName                    = "test-cluster"
 		agentClusterInstallName        = "test-cluster-aci"
@@ -4073,24 +5544,27 @@ var _ = Describe("day2 cluster", func() {
 		cr                             *ClusterDeploymentsReconciler
 		mockVersions                   *versions.MockHandler
 		dbCluster                      *common.Cluster
+		mockMirrorRegistries           *mirrorregistries.MockServiceMirrorRegistriesConfigBuilder
 	)
 
 	BeforeEach(func() {
 		mockCtrl = gomock.NewController(GinkgoT())
 		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
 		mockVersions = versions.NewMockHandler(mockCtrl)
-
+		mockMirrorRegistries = mirrorregistries.NewMockServiceMirrorRegistriesConfigBuilder(mockCtrl)
+		mockMirrorRegistries.EXPECT().IsMirrorRegistriesConfigured().AnyTimes().Return(false)
 		c = fakeclient.NewClientBuilder().WithScheme(scheme.Scheme).
 			WithStatusSubresource(&hiveext.AgentClusterInstall{}).Build()
 
 		cr = &ClusterDeploymentsReconciler{
-			Client:            c,
-			APIReader:         c,
-			Scheme:            scheme.Scheme,
-			Log:               common.GetTestLog(),
-			Installer:         mockInstallerInternal,
-			PullSecretHandler: NewPullSecretHandler(c, c, mockInstallerInternal),
-			VersionsHandler:   mockVersions,
+			Client:                        c,
+			APIReader:                     c,
+			Scheme:                        scheme.Scheme,
+			Log:                           common.GetTestLog(),
+			Installer:                     mockInstallerInternal,
+			PullSecretHandler:             NewPullSecretHandler(c, c, mockInstallerInternal),
+			VersionsHandler:               mockVersions,
+			MirrorRegistriesConfigBuilder: mockMirrorRegistries,
 		}
 
 		clusterKey = types.NamespacedName{
@@ -4100,9 +5574,6 @@ var _ = Describe("day2 cluster", func() {
 
 		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 		Expect(c.Create(ctx, pullSecret)).To(BeNil())
-
-		imageSet := getDefaultTestImageSet(imageSetName, releaseImageUrl)
-		Expect(c.Create(ctx, imageSet)).To(BeNil())
 
 		secretName := fmt.Sprintf(adminKubeConfigStringTemplate, clusterName)
 		adminKubeconfigSecret := &corev1.Secret{
@@ -4162,6 +5633,9 @@ var _ = Describe("day2 cluster", func() {
 
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
 		mockInstallerInternal.EXPECT().V2ImportClusterInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+		mockInstallerInternal.EXPECT().UpdateClusterNonInteractive(gomock.Any(), gomock.Any(), gomock.Any()).Return(dbCluster, nil)
 
 		By("first time will create the cluster")
 		request := newClusterDeploymentRequest(cd)
@@ -4170,7 +5644,6 @@ var _ = Describe("day2 cluster", func() {
 		Expect(result).To(Equal(ctrl.Result{}))
 
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(dbCluster, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 		mockInstallerInternal.EXPECT().GetKnownApprovedHosts(gomock.Any()).Return(nil, nil)
 		// expected not to be called
 		mockInstallerInternal.EXPECT().UpdateClusterInstallConfigInternal(gomock.Any(), gomock.Any()).Times(0)
@@ -4178,5 +5651,165 @@ var _ = Describe("day2 cluster", func() {
 		result, err = cr.Reconcile(ctx, request)
 		Expect(err).To(BeNil())
 		Expect(result).To(Equal(ctrl.Result{}))
+	})
+})
+
+var _ = Describe("mapConfigMapToClusterDeployment", func() {
+	var (
+		c                    client.Client
+		cr                   *ClusterDeploymentsReconciler
+		ctx                  = context.Background()
+		mockCtrl             *gomock.Controller
+		mockCRDEventsHandler *MockCRDEventsHandler
+	)
+
+	BeforeEach(func() {
+		c = fakeclient.NewClientBuilder().WithScheme(scheme.Scheme).
+			WithStatusSubresource(&hiveext.AgentClusterInstall{}).
+			WithIndex(&hiveext.AgentClusterInstall{}, ManifestConfigMapIndexField, indexManifestConfigMapNames).
+			Build()
+		mockCtrl = gomock.NewController(GinkgoT())
+		mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
+		cr = &ClusterDeploymentsReconciler{
+			Client:           c,
+			APIReader:        c,
+			Scheme:           scheme.Scheme,
+			Log:              common.GetTestLog(),
+			CRDEventsHandler: mockCRDEventsHandler,
+		}
+	})
+
+	AfterEach(func() {
+		mockCtrl.Finish()
+	})
+
+	It("enqueues ClusterDeployment when ConfigMap matches ManifestsConfigMapRefs", func() {
+		clusterName := "test-cd"
+		aciName := "test-aci"
+		cmName := "cni-manifests"
+
+		cd := newClusterDeployment(clusterName, testNamespace, getDefaultClusterDeploymentSpec(clusterName, aciName, "pull-secret"))
+		Expect(c.Create(ctx, cd)).ShouldNot(HaveOccurred())
+
+		aciSpec := getDefaultAgentClusterInstallSpec(clusterName)
+		aciSpec.ManifestsConfigMapRefs = []hiveext.ManifestsConfigMapReference{{Name: cmName}}
+		aci := newAgentClusterInstall(aciName, testNamespace, aciSpec, cd)
+		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cmName,
+				Namespace: testNamespace,
+			},
+		}
+
+		requests := cr.mapConfigMapToClusterDeployment(ctx, cm)
+		Expect(requests).To(HaveLen(1))
+		Expect(requests[0].Name).To(Equal(clusterName))
+		Expect(requests[0].Namespace).To(Equal(testNamespace))
+	})
+
+	It("returns empty when ConfigMap does not match any ACI", func() {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "unrelated-configmap",
+				Namespace: testNamespace,
+			},
+		}
+
+		requests := cr.mapConfigMapToClusterDeployment(ctx, cm)
+		Expect(requests).To(BeEmpty())
+	})
+
+	It("enqueues ClusterDeployment when ConfigMap matches deprecated ManifestsConfigMapRef", func() {
+		clusterName := "test-cd-legacy"
+		aciName := "test-aci-legacy"
+		cmName := "legacy-cni"
+
+		cd := newClusterDeployment(clusterName, testNamespace, getDefaultClusterDeploymentSpec(clusterName, aciName, "pull-secret"))
+		Expect(c.Create(ctx, cd)).ShouldNot(HaveOccurred())
+
+		aciSpec := getDefaultAgentClusterInstallSpec(clusterName)
+		aciSpec.ManifestsConfigMapRef = &corev1.LocalObjectReference{Name: cmName}
+		aci := newAgentClusterInstall(aciName, testNamespace, aciSpec, cd)
+		Expect(c.Create(ctx, aci)).ShouldNot(HaveOccurred())
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cmName,
+				Namespace: testNamespace,
+			},
+		}
+
+		requests := cr.mapConfigMapToClusterDeployment(ctx, cm)
+		Expect(requests).To(HaveLen(1))
+		Expect(requests[0].Name).To(Equal(clusterName))
+	})
+
+	It("enqueues multiple ClusterDeployments when ConfigMap is shared", func() {
+		cmName := "shared-cni"
+
+		cd1 := newClusterDeployment("cd-1", testNamespace, getDefaultClusterDeploymentSpec("cd-1", "aci-1", "pull-secret"))
+		Expect(c.Create(ctx, cd1)).ShouldNot(HaveOccurred())
+		aciSpec1 := getDefaultAgentClusterInstallSpec("cd-1")
+		aciSpec1.ManifestsConfigMapRefs = []hiveext.ManifestsConfigMapReference{{Name: cmName}}
+		aci1 := newAgentClusterInstall("aci-1", testNamespace, aciSpec1, cd1)
+		Expect(c.Create(ctx, aci1)).ShouldNot(HaveOccurred())
+
+		cd2 := newClusterDeployment("cd-2", testNamespace, getDefaultClusterDeploymentSpec("cd-2", "aci-2", "pull-secret"))
+		Expect(c.Create(ctx, cd2)).ShouldNot(HaveOccurred())
+		aciSpec2 := getDefaultAgentClusterInstallSpec("cd-2")
+		aciSpec2.ManifestsConfigMapRefs = []hiveext.ManifestsConfigMapReference{{Name: cmName}}
+		aci2 := newAgentClusterInstall("aci-2", testNamespace, aciSpec2, cd2)
+		Expect(c.Create(ctx, aci2)).ShouldNot(HaveOccurred())
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      cmName,
+				Namespace: testNamespace,
+			},
+		}
+
+		requests := cr.mapConfigMapToClusterDeployment(ctx, cm)
+		Expect(requests).To(HaveLen(2))
+		names := []string{requests[0].Name, requests[1].Name}
+		Expect(names).To(ContainElements("cd-1", "cd-2"))
+	})
+})
+
+var _ = Describe("indexManifestConfigMapNames", func() {
+	It("returns ConfigMap names from ManifestsConfigMapRefs", func() {
+		aci := &hiveext.AgentClusterInstall{
+			Spec: hiveext.AgentClusterInstallSpec{
+				ManifestsConfigMapRefs: []hiveext.ManifestsConfigMapReference{
+					{Name: "cm-a"},
+					{Name: "cm-b"},
+				},
+			},
+		}
+		result := indexManifestConfigMapNames(aci)
+		Expect(result).To(ConsistOf("cm-a", "cm-b"))
+	})
+
+	It("returns ConfigMap name from deprecated ManifestsConfigMapRef", func() {
+		aci := &hiveext.AgentClusterInstall{
+			Spec: hiveext.AgentClusterInstallSpec{
+				ManifestsConfigMapRef: &corev1.LocalObjectReference{Name: "legacy-cm"},
+			},
+		}
+		result := indexManifestConfigMapNames(aci)
+		Expect(result).To(ConsistOf("legacy-cm"))
+	})
+
+	It("returns nil when no ConfigMap refs are set", func() {
+		aci := &hiveext.AgentClusterInstall{}
+		result := indexManifestConfigMapNames(aci)
+		Expect(result).To(BeNil())
+	})
+
+	It("returns nil for non-ACI objects", func() {
+		cm := &corev1.ConfigMap{}
+		result := indexManifestConfigMapNames(cm)
+		Expect(result).To(BeNil())
 	})
 })

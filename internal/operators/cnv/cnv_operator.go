@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/lib/pq"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/hardware/virt"
-	"github.com/openshift/assisted-service/internal/oc"
 	"github.com/openshift/assisted-service/internal/operators/api"
-	"github.com/openshift/assisted-service/internal/operators/lso"
-	"github.com/openshift/assisted-service/internal/operators/lvm"
+	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	logutil "github.com/openshift/assisted-service/pkg/log"
@@ -25,12 +24,14 @@ const (
 	// Memory value provided in MiB
 	WorkerMemory int64 = 360
 	WorkerCPU    int64 = 2
+
+	clusterValidationID = string(models.ClusterValidationIDCnvRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDCnvRequirementsSatisfied)
 )
 
 type operator struct {
-	log       logrus.FieldLogger
-	config    Config
-	extracter oc.Extracter
+	log    logrus.FieldLogger
+	config Config
 }
 
 var Operator = models.MonitoredOperator{
@@ -39,15 +40,17 @@ var Operator = models.MonitoredOperator{
 	OperatorType:     models.OperatorTypeOlm,
 	SubscriptionName: "hco-operatorhub",
 	TimeoutSeconds:   60 * 60,
+	Bundles: pq.StringArray{
+		operatorscommon.BundleVirtualization.ID,
+	},
 }
 
 // NewCNVOperator creates new instance of a Container Native Virtualization installation plugin
-func NewCNVOperator(log logrus.FieldLogger, cfg Config, extracter oc.Extracter) *operator {
+func NewCNVOperator(log logrus.FieldLogger, cfg Config) *operator {
 	log.WithField("config", cfg).Infof("Configuring CNV Operator plugin")
 	return &operator{
-		log:       log,
-		config:    cfg,
-		extracter: extracter,
+		log:    log,
+		config: cfg,
 	}
 }
 
@@ -61,45 +64,49 @@ func (o *operator) GetFullName() string {
 }
 
 // GetDependencies provides a list of dependencies of the Operator
-func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	lsoOperator := []string{lso.Operator.Name}
-	if !common.IsSingleNodeCluster(cluster) || cluster.OpenshiftVersion == "" {
-		return lsoOperator, nil
-	}
-
-	if isGreaterOrEqual, _ := common.BaseVersionGreaterOrEqual(lvm.LvmsMinOpenshiftVersion4_12, cluster.OpenshiftVersion); isGreaterOrEqual {
-		return []string{lvm.Operator.Name}, nil
-	}
-
-	return lsoOperator, nil
+func (o *operator) GetDependencies(cluster *common.Cluster) []string {
+	return []string{}
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDCnvRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDCnvRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster verifies whether this operator is valid for given cluster
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
 	status, message := o.validateRequirements(&cluster.Cluster)
-	return api.ValidationResult{Status: status, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+	result := []api.ValidationResult{{
+		Status:       status,
+		ValidationId: clusterValidationID,
+	}}
+
+	if message != "" {
+		result[0].Reasons = []string{message}
+	}
+
+	return result, nil
 }
 
 func (o *operator) validateRequirements(cluster *models.Cluster) (api.ValidationStatus, string) {
 	if !featuresupport.IsFeatureCompatibleWithArchitecture(models.FeatureSupportLevelIDCNV, cluster.OpenshiftVersion, cluster.CPUArchitecture) {
 		return api.Failure, fmt.Sprintf(
-			"%s is supported only for %s CPU architecture.", o.GetFullName(), common.DefaultCPUArchitecture)
+			"%s is not supported for %s CPU architecture.", o.GetFullName(), cluster.CPUArchitecture)
 	}
 	return api.Success, ""
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and cpu
-func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host) (api.ValidationResult, error) {
+func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host, _ *models.ClusterHostRequirementsDetails) (api.ValidationResult, error) {
 	if host.Inventory == "" {
 		o.log.Info("Empty Inventory of host with hostID ", host.ID)
 		return api.ValidationResult{Status: api.Pending, ValidationId: o.GetHostValidationID(), Reasons: []string{"Missing Inventory in some of the hosts"}}, nil
@@ -135,14 +142,14 @@ func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, ho
 
 	cpu := requirements.CPUCores
 	if inventory.CPU.Count < cpu {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient CPU to deploy OpenShift Virtualization. Required CPU count is %d but found %d ", cpu, inventory.CPU.Count)}}, nil
+		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient CPU to deploy OpenShift Virtualization on the %s role, requires an additional %d CPU cores (included in the total required for the %s role) but found %d.", role, cpu, role, inventory.CPU.Count)}}, nil
 	}
 
 	mem := requirements.RAMMib
 	memBytes := conversions.MibToBytes(mem)
 	if inventory.Memory.UsableBytes < memBytes {
 		usableMemory := conversions.BytesToMib(inventory.Memory.UsableBytes)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient memory to deploy OpenShift Virtualization. Required memory is %d MiB but found %d MiB", mem, usableMemory)}}, nil
+		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{fmt.Sprintf("Insufficient memory to deploy OpenShift Virtualization on the %s role, requires an additional %d MiB (included in the total required for the %s role) but found %d MiB.", role, mem, role, usableMemory)}}, nil
 	}
 
 	// TODO: validate available devices on worker node like gpu and sr-iov and check whether there is enough memory to support them
@@ -171,11 +178,7 @@ func (o *operator) GetMonitoredOperator() *models.MonitoredOperator {
 // GetHostRequirements provides operator's requirements towards the host
 func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error) {
 	log := logutil.FromContext(ctx, o.log)
-	preflightRequirements, err := o.GetPreflightRequirements(ctx, cluster)
-	if err != nil {
-		log.WithError(err).Errorf("Cannot Retrieve preflight requirements for cluster %s", cluster.ID)
-		return nil, err
-	}
+	preflightRequirements := o.GetPreflightRequirements(ctx, cluster)
 
 	if common.IsSingleNodeCluster(cluster) {
 		overhead, err := o.getDevicesMemoryOverhead(host)
@@ -191,6 +194,8 @@ func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Clus
 	switch role {
 	case models.HostRoleMaster:
 		return preflightRequirements.Requirements.Master.Quantitative, nil
+	case models.HostRoleArbiter:
+		return &models.ClusterHostRequirementsDetails{}, nil
 	case models.HostRoleWorker, models.HostRoleAutoAssign:
 		return o.getWorkerRequirements(ctx, cluster, host, preflightRequirements)
 	}
@@ -212,7 +217,7 @@ func (o *operator) getWorkerRequirements(ctx context.Context, cluster *common.Cl
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-func (o *operator) GetPreflightRequirements(_ context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error) {
+func (o *operator) GetPreflightRequirements(_ context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
 	qualitativeRequirements := []string{
 		"Additional 1GiB of RAM per each supported GPU",
 		"Additional 1GiB of RAM per each supported SR-IOV NIC",
@@ -222,13 +227,9 @@ func (o *operator) GetPreflightRequirements(_ context.Context, cluster *common.C
 		qualitativeRequirements = append(qualitativeRequirements, fmt.Sprintf("Additional disk with %d Gi", o.config.SNOPoolSizeRequestHPPGib))
 	}
 
-	cnvODependencies, err := o.GetDependencies(cluster)
-	if err != nil {
-		return &models.OperatorHardwareRequirements{}, err
-	}
 	requirements := models.OperatorHardwareRequirements{
 		OperatorName: o.GetName(),
-		Dependencies: cnvODependencies,
+		Dependencies: o.GetDependencies(cluster),
 		Requirements: &models.HostTypeHardwareRequirementsWrapper{
 			Master: &models.HostTypeHardwareRequirements{
 				Qualitative: qualitativeRequirements,
@@ -252,7 +253,7 @@ func (o *operator) GetPreflightRequirements(_ context.Context, cluster *common.C
 		requirements.Requirements.Master.Quantitative.RAMMib += WorkerMemory
 	}
 
-	return &requirements, nil
+	return &requirements
 }
 
 func (o *operator) getDevicesMemoryOverhead(host *models.Host) (int64, error) {
@@ -325,4 +326,9 @@ func validDiscoverableSNODisk(disks []*models.Disk, installationDiskID string, d
 
 func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDCNV
+}
+
+// GetBundleLabels returns the bundle labels for the Authorino operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	return []string(Operator.Bundles)
 }

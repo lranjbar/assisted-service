@@ -11,7 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	. "github.com/onsi/gomega"
-	"github.com/ory/dockertest/v3"
+	dbpkg "github.com/openshift/assisted-service/pkg/db"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -32,11 +32,11 @@ import (
 		* k8s cluster
 		* if k8s connection is not available try to run it as docker container
 
-		When SKIP_UT_DB env var is set localhost:5432 is being used.
+		When SKIP_UT_DB env var is set localhost:5433 is being used.
 */
 const (
 	dbDockerName  = "ut-postgres"
-	dbDefaultPort = "5432"
+	dbDefaultPort = "5433"
 
 	k8sNamespace = "assisted-installer"
 )
@@ -51,12 +51,6 @@ type DBContext interface {
 // K8SDBContext runs postgresql as a pod in k8s cluster
 type K8SDBContext struct {
 	client *k8s.Clientset
-}
-
-// DockerDBContext runs postgresql as a docker container
-type DockerDBContext struct {
-	resource *dockertest.Resource
-	pool     *dockertest.Pool
 }
 
 // NoDBContext
@@ -74,47 +68,8 @@ func (c *NoDBContext) GetHostPort() (string, string) {
 	return "127.0.0.1", dbDefaultPort
 }
 
-func getDockerClient() (*DockerDBContext, error) {
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		return nil, err
-	}
-	return &DockerDBContext{pool: pool}, nil
-}
-
-func (c *DockerDBContext) Create() error {
-	//cleanup any old instances of the DB
-	if oldResource, isFound := c.pool.ContainerByName(dbDockerName); isFound {
-		oldResource.Close()
-	}
-	resource, err := c.pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "quay.io/centos7/postgresql-12-centos7",
-		Tag:        "latest",
-		Env:        []string{"POSTGRESQL_ADMIN_PASSWORD=admin"},
-		Name:       dbDockerName,
-	})
-	if err != nil {
-		return err
-	}
-
-	c.resource = resource
-	return nil
-}
-
-func (c *DockerDBContext) Teardown() {
-	Expect(c.pool).ShouldNot(BeNil())
-	err := c.pool.Purge(c.resource)
-	Expect(err).ShouldNot(HaveOccurred())
-	c.pool = nil
-}
-
-func (c *DockerDBContext) GetHostPort() (string, string) {
-	host := "127.0.0.1"
-	port := dbDefaultPort
-	if c.resource != nil {
-		port = c.resource.GetPort(fmt.Sprintf("%s/tcp", dbDefaultPort))
-	}
-	return host, port
+func getTestContainersClient() *TestContainersDBContext {
+	return &TestContainersDBContext{}
 }
 
 func getK8sClient() (*K8SDBContext, error) {
@@ -177,12 +132,12 @@ func (c *K8SDBContext) Create() error {
 					Containers: []corev1.Container{
 						{
 							Name:  "psql",
-							Image: "quay.io/centos7/postgresql-12-centos7",
+							Image: "quay.io/sclorg/postgresql-16-c9s",
 							Ports: []corev1.ContainerPort{
 								{
-									Name:          "tcp-5432",
+									Name:          "tcp-5433",
 									Protocol:      corev1.ProtocolTCP,
-									ContainerPort: 5432,
+									ContainerPort: 5433,
 								},
 							},
 							Env: []corev1.EnvVar{
@@ -194,7 +149,7 @@ func (c *K8SDBContext) Create() error {
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									TCPSocket: &corev1.TCPSocketAction{
-										Port: intstr.FromInt(5432),
+										Port: intstr.FromInt(5433),
 									},
 								},
 							},
@@ -247,9 +202,9 @@ func (c *K8SDBContext) Create() error {
 		Spec: corev1.ServiceSpec{
 			Ports: []corev1.ServicePort{
 				{
-					Port:     5432,
+					Port:     5433,
 					Protocol: corev1.ProtocolTCP,
-					Name:     "tcp-5432",
+					Name:     "tcp-5433",
 				},
 			},
 			Type: corev1.ServiceTypeLoadBalancer,
@@ -320,12 +275,12 @@ func getDBContext() DBContext {
 			return k8sContext
 		}
 	}
-	dockerContext, err := getDockerClient()
+
+	testContainersContext := getTestContainersClient()
+	err = testContainersContext.Create()
 	Expect(err).ShouldNot(HaveOccurred())
-	err = dockerContext.Create()
-	Expect(err).ShouldNot(HaveOccurred())
-	gDbCtx = dockerContext
-	return dockerContext
+	gDbCtx = testContainersContext
+	return testContainersContext
 }
 
 func InitializeDBTest() {
@@ -383,10 +338,8 @@ func DeleteTestDB(db *gorm.DB, dbName string) {
 
 func getDBDSN(dbName string) string {
 	host, port := getDBContext().GetHostPort()
-	dsn := fmt.Sprintf("host=%s port=%s user=postgres password=admin sslmode=disable", host, port)
-	if dbName != "" {
-		dsn = dsn + fmt.Sprintf(" database=%s", dbName)
-	}
+	dsn, err := dbpkg.LibpqDSN(host, port, "postgres", "admin", dbName)
+	Expect(err).ShouldNot(HaveOccurred())
 	return dsn
 }
 

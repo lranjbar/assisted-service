@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	"github.com/kelseyhightower/envconfig"
 	. "github.com/onsi/ginkgo"
@@ -20,8 +19,10 @@ import (
 	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/operators/odf"
+	"github.com/openshift/assisted-service/internal/testing"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -100,8 +101,8 @@ var _ = Describe("Ocs Operator use-cases", func() {
 		mockHostAPI.EXPECT().IsRequireUserActionReset(gomock.Any()).Return(false).AnyTimes()
 	}
 
-	mockIsValidMasterCandidate := func() {
-		mockHostAPI.EXPECT().IsValidMasterCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
+	mockIsValidCandidate := func() {
+		mockHostAPI.EXPECT().IsValidCandidate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(true, nil).AnyTimes()
 	}
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
@@ -109,11 +110,11 @@ var _ = Describe("Ocs Operator use-cases", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockHostAPI = host.NewMockAPI(ctrl)
 		mockMetric = metrics.NewMockAPI(ctrl)
-		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil, nil)
+		operatorsManager := operators.NewManager(common.GetTestLog(), nil, operators.Options{}, nil)
 		var cfg clust.Config
 		Expect(envconfig.Process(common.EnvConfigPrefix, &cfg)).ShouldNot(HaveOccurred())
 		clusterApi = clust.NewManager(cfg, common.GetTestLog().WithField("pkg", "cluster-monitor"), db, commontesting.GetDummyNotificationStream(ctrl),
-			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false)
+			mockEvents, nil, mockHostAPI, mockMetric, nil, nil, operatorsManager, nil, nil, nil, nil, nil, false, nil)
 
 		hid1 = strfmt.UUID(uuid.New().String())
 		hid2 = strfmt.UUID(uuid.New().String())
@@ -122,6 +123,10 @@ var _ = Describe("Ocs Operator use-cases", func() {
 		hid5 = strfmt.UUID(uuid.New().String())
 		hid6 = strfmt.UUID(uuid.New().String())
 		clusterId = strfmt.UUID(uuid.New().String())
+
+		mockEvents.EXPECT().NotifyInternalEvent(
+			gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
+		).AnyTimes()
 	})
 
 	tests := []struct {
@@ -136,6 +141,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 		setMachineCidrUpdatedAt bool
 		errorExpected           bool
 		OpenShiftVersion        string
+		controlPlaneCount       int64
 	}{
 		{
 			name:          "odf enabled, 3 sufficient nodes",
@@ -171,9 +177,49 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Mode are satisfied"},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
 			}),
 			errorExpected: false,
+		},
+		{
+			name:          "odf enabled, 3 sufficient nodes - 2 masters and 1 arbiter",
+			srcState:      models.ClusterStatusReady,
+			dstState:      models.ClusterStatusReady,
+			pullSecretSet: true,
+			hosts: []models.Host{
+				{ID: &hid1, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleMaster, InstallationDiskID: diskID1},
+				{ID: &hid2, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleMaster, InstallationDiskID: diskID1},
+				{ID: &hid3, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 25 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleArbiter, InstallationDiskID: diskID1},
+			},
+			statusInfoChecker: makeValueChecker(clust.StatusInfoReady),
+			validationsChecker: makeJsonChecker(map[clust.ValidationID]validationCheckResult{
+				clust.IsMachineCidrDefined:                {status: clust.ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+				clust.IsMachineCidrEqualsToCalculatedCidr: {status: clust.ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+				clust.AreApiVipsDefined:                   {status: clust.ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+				clust.AreApiVipsValid:                     {status: clust.ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+				clust.AreIngressVipsDefined:               {status: clust.ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+				clust.AreIngressVipsValid:                 {status: clust.ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+				clust.AllHostsAreReadyToInstall:           {status: clust.ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
+				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
+				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
+			}),
+			errorExpected:     false,
+			OpenShiftVersion:  common.MinimumVersionForArbiterClusters,
+			controlPlaneCount: 2,
 		},
 		{
 			name:          "odf enabled, 6 sufficient nodes",
@@ -227,6 +273,61 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Standard Deployment are satisfied"},
 			}),
 			errorExpected: false,
+		},
+		{
+			name:          "odf enabled, 6 sufficient nodes - 2 masters, 1 arbiter and 3 workers",
+			srcState:      models.ClusterStatusReady,
+			dstState:      models.ClusterStatusReady,
+			pullSecretSet: true,
+			hosts: []models.Host{
+				{ID: &hid1, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB},
+						{SizeBytes: 40 * conversions.GB}}}),
+					Role: models.HostRoleMaster, InstallationDiskID: diskID1},
+				{ID: &hid2, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 25 * conversions.GB},
+						{SizeBytes: 40 * conversions.GB}}}),
+					Role: models.HostRoleMaster, InstallationDiskID: diskID1},
+				{ID: &hid3, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 16, Ram: 64 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 25 * conversions.GB},
+						{SizeBytes: 40 * conversions.GB}}}),
+					Role: models.HostRoleArbiter, InstallationDiskID: diskID1},
+				{ID: &hid4, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 10, Ram: 15 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleWorker, InstallationDiskID: diskID1},
+				{ID: &hid5, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 10, Ram: 32 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleWorker, InstallationDiskID: diskID1},
+				{ID: &hid6, Status: swag.String(models.HostStatusKnown),
+					Inventory: odf.Inventory(&odf.InventoryResources{Cpus: 9, Ram: 60 * conversions.GiB, Disks: []*models.Disk{
+						{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+						{SizeBytes: 40 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID2}}}),
+					Role: models.HostRoleWorker, InstallationDiskID: diskID1},
+			},
+			statusInfoChecker: makeValueChecker(clust.StatusInfoReady),
+			validationsChecker: makeJsonChecker(map[clust.ValidationID]validationCheckResult{
+				clust.IsMachineCidrDefined:                {status: clust.ValidationSuccess, messagePattern: "The Machine Network CIDR is defined"},
+				clust.IsMachineCidrEqualsToCalculatedCidr: {status: clust.ValidationSuccess, messagePattern: "The Cluster Machine CIDR is equivalent to the calculated CIDR"},
+				clust.AreApiVipsDefined:                   {status: clust.ValidationSuccess, messagePattern: "API virtual IPs are defined"},
+				clust.AreApiVipsValid:                     {status: clust.ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+				clust.AreIngressVipsDefined:               {status: clust.ValidationSuccess, messagePattern: "Ingress virtual IPs are defined"},
+				clust.AreIngressVipsValid:                 {status: clust.ValidationSuccess, messagePattern: "belongs to the Machine CIDR and is not in use."},
+				clust.AllHostsAreReadyToInstall:           {status: clust.ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
+				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
+				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
+				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Standard Deployment are satisfied"},
+			}),
+			errorExpected:     false,
+			OpenShiftVersion:  common.MinimumVersionForArbiterClusters,
+			controlPlaneCount: 2,
 		},
 		{
 			name:          "odf enabled, 3 nodes, one with empty inventory",
@@ -298,7 +399,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Mode are satisfied"},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
 			}),
 			errorExpected: false,
 		},
@@ -330,8 +431,8 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.AllHostsAreReadyToInstall:           {status: clust.ValidationSuccess, messagePattern: "All hosts in the cluster are ready to install"},
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
-				clust.SufficientMastersCount:              {status: clust.ValidationFailure, messagePattern: fmt.Sprintf("Clusters must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.", common.MinMasterHostsNeededForInstallation)},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "A minimum of 3 hosts is required to deploy ODF."},
+				clust.SufficientMastersCount:              {status: clust.ValidationFailure, messagePattern: fmt.Sprintf("The cluster must have exactly %d dedicated control plane nodes. Add or remove hosts, or change their roles configurations to meet the requirement.", common.MinMasterHostsNeededForInstallationInHaMode)},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "The cluster must either have no dedicated worker nodes or at least three."},
 			}),
 			errorExpected: false,
 		},
@@ -435,7 +536,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "A cluster with only 3 masters or with a minimum of 3 workers is required."},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "The cluster must either have no dedicated worker nodes or at least three."},
 			}),
 			errorExpected: false,
 		},
@@ -651,7 +752,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "For ODF Standard Mode, all host roles must be assigned to master or worker."},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationFailure, messagePattern: "The cluster must either have no dedicated worker nodes or at least three."},
 			}),
 			errorExpected: false,
 		},
@@ -689,7 +790,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Mode are satisfied"},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
 			}),
 			errorExpected: false,
 		},
@@ -781,7 +882,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Mode are satisfied"},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
 			}),
 			errorExpected: false,
 		},
@@ -820,7 +921,7 @@ var _ = Describe("Ocs Operator use-cases", func() {
 				clust.IsDNSDomainDefined:                  {status: clust.ValidationSuccess, messagePattern: "The base domain is defined"},
 				clust.IsPullSecretSet:                     {status: clust.ValidationSuccess, messagePattern: "The pull secret is set"},
 				clust.SufficientMastersCount:              {status: clust.ValidationSuccess, messagePattern: "The cluster has the exact amount of dedicated control plane nodes."},
-				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Mode are satisfied"},
+				clust.IsOdfRequirementsSatisfied:          {status: clust.ValidationSuccess, messagePattern: "ODF Requirements for Compact Deployment are satisfied."},
 			}),
 			errorExpected: false,
 		},
@@ -890,11 +991,20 @@ var _ = Describe("Ocs Operator use-cases", func() {
 					MonitoredOperators: operators,
 					OpenshiftVersion:   t.OpenShiftVersion,
 					NetworkType:        swag.String(models.ClusterNetworkTypeOVNKubernetes),
+					ControlPlaneCount:  3,
 				},
 			}
 
+			if cluster.Cluster.OpenshiftVersion == "" {
+				cluster.Cluster.OpenshiftVersion = testing.ValidOCPVersionForNonStandardHAOCPControlPlane
+			}
+
+			if t.controlPlaneCount != 0 {
+				cluster.Cluster.ControlPlaneCount = t.controlPlaneCount
+			}
+
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
-			mockIsValidMasterCandidate()
+			mockIsValidCandidate()
 			for i := range t.hosts {
 				t.hosts[i].ClusterID = &clusterId
 				t.hosts[i].InfraEnvID = clusterId

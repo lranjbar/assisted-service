@@ -18,11 +18,11 @@ import (
 
 // AgentClusterInstallMutatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
 type AgentClusterInstallMutatingAdmissionHook struct {
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // NewAgentClusterInstallMutatingAdmissionHook constructs a new AgentClusterInstallMutatingAdmissionHook
-func NewAgentClusterInstallMutatingAdmissionHook(decoder *admission.Decoder) *AgentClusterInstallMutatingAdmissionHook {
+func NewAgentClusterInstallMutatingAdmissionHook(decoder admission.Decoder) *AgentClusterInstallMutatingAdmissionHook {
 	return &AgentClusterInstallMutatingAdmissionHook{decoder: decoder}
 }
 
@@ -164,7 +164,7 @@ func patchUserManagedNetworking(newObject *hiveext.AgentClusterInstall, logger *
 	var (
 		platformUserManagedNetworking *bool
 		userManagedNetworking         = isNonePlatformOrSNO(newObject)
-		highAvailabilityMode          = getHighAvailabilityMode(newObject, nil)
+		controlPlaneCount             = int64(newObject.Spec.ProvisionRequirements.ControlPlaneAgents)
 		err                           error
 	)
 
@@ -172,8 +172,8 @@ func patchUserManagedNetworking(newObject *hiveext.AgentClusterInstall, logger *
 	// 1. Cluster topology is SNO.
 	// 2. Platform is specified.
 	if !isNonePlatformOrSNO(newObject) && newObject.Spec.PlatformType != "" {
-		platform := common.PlatformTypeToPlatform(newObject.Spec.PlatformType)
-		_, platformUserManagedNetworking, err = provider.GetClusterPlatformByHighAvailabilityMode(platform, nil, highAvailabilityMode)
+		platform := common.PlatformTypeToPlatform(newObject.Spec)
+		_, platformUserManagedNetworking, err = provider.GetClusterPlatformByControlPlaneCount(platform, nil, &controlPlaneCount)
 		if err != nil {
 			logger.Warnf("Cannot set UserManagedNetworking automatically due to: %s", err.Error())
 			return nil

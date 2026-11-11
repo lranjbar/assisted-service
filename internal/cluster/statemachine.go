@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/filanov/stateswitch"
@@ -13,6 +14,21 @@ const (
 	TransitionTypePrepareForInstallation = "PrepareForInstallation"
 	TransitionTypeRefreshStatus          = "RefreshStatus"
 )
+
+func SequentialPostTransitions(postTransitions ...stateswitch.PostTransition) stateswitch.PostTransition {
+	return func(stateSwitch stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
+		var ret error
+
+		for _, postTransition := range postTransitions {
+			err := postTransition(stateSwitch, args) // Run everything anyway ?
+			if err != nil {
+				ret = errors.Join(ret, err)
+			}
+		}
+
+		return ret
+	}
+}
 
 func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 	sm := stateswitch.NewStateMachine()
@@ -91,7 +107,6 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 	var vipsDefinedConditions = stateswitch.And(
 		If(AreIngressVipsDefined),
 		If(AreApiVipsDefined),
-		If(AreIngressVipsDefined),
 	)
 
 	var requiredForInstall = stateswitch.And(
@@ -108,8 +123,32 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		If(IsCnvRequirementsSatisfied),
 		If(IsLvmRequirementsSatisfied),
 		If(IsMceRequirementsSatisfied),
+		If(IsMtvRequirementsSatisfied),
+		If(IsOscRequirementsSatisfied),
 		If(isNetworkTypeValid),
+		If(IsCustomManifestsRequirementsSatisfied),
 		If(NetworksSameAddressFamilies),
+		If(IsNodeFeatureDiscoveryRequirementsSatisfied),
+		If(IsNvidiaGPURequirementsSatisfied),
+		If(IsPipelinesRequirementsSatisfied),
+		If(IsServiceMeshRequirementsSatisfied),
+		If(IsServerLessRequirementsSatisfied),
+		If(IsOpenShiftAIRequirementsSatisfied),
+		If(IsAuthorinoRequirementsSatisfied),
+		If(IsNmstateRequirementsSatisfied),
+		If(IsAMDGPURequirementsSatisfied),
+		If(IsKMMRequirementsSatisfied),
+		If(AreNodeHealthcheckRequirementsSatisfied),
+		If(AreSelfNodeRemediationRequirementsSatisfied),
+		If(AreFenceAgentsRemediationRequirementsSatisfied),
+		If(AreNodeMaintenanceRequirementsSatisfied),
+		If(AreKubeDeschedulerRequirementsSatisfied),
+		If(AreClusterObservabilityRequirementsSatisfied),
+		If(AreNUMAResourcesRequirementsSatisfied),
+		If(AreOADPRequirementsSatisfied),
+		If(AreMetallbRequirementsSatisfied),
+		If(IsLokiRequirementsSatisfied),
+		If(IsOpenShiftLoggingRequirementsSatisfied),
 	)
 
 	// Refresh cluster status conditions - Non DHCP
@@ -152,7 +191,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		PostTransition:   th.PostRefreshCluster(StatusInfoInsufficient),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Refresh discovering cluster - detect insufficient",
-			Description: "In order for this transition to be fired at least one of the validations in isSufficientForInstallNonDhcp must fail. This transition handles the case that one of the required validations that are required in order for the cluster to be in ready state  has failed",
+			Description: "In order for this transition to be fired at least one of the validations in isSufficientForInstallNonDhcp must fail. This transition handles the case that one of the required validations that are required in order for the cluster to be in ready state has failed",
 		},
 	})
 
@@ -271,7 +310,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 			),
 		),
 		DestinationState: stateswitch.State(models.ClusterStatusError),
-		PostTransition:   th.PostRefreshCluster(statusInfoError),
+		PostTransition:   SequentialPostTransitions(th.PostRefreshCluster(statusInfoError), th.SendClusterInstallationFailedEvent(statusInfoError)),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "TODO: Name this transition",
 			Description: "TODO: Document this transition",
@@ -285,10 +324,28 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		},
 		Condition:        th.IsInstallationTimedOut,
 		DestinationState: stateswitch.State(models.ClusterStatusError),
-		PostTransition:   th.PostRefreshCluster(statusInfoTimeout),
+		PostTransition:   SequentialPostTransitions(th.PostRefreshCluster(statusInfoTimeout), th.SendClusterInstallationFailedEvent(statusInfoTimeout)),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Timed out while waiting for user",
 			Description: "User was asked to take action and did not do so in time, give up and display appropriate error",
+		},
+	})
+
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefreshStatus,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.ClusterStatusInstalling),
+			stateswitch.State(models.ClusterStatusFinalizing),
+		},
+		Condition:        stateswitch.And(th.IsInstallationTimedOut, th.SoftTimeoutsEnabled),
+		DestinationState: stateswitch.State(models.ClusterStatusError),
+		PostTransition: SequentialPostTransitions(
+			th.PostRefreshCluster(statusInfoInstallationTimeout, th.InstallationTimeoutMinutes),
+			th.SendClusterInstallationFailedEvent(statusInfoInstallationTimeout, th.InstallationTimeoutMinutes),
+		),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Timed out while installing",
+			Description: "Cluster installation is taking too long, give up and display appropriate error",
 		},
 	})
 
@@ -300,7 +357,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		Condition: stateswitch.And(th.IsFinalizingTimedOut,
 			stateswitch.Not(th.SoftTimeoutsEnabled)),
 		DestinationState: stateswitch.State(models.ClusterStatusError),
-		PostTransition:   th.PostRefreshCluster(statusInfoFinalizingTimeout),
+		PostTransition:   SequentialPostTransitions(th.PostRefreshCluster(statusInfoFinalizingTimeout), th.SendClusterInstallationFailedEvent(statusInfoFinalizingTimeout)),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Timed out while finalizing",
 			Description: "Cluster finalization took too long, display appropriate error",
@@ -316,7 +373,10 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 			th.IsFinalizingStageTimedOut,
 			stateswitch.Not(isInFinalizingStages(nonFailingFinalizingStages...))),
 		DestinationState: stateswitch.State(models.ClusterStatusError),
-		PostTransition:   th.PostRefreshCluster(statusInfoFinalizingStageTimeout, FinalizingStage, th.FinalizingStageTimeoutMinutes),
+		PostTransition: SequentialPostTransitions(
+			th.PostRefreshCluster(statusInfoFinalizingStageTimeout, FinalizingStage, th.FinalizingStageTimeoutMinutes),
+			th.SendClusterInstallationFailedEvent(statusInfoFinalizingStageTimeout, FinalizingStage, th.FinalizingStageTimeoutMinutes),
+		),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Finalizing stage timed out.  Move to error",
 			Description: "Cluster finalization stage took too long, display appropriate error",
@@ -488,7 +548,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 			stateswitch.Not(th.IsInstalling),
 		),
 		DestinationState: stateswitch.State(models.ClusterStatusError),
-		PostTransition:   th.PostRefreshCluster(statusInfoError),
+		PostTransition:   SequentialPostTransitions(th.PostRefreshCluster(statusInfoError), th.SendClusterInstallationFailedEvent(statusInfoError)),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Installation error",
 			Description: "This transition is fired when the cluster is in installing and should move to error",
@@ -520,6 +580,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		stateswitch.State(models.ClusterStatusError),
 		stateswitch.State(models.ClusterStatusCancelled),
 		stateswitch.State(models.ClusterStatusAddingHosts),
+		stateswitch.State(models.ClusterStatusUnmonitored),
 	} {
 		sm.AddTransitionRule(stateswitch.TransitionRule{
 			TransitionType:   TransitionTypeRefreshStatus,
@@ -579,6 +640,10 @@ func documentStates(sm stateswitch.StateMachine) {
 	sm.DescribeState(stateswitch.State(models.ClusterStatusInstallingPendingUserAction), stateswitch.StateDoc{
 		Name:        "Installing, Pending User Action",
 		Description: "Installation is in progress, but is blocked and cannot continue until the user takes action",
+	})
+	sm.DescribeState(stateswitch.State(models.ClusterStatusUnmonitored), stateswitch.StateDoc{
+		Name:        "Unmonitored",
+		Description: "The cluster is a temporary configuration holder for disconnected ISO generation and should not be monitored or transitioned",
 	})
 }
 

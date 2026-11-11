@@ -64,6 +64,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusInstallingInProgress),
 			stateswitch.State(models.HostStatusInstalling),
+			stateswitch.State(models.HostStatusInstallingPendingUserAction),
 		},
 		DestinationState: stateswitch.State(models.HostStatusAddedToExistingCluster),
 		PostTransition:   th.PostHostProgress,
@@ -126,13 +127,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRegisterHost,
 		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusPreparingForInstallation),
+			stateswitch.State(models.HostStatusPreparingSuccessful),
+		},
+		DestinationState: stateswitch.State(models.HostStatusKnown),
+		PostTransition:   th.PostRegisterDuringPreparingForInstallation,
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Re-registration during preparation",
+			Description: "When a host re-registers during preparing-for-installation, we preserve inventory and bootstrap flag, reset to 'known' status, and reset LastInstallationPreparation to allow state machine re-evaluation",
+		},
+	})
+
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRegisterHost,
+		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusDiscovering),
 			stateswitch.State(models.HostStatusKnown),
 			stateswitch.State(models.HostStatusDisconnected),
 			stateswitch.State(models.HostStatusInsufficient),
 			stateswitch.State(models.HostStatusResettingPendingUserAction),
-			stateswitch.State(models.HostStatusPreparingForInstallation),
-			stateswitch.State(models.HostStatusPreparingSuccessful),
 			stateswitch.State(models.HostStatusBinding),
 			stateswitch.State(models.HostStatusPendingForInput),
 		},
@@ -346,6 +359,12 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeUnbindHost,
 		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusPreparingForInstallation),
+			stateswitch.State(models.HostStatusPreparingSuccessful),
+			stateswitch.State(models.HostStatusPreparingFailed),
+			stateswitch.State(models.HostStatusInstalling),
+			stateswitch.State(models.HostStatusInstallingInProgress),
+			stateswitch.State(models.HostStatusInstallingPendingUserAction),
 			stateswitch.State(models.HostStatusInstalled),
 			stateswitch.State(models.HostStatusAddedToExistingCluster),
 			stateswitch.State(models.HostStatusError),
@@ -788,20 +807,20 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	// Host stage timeout transitions.  They handle all stages when cluster is in 'installing-in-progress' status besides
 	// rebooting stage which is handled differently - it moves to installing-pending-user-action
 
-	// Timeout while host installationInProgress and soft timeouts is not enabled for stages other than [writing-image-to-disk, rebooting]
+	// Timeout while host installationInProgress and soft timeouts is not enabled for stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusInstallingInProgress)},
 		Condition: stateswitch.And(
 			stateswitch.Not(If(SoftTimeoutsEnabled)),
-			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageRebooting)),
+			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageCopyingRegistryDataToDisk, models.HostStageRebooting)),
 			th.HasInstallationInProgressTimedOut,
 			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
 		DestinationState: stateswitch.State(models.HostStatusError),
 		PostTransition:   th.PostRefreshHost(statusInfoInstallationInProgressTimedOut),
 		Documentation: stateswitch.TransitionRuleDoc{
-			Name:        "Move to error on timeout if host is in particular installation in progress stages other than [writing-image-to-disk, rebooting]",
+			Name:        "Move to error on timeout if host is in particular installation in progress stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]",
 			Description: "The transition is triggered when soft timeouts is not enabled which means that timeout expiration causes a host to move to error",
 		},
 	})
@@ -824,7 +843,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		},
 	})
 
-	// Timeout while host installationInProgress and soft timeouts is enabled for stages other than [writing-image-to-disk, rebooting]
+	// Timeout while host installationInProgress and soft timeouts is not enabled for stage copying-registry-data-to-disk.
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefresh,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusInstallingInProgress)},
+		Condition: stateswitch.And(
+			stateswitch.Not(If(SoftTimeoutsEnabled)),
+			IsInStages(models.HostStageCopyingRegistryDataToDisk),
+			th.HasInstallationInProgressTimedOut,
+			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
+		DestinationState: stateswitch.State(models.HostStatusError),
+		PostTransition:   th.PostRefreshHost(statusInfoInstallationInProgressCopyingRegistryDataToDiskTimedOut),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Move to error on timeout if host is in particular installation in progress stage copying-registry-data-to-disk",
+			Description: "The transition is triggered when soft timeouts is not enabled which means that timeout expiration causes a host to move to error",
+		},
+	})
+
+	// Timeout while host installationInProgress and soft timeouts is enabled for stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
@@ -832,13 +869,13 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		Condition: stateswitch.And(
 			If(SoftTimeoutsEnabled),
 			stateswitch.Not(If(HostStageTimedOut)),
-			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageRebooting)),
+			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageCopyingRegistryDataToDisk, models.HostStageRebooting)),
 			th.HasInstallationInProgressTimedOut,
 			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
 		DestinationState: stateswitch.State(models.HostStatusInstallingInProgress),
 		PostTransition:   th.PostHostStageTimeout(statusInfoInstallationInProgressSoftTimedOut),
 		Documentation: stateswitch.TransitionRuleDoc{
-			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stages other than [writing-image-to-disk, rebooting]",
+			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]",
 			Description: "The transition is triggered when soft timeouts is enabled which means that timeout expiration causes event generation only",
 		},
 	})
@@ -862,6 +899,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		},
 	})
 
+	// Timeout while host installationInProgress and soft timeouts is enabled for stage copying-registry-data-to-disk.
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefresh,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusInstallingInProgress)},
+		Condition: stateswitch.And(
+			If(SoftTimeoutsEnabled),
+			stateswitch.Not(If(HostStageTimedOut)),
+			IsInStages(models.HostStageCopyingRegistryDataToDisk),
+			th.HasInstallationInProgressTimedOut,
+			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
+		DestinationState: stateswitch.State(models.HostStatusInstallingInProgress),
+		PostTransition:   th.PostHostStageTimeout(statusInfoInstallationInProgressCopyingRegistryDataToDiskSoftTimedOut),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stage copying-registry-data-to-disk",
+			Description: "The transition is triggered when soft timeouts is enabled which means that timeout expiration causes event generation only",
+		},
+	})
+
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
@@ -874,6 +930,23 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Tell user about boot order wen reboot takes too long",
 			Description: "TODO: Document this transition rule.",
+		},
+	})
+
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefresh,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusInstallingPendingUserAction)},
+		Condition: stateswitch.And(
+			th.HasPendingUserActionTimedOut,
+			th.ClusterWouldSucceedWithoutHost,
+			stateswitch.Not(th.IsClusterPostInstallation),
+		),
+		DestinationState: stateswitch.State(models.HostStatusError),
+		PostTransition:   th.PostRefreshHost(statusInfoPendingUserActionTimeout),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Host pending user action timeout with cluster viability check (day1 only)",
+			Description: "When a host is in installing-pending-user-action state for too long without recovery, transition to error state ONLY if the cluster can still succeed without this host AND the cluster is still in initial installation (not post-installation). This prevents timing out hosts that are required for cluster success (e.g., masters in a 3-node cluster) and prevents timing out hosts being added to already-installed clusters where users explicitly want those specific hosts to join.",
 		},
 	})
 
@@ -897,13 +970,15 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		})
 	}
 
+	var hasValidInventory = stateswitch.And(If(HasInventory), If(InventoryNotFullyTruncated))
+
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusDisconnected),
 			stateswitch.State(models.HostStatusDiscovering),
 		},
-		Condition:        stateswitch.And(If(IsConnected), If(IsMediaConnected), stateswitch.Not(If(HasInventory))),
+		Condition:        stateswitch.And(If(IsConnected), If(IsMediaConnected), stateswitch.Not(hasValidInventory)),
 		DestinationState: stateswitch.State(models.HostStatusDiscovering),
 		PostTransition:   th.PostRefreshHost(statusInfoDiscovering),
 		Documentation: stateswitch.TransitionRuleDoc{
@@ -937,6 +1012,8 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		If(AreCnvRequirementsSatisfied),
 		If(AreLvmRequirementsSatisfied),
 		If(AreMceRequirementsSatisfied),
+		If(AreMtvRequirementsSatisfied),
+		If(AreOscRequirementsSatisfied),
 		If(HasSufficientNetworkLatencyRequirementForRole),
 		If(HasSufficientPacketLossRequirementForRole),
 		If(HasDefaultRoute),
@@ -952,6 +1029,28 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		If(NoSkipInstallationDisk),
 		If(NoSkipMissingDisk),
 		If(NoIPCollisionsInNetwork),
+		If(NoIscsiNicBelongsToMachineCidr),
+		If(AreNodeFeatureDiscoveryRequirementsSatisfied),
+		If(AreNvidiaGPURequirementsSatisfied),
+		If(ArePipelinesRequirementsSatisfied),
+		If(AreServiceMeshRequirementsSatisfied),
+		If(AreServerLessRequirementsSatisfied),
+		If(AreOpenShiftAIRequirementsSatisfied),
+		If(AreAuthorinoRequirementsSatisfied),
+		If(AreNmstateRequirementsSatisfied),
+		If(AreAMDGPURequirementsSatisfied),
+		If(AreKMMRequirementsSatisfied),
+		If(AreNodeHealthcheckRequirementsSatisfied),
+		If(AreSelfNodeRemediationRequirementsSatisfied),
+		If(AreFenceAgentsRemediationRequirementsSatisfied),
+		If(AreNodeMaintenanceRequirementsSatisfied),
+		If(AreKubeDeschedulerRequirementsSatisfied),
+		If(AreClusterObservabilityRequirementsSatisfied),
+		If(AreNUMAResourcesRequirementsSatisfied),
+		If(AreOADPRequirementsSatisfied),
+		If(AreMetalLBRequirementsSatisfied),
+		If(AreLokiRequirementsSatisfied),
+		If(AreOpenShiftLoggingRequirementsSatisfied),
 		/*
 					 * MGMT-15213: The release domain is not resolved correctly when there is a mirror or proxy.  In this case
 					 * validation might fail, but the installation may succeed.
@@ -969,7 +1068,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 			stateswitch.State(models.HostStatusKnown),
 			stateswitch.State(models.HostStatusPendingForInput),
 		},
-		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), If(HasInventory),
+		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), hasValidInventory,
 			stateswitch.Not(hasMinRequiredHardware)),
 		DestinationState: stateswitch.State(models.HostStatusInsufficient),
 		PostTransition:   th.PostRefreshHost(statusInfoInsufficientHardware),
@@ -988,7 +1087,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 			stateswitch.State(models.HostStatusKnown),
 			stateswitch.State(models.HostStatusPendingForInput),
 		},
-		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), If(HasInventory), If(VSphereHostUUIDEnabled),
+		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), hasValidInventory, If(VSphereHostUUIDEnabled),
 			hasMinRequiredHardware,
 			stateswitch.Not(requiredInputFieldsExist)),
 		DestinationState: stateswitch.State(models.HostStatusPendingForInput),
@@ -1009,7 +1108,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 			stateswitch.State(models.HostStatusKnown),
 		},
 		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), If(HasInventory),
-			hasMinRequiredHardware,
+			stateswitch.Or(hasMinRequiredHardware, stateswitch.Not(If(InventoryNotFullyTruncated))),
 			stateswitch.Or(stateswitch.Not(If(VSphereHostUUIDEnabled)),
 				stateswitch.And(requiredInputFieldsExist, stateswitch.Not(isSufficientForInstall)),
 			)),
@@ -1030,7 +1129,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 			stateswitch.State(models.HostStatusPendingForInput),
 			stateswitch.State(models.HostStatusDiscovering),
 		},
-		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), If(HasInventory),
+		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), hasValidInventory,
 			hasMinRequiredHardware,
 			requiredInputFieldsExist,
 			isSufficientForInstall,
@@ -1049,7 +1148,7 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusKnown),
 		},
-		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), If(HasInventory),
+		Condition: stateswitch.And(If(IsConnected), If(IsMediaConnected), hasValidInventory,
 			hasMinRequiredHardware,
 			requiredInputFieldsExist,
 			isSufficientForInstall,

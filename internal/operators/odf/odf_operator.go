@@ -3,16 +3,22 @@ package odf
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
+	"unicode"
 
 	"github.com/kelseyhightower/envconfig"
+	"github.com/lib/pq"
 	"github.com/openshift/assisted-service/internal/common"
-	"github.com/openshift/assisted-service/internal/oc"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
 	"github.com/openshift/assisted-service/internal/operators/lso"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/sirupsen/logrus"
 )
+
+const defaultStorageClassName = "ocs-storagecluster-cephfs"
 
 var OcsOperator = models.MonitoredOperator{
 	Name:             "ocs",
@@ -31,9 +37,8 @@ func NewOcsOperator(log logrus.FieldLogger) *operator {
 
 // operator is an ODF OLM operator plugin; it implements api.Operator
 type operator struct {
-	log       logrus.FieldLogger
-	config    *Config
-	extracter oc.Extracter
+	log    logrus.FieldLogger
+	config *Config
 }
 
 var Operator = models.MonitoredOperator{
@@ -42,24 +47,26 @@ var Operator = models.MonitoredOperator{
 	Namespace:        "openshift-storage",
 	SubscriptionName: "odf-operator",
 	TimeoutSeconds:   30 * 60,
+	Bundles: pq.StringArray{
+		operatorscommon.BundleOpenShiftAI.ID,
+	},
 }
 
 // NewOdfOperator creates new ODFOperator
-func NewOdfOperator(log logrus.FieldLogger, extracter oc.Extracter) *operator {
+func NewOdfOperator(log logrus.FieldLogger) *operator {
 	cfg := Config{}
 	err := envconfig.Process(common.EnvConfigPrefix, &cfg)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	return newOdfOperatorWithConfig(log, &cfg, extracter)
+	return newOdfOperatorWithConfig(log, &cfg)
 }
 
 // newOdfOperatorWithConfig creates new ODFOperator with given configuration
-func newOdfOperatorWithConfig(log logrus.FieldLogger, config *Config, extracter oc.Extracter) *operator {
+func newOdfOperatorWithConfig(log logrus.FieldLogger, config *Config) *operator {
 	return &operator{
-		log:       log,
-		config:    config,
-		extracter: extracter,
+		log:    log,
+		config: config,
 	}
 }
 
@@ -73,37 +80,97 @@ func (o *operator) GetFullName() string {
 }
 
 // GetDependencies provides a list of dependencies of the Operator
-func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	return []string{lso.Operator.Name}, nil
+func (o *operator) GetDependencies(cluster *common.Cluster) []string {
+	return []string{lso.Operator.Name}
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDOdfRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{models.FeatureSupportLevelIDLSO}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDOdfRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster verifies whether this operator is valid for given cluster
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
 	status, message := o.validateRequirements(&cluster.Cluster)
+	result := []api.ValidationResult{{
+		Status:       status,
+		ValidationId: clusterValidationID,
+	}}
 
-	return api.ValidationResult{Status: status, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+	if message != "" {
+		result[0].Reasons = []string{message}
+	}
+
+	return result, nil
 }
 
-func getODFDeploymentMode(numOfHosts int) odfDeploymentMode {
-	if numOfHosts <= 3 {
-		return compactMode
+func (o *operator) StorageClassName() string {
+	return defaultStorageClassName
+}
+
+func (o *operator) getMinDiskSizeGB(additionalDiskRequirementsGb int64) int64 {
+	return o.config.ODFMinDiskSizeGB + additionalDiskRequirementsGb
+}
+
+// Get valid disk count, and return error if no disk available
+func (o *operator) getValidDiskCount(
+	disks []*models.Disk,
+	installationDiskID string,
+	additionalOperatorRequirements *models.ClusterHostRequirementsDetails,
+	mode odfDeploymentMode,
+) (int64, error) {
+	minDiskSizeGb := int64(0)
+	if additionalOperatorRequirements != nil {
+		minDiskSizeGb = additionalOperatorRequirements.DiskSizeGb
 	}
-	return standardMode
+	eligibleDisks, availableDisks := operatorscommon.NonInstallationDiskCount(disks, installationDiskID, o.getMinDiskSizeGB(minDiskSizeGb))
+	var err error
+	if eligibleDisks == 0 && availableDisks > 0 {
+		err = fmt.Errorf("Insufficient resources to deploy ODF in %s mode. ODF requires a minimum of 3 hosts. Each host must have at least 1 additional disk of %d GB minimum and an installation disk.", strings.ToLower(string(mode)), o.getMinDiskSizeGB(minDiskSizeGb))
+	}
+	return eligibleDisks, err
 }
 
 // ValidateHost verifies whether this operator is valid for given host
-func (o *operator) ValidateHost(_ context.Context, cluster *common.Cluster, host *models.Host) (api.ValidationResult, error) {
-	numOfHosts := len(cluster.Hosts)
+func (o *operator) ValidateHost(_ context.Context, cluster *common.Cluster, host *models.Host, additionalOperatorRequirements *models.ClusterHostRequirementsDetails) (api.ValidationResult, error) {
+	mode := getODFDeploymentMode(&cluster.Cluster, o.config.ODFNumMinimumHosts)
+	shouldHostRunODF, err := shouldHostRunODF(&cluster.Cluster, mode, host.Role)
+
+	log := o.log
+	if cluster.ID != nil {
+		log = log.WithField("cluster", cluster.ID.String())
+	}
+
+	if host.ID != nil {
+		log = log.WithField("host", host.ID.String())
+	}
+
+	log.Debugf("ODF validate host - host role: %s", host.Role)
+	log.Debugf("ODF validate host - mode: %s", string(mode))
+
+	// Host role is auto-assign in standard mode.
+	if err != nil {
+		status := fmt.Sprintf("%s.", capitalizeFirstLetter(err.Error()))
+		return api.ValidationResult{
+			Status:       api.Pending,
+			ValidationId: o.GetHostValidationID(),
+			Reasons:      []string{status}}, nil
+	}
+
+	// No ODF requirement to validate in the host in this case.
+	if shouldHostRunODF == nil || !*shouldHostRunODF {
+		return api.ValidationResult{Status: api.Success, ValidationId: o.GetHostValidationID(), Reasons: []string{}}, nil
+	}
+
 	if host.Inventory == "" {
 		return api.ValidationResult{Status: api.Pending, ValidationId: o.GetHostValidationID(), Reasons: []string{"Missing Inventory in the host."}}, nil
 	}
@@ -113,45 +180,48 @@ func (o *operator) ValidateHost(_ context.Context, cluster *common.Cluster, host
 		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, err
 	}
 
-	mode := getODFDeploymentMode(numOfHosts)
-
-	// GetValidDiskCount counts the total number of valid disks in each host and return a error if we don't have the disk of required size
-	diskCount, err := o.getValidDiskCount(inventory.Disks, host.InstallationDiskID, mode)
+	// getValidDiskCount counts the total number of valid disks in each host and return a error if we don't have the disk of required size.
+	diskCount, err := o.getValidDiskCount(inventory.Disks, host.InstallationDiskID, additionalOperatorRequirements, mode)
 	if err != nil {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{err.Error()}}, nil
+		return api.ValidationResult{
+			Status:       api.Failure,
+			ValidationId: o.GetHostValidationID(),
+			Reasons:      []string{err.Error()}}, nil
 	}
 
-	if mode == compactMode {
-		if host.Role == models.HostRoleMaster || host.Role == models.HostRoleAutoAssign {
-			if diskCount == 0 {
-				return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{"Insufficient disks, ODF requires at least one non-installation disk on each host in compact mode."}}, nil
-			}
-			return api.ValidationResult{Status: api.Success, ValidationId: o.GetHostValidationID(), Reasons: []string{}}, nil
-		}
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{"ODF unsupported Host Role for Compact Mode."}}, nil
+	// validate eligible extra disk.
+	if diskCount == 0 {
+		return api.ValidationResult{
+			Status:       api.Failure,
+			ValidationId: o.GetHostValidationID(),
+			Reasons: []string{
+				fmt.Sprintf(
+					"Insufficient disks, ODF requires at least one non-installation SSD or HDD disk on each host in %s mode.",
+					strings.ToLower(string(mode)),
+				),
+			}}, nil
 	}
 
-	// Standard mode
-	// If the Role is set to Auto-assign for a host, it is not possible to determine whether the node will end up as a master or worker node.
-	if host.Role == models.HostRoleAutoAssign {
-		status := "For ODF Standard Mode, host role must be assigned to master or worker."
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{status}}, nil
-	}
-	return api.ValidationResult{Status: api.Success, ValidationId: o.GetHostValidationID(), Reasons: []string{}}, nil
+	return api.ValidationResult{
+		Status:       api.Success,
+		ValidationId: o.GetHostValidationID(),
+		Reasons:      []string{}}, nil
 }
 
 // GenerateManifests generates manifests for the operator
 // We recalculate the resources for all nodes because the computation that takes place during
 // odf validations may be performed by a different replica
 func (o *operator) GenerateManifests(cluster *common.Cluster) (map[string][]byte, []byte, error) {
+	mode := getODFDeploymentMode(&cluster.Cluster, o.config.ODFNumMinimumHosts)
+
 	odfClusterResources := odfClusterResourcesInfo{}
-	_, err := o.computeResourcesAllNodes(&cluster.Cluster, &odfClusterResources)
+	_, err := o.computeResourcesAllNodes(&cluster.Cluster, &odfClusterResources, mode)
 	if err != nil {
 		return nil, nil, err
 	}
-	o.config.ODFDisksAvailable = odfClusterResources.numberOfDisks
-	o.log.Info("No. of ODF eligible disks in cluster ", cluster.ID, " are ", o.config.ODFDisksAvailable)
-	return Manifests(o.config, cluster.OpenshiftVersion)
+
+	o.log.Info("No. of ODF eligible disks in cluster ", cluster.ID, " are ", odfClusterResources.numberOfDisks)
+	return Manifests(mode, odfClusterResources.numberOfDisks, cluster.OpenshiftVersion)
 }
 
 // GetProperties provides description of operator properties: none required
@@ -166,9 +236,26 @@ func (o *operator) GetMonitoredOperator() *models.MonitoredOperator {
 
 // GetHostRequirements provides operator's requirements towards the host
 func (o *operator) GetHostRequirements(_ context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error) {
-	numOfHosts := len(cluster.Hosts)
+	mode := getODFDeploymentMode(&cluster.Cluster, o.config.ODFNumMinimumHosts)
+	shouldHostRunODF, err := shouldHostRunODF(&cluster.Cluster, mode, host.Role)
 
-	mode := getODFDeploymentMode(numOfHosts)
+	log := o.log
+	if cluster.ID != nil {
+		log = log.WithField("cluster", cluster.ID.String())
+	}
+
+	if host.ID != nil {
+		log = log.WithField("host", host.ID.String())
+	}
+
+	log.Debugf("ODF validate host - host role: %s", host.Role)
+	log.Debugf("ODF validate host - mode: %s", string(mode))
+
+	// If the host is not going to run ODF workoads, we return 0 extra requirements for ODF.
+	if err != nil || shouldHostRunODF == nil || !*shouldHostRunODF {
+		return &models.ClusterHostRequirementsDetails{CPUCores: 0, RAMMib: 0}, nil
+	}
+
 	var diskCount int64 = 0
 	if host.Inventory != "" {
 		inventory, err := common.UnmarshalInventory(host.Inventory)
@@ -176,59 +263,34 @@ func (o *operator) GetHostRequirements(_ context.Context, cluster *common.Cluste
 			return nil, err
 		}
 
-		/* GetValidDiskCount counts the total number of valid disks in each host and return a error if we don't have the disk of required size,
+		/* getValidDiskCount counts the total number of valid disks in each host and return a error if we don't have the disk of required size,
 		we ignore the error as its treated as 500 in the UI */
-		diskCount, _ = o.getValidDiskCount(inventory.Disks, host.InstallationDiskID, mode)
+		diskCount, _ = o.getValidDiskCount(inventory.Disks, host.InstallationDiskID, nil, mode)
 	}
 
-	role := common.GetEffectiveRole(host)
 	if mode == compactMode {
-		var reqDisks int64 = 1
-		if diskCount > 0 {
-			reqDisks = diskCount
-		}
-		// for each disk odf requires 2 CPUs and 5 GiB RAM
-		if role == models.HostRoleMaster || role == models.HostRoleAutoAssign {
-			return &models.ClusterHostRequirementsDetails{
-				CPUCores: o.config.ODFPerHostCPUCompactMode + (reqDisks * o.config.ODFPerDiskCPUCount),
-				RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBCompactMode + (reqDisks * o.config.ODFPerDiskRAMGiB)),
-			}, nil
-		}
-		// regular worker req
+		diskCount = max(1, diskCount)
+
+		// Each ODF disk requires 2 CPUs and 5 GiB RAM
 		return &models.ClusterHostRequirementsDetails{
-			CPUCores: o.config.ODFPerHostCPUStandardMode + (reqDisks * o.config.ODFPerDiskCPUCount),
-			RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBStandardMode + (reqDisks * o.config.ODFPerDiskRAMGiB)),
+			CPUCores: o.config.ODFPerHostCPUCompactMode + (diskCount * o.config.ODFPerDiskCPUCount),
+			RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBCompactMode + (diskCount * o.config.ODFPerDiskRAMGiB)),
 		}, nil
 	}
 
-	// In standard mode, ODF does not run on master nodes so return zero
-	if role == models.HostRoleMaster {
-		return &models.ClusterHostRequirementsDetails{CPUCores: 0, RAMMib: 0}, nil
-	}
-
-	// worker and auto-assign
-	if diskCount > 0 {
-		// for each disk odf requires 2 CPUs and 5 GiB RAM
-		return &models.ClusterHostRequirementsDetails{
-			CPUCores: o.config.ODFPerHostCPUStandardMode + (diskCount * o.config.ODFPerDiskCPUCount),
-			RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBStandardMode + (diskCount * o.config.ODFPerDiskRAMGiB)),
-		}, nil
-	}
+	// worker in standard mode
+	// Each ODF disk odf requires 2 CPUs and 5 GiB RAM
 	return &models.ClusterHostRequirementsDetails{
-		CPUCores: o.config.ODFPerHostCPUStandardMode,
-		RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBStandardMode),
+		CPUCores: o.config.ODFPerHostCPUStandardMode + (diskCount * o.config.ODFPerDiskCPUCount),
+		RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBStandardMode + (diskCount * o.config.ODFPerDiskRAMGiB)),
 	}, nil
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
-func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error) {
-	dependencies, err := o.GetDependencies(cluster)
-	if err != nil {
-		return &models.OperatorHardwareRequirements{}, err
-	}
+func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
 	return &models.OperatorHardwareRequirements{
 		OperatorName: o.GetName(),
-		Dependencies: dependencies,
+		Dependencies: o.GetDependencies(cluster),
 		Requirements: &models.HostTypeHardwareRequirementsWrapper{
 			Master: &models.HostTypeHardwareRequirements{
 				Quantitative: &models.ClusterHostRequirementsDetails{
@@ -238,7 +300,7 @@ func (o *operator) GetPreflightRequirements(context context.Context, cluster *co
 				Qualitative: []string{
 					"Requirements apply only for master-only clusters",
 					"At least 3 hosts",
-					"At least 1 non-boot disk on 3 hosts",
+					"At least 1 non-boot SSD or HDD disk on 3 hosts",
 				},
 			},
 			Worker: &models.HostTypeHardwareRequirements{
@@ -251,13 +313,34 @@ func (o *operator) GetPreflightRequirements(context context.Context, cluster *co
 					fmt.Sprintf("%v GiB of additional RAM for each non-boot disk", o.config.ODFPerDiskRAMGiB),
 					fmt.Sprintf("%v additional CPUs for each non-boot disk", o.config.ODFPerDiskCPUCount),
 					"At least 3 workers",
-					"At least 1 non-boot disk on 3 workers",
+					"At least 1 non-boot SSD or HDD disk on 3 workers",
 				},
 			},
 		},
-	}, nil
+	}
 }
 
 func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDODF
+}
+
+// GetBundleLabels returns the bundle labels for the ODF operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	// For SNO feature, exclude from openshift-ai bundle
+	if slices.Contains(featureIDs, models.FeatureSupportLevelIDSNO) {
+		return []string{}
+	}
+
+	// For non-SNO deployments, use the default bundle behavior
+	return []string(Operator.Bundles)
+}
+
+func capitalizeFirstLetter(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+
+	runes := []rune(s)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }

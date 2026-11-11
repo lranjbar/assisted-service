@@ -1,25 +1,27 @@
-# Generate python client
-FROM quay.io/edge-infrastructure/swagger-codegen-cli:2.4.18 as swagger_py
-COPY swagger.yaml .
-COPY tools/generate_python_client.sh .
-RUN chmod +x ./generate_python_client.sh && SWAGGER_FILE=swagger.yaml OUTPUT=/build ./generate_python_client.sh
+FROM registry.access.redhat.com/ubi9/go-toolset:1.26 AS golang
 
-FROM registry.access.redhat.com/ubi9/python-311:latest as pybuilder
-COPY --chown=1001:0 . /assisted-service
-COPY --from=swagger_py --chown=1001:0 /build /assisted-service/build
-RUN python3 -m pip install -I pip && pip3 install -I -r /assisted-service/dev-requirements.txt
-RUN cd /assisted-service/build && python3 ../tools/client_package_initializer.py ./ https://github.com/openshift/assisted-service
+ADD . /app
+WORKDIR /app
 
-# TODO: Currently, the Python package is included in the service image for testing purposes. It conveniently allows matching a service version to a specific Python client version. In the future, once the Python package is published on pip, it should (probably) be removed from the Assisted Service image (this dockerfile).
+# Licenses
+RUN go install github.com/google/go-licenses@v1.6.0
+RUN ${HOME}/go/bin/go-licenses save --save_path /tmp/licenses ./...
 
 # Build binaries
-FROM quay.io/centos/centos:stream9 as builder
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:3816d303e75dec4da2d10eeb9e8651eef4393721598bea4690c607282635aa57 AS builder
 
-RUN dnf install --enablerepo=crb -y gcc git nmstate-devel && dnf clean all
-COPY --from=registry.ci.openshift.org/openshift/release:golang-1.20 /usr/local/go /usr/local/go
+# Build requirements
+RUN dnf install -y gcc git nmstate-devel openssl-devel && \
+    dnf clean all
 
-ENV GOROOT=/usr/local/go
-ENV PATH=$PATH:$GOROOT/bin
+ENV GOROOT=/usr/lib/golang
+ENV GOPATH=/opt/app-root/src/go
+ENV PATH=$PATH:$GOROOT/bin:$GOPATH/bin
+
+COPY --from=golang $GOPATH $GOPATH
+COPY --from=golang $GOROOT $GOROOT
+
+RUN chmod 775 -R $GOPATH && chmod 775 -R $GOROOT
 
 WORKDIR /assisted-service/
 
@@ -33,25 +35,68 @@ RUN go mod download
 
 COPY . /assisted-service/
 
-RUN cd cmd && CGO_ENABLED=1 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service
-RUN cd ./cmd/operator && CGO_ENABLED=1 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service-operator
-RUN cd ./cmd/webadmission && CGO_ENABLED=1 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service-admission
-RUN cd ./cmd/agentbasedinstaller/client && CGO_ENABLED=1 GOFLAGS="" GO111MODULE=on go build -o /build/agent-installer-client
+RUN cd cmd && CGO_ENABLED=1 GOFIPS140=v1.0.0 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service
+RUN cd ./cmd/operator && CGO_ENABLED=1 GOFIPS140=v1.0.0 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service-operator
+RUN cd ./cmd/webadmission && CGO_ENABLED=1 GOFIPS140=v1.0.0 GOFLAGS="" GO111MODULE=on go build -o /build/assisted-service-admission
+RUN cd ./cmd/agentbasedinstaller/client && CGO_ENABLED=1 GOFIPS140=v1.0.0 GOFLAGS="" GO111MODULE=on go build -o /build/agent-installer-client
+
+# Extract the commit reference from which the image is built
+RUN git rev-parse --short HEAD > /commit-reference.txt
 
 # Create final image
-FROM quay.io/centos/centos:stream9
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest@sha256:6fc28bcb6776e387d7a35a2056d9d2b985dc4e26031e98a2bd35a7137cd6fd71
+
+RUN microdnf install -y --disablerepo="*" --enablerepo="ubi-9-*" crypto-policies-scripts && \
+    update-crypto-policies --set DEFAULT:PQ && \
+    microdnf clean all
+
+ARG release=main
+ARG version=latest
+
+LABEL com.redhat.component assisted-service
+LABEL description "Service that installs Openshift"
+LABEL summary "Service that installs Openshift"
+LABEL io.k8s.description "Service that installs Openshift"
+LABEL distribution-scope public
+LABEL name assisted-service
+LABEL release ${release}
+LABEL version ${version}
+LABEL url https://github.com/openshift/assisted-service
+LABEL vendor "Red Hat, Inc."
+LABEL maintainer "Red Hat"
+
+COPY --from=golang /tmp/licenses /licenses
 
 # multiarch images need it till WRKLDS-222 and https://bugzilla.redhat.com/show_bug.cgi?id=2111537 are fixed
-RUN dnf install -y --setopt=install_weak_deps=False skopeo
-# openshift-install requires this
-RUN dnf install -y libvirt-libs nmstate nmstate-libs &&\
+RUN microdnf install -y skopeo && \
+    microdnf clean all
+# openshift-install requirements
+RUN microdnf install -y nmstate nmstate-libs && \
+    microdnf clean all
+
+# Install dnf for external repository management
+RUN microdnf install -y dnf && microdnf clean all
+
+# Import CentOS GPG keys for secure package verification
+RUN rpm --import https://www.centos.org/keys/RPM-GPG-KEY-CentOS-Official
+
+# Add CentOS Stream repositories for packages not available in UBI (platform-agnostic)
+RUN ARCH=$(uname -m) && \
+    dnf install -y 'dnf-command(config-manager)' && \
+    dnf config-manager --add-repo http://mirror.stream.centos.org/9-stream/BaseOS/${ARCH}/os/ && \
+    dnf config-manager --add-repo http://mirror.stream.centos.org/9-stream/AppStream/${ARCH}/os/ && \
+    dnf install -y libvirt-libs && \
     dnf clean all
 
-RUN dnf update libksba libxml2 -y && dnf clean all
+RUN microdnf update libksba libxml2 -y && microdnf clean all
 
+# Ensure UID can write in data dir (e.g.: when using podman, docker, ...)
+# Ensure root group can write in data dir when deployed on OCP
+# https://docs.openshift.com/container-platform/4.16/openshift_images/create-images.html#use-uid_create-images
 ARG WORK_DIR=/data
-
-RUN mkdir $WORK_DIR && chmod 775 $WORK_DIR
+ARG UID=1001
+ARG GID=0
+RUN mkdir $WORK_DIR && chmod 775 $WORK_DIR && chown $UID:$GID $WORK_DIR
 
 # downstream this can be installed as an RPM
 COPY --from=quay.io/openshift/origin-cli:4.12 /usr/bin/oc /usr/local/bin/
@@ -61,7 +106,12 @@ COPY --from=builder /build/assisted-service-operator /assisted-service-operator
 COPY --from=builder /build/assisted-service-admission /assisted-service-admission
 COPY --from=builder /build/agent-installer-client /usr/local/bin/agent-installer-client
 RUN ln -s /usr/local/bin/agent-installer-client /agent-based-installer-register-cluster-and-infraenv
-COPY --from=pybuilder /assisted-service/build/dist/* /clients/
 ENV GODEBUG=madvdontneed=1
 ENV GOGC=50
+
+# Extract the commit reference from which the image is built
+COPY --from=builder /commit-reference.txt /commit-reference.txt
+
+USER $UID:$GID
+
 CMD ["/assisted-service"]

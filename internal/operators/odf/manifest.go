@@ -28,18 +28,18 @@ func generateStorageClusterManifest(StorageClusterManifest string, odfDiskCounts
 
 }
 
-func Manifests(odfConfig *Config, openshiftVersion string) (map[string][]byte, []byte, error) {
+func Manifests(mode odfDeploymentMode, numberOfDisks int64, openshiftVersion string) (map[string][]byte, []byte, error) {
 	openshiftManifests := make(map[string][]byte)
 	var odfSC []byte
 	var err error
 
-	if odfConfig.ODFDeploymentType == compactMode {
-		odfSC, err = generateStorageClusterManifest(ocsMinDeploySC, odfConfig.ODFDisksAvailable)
+	if mode == compactMode {
+		odfSC, err = generateStorageClusterManifest(ocsMinDeploySC, numberOfDisks)
 		if err != nil {
 			return nil, nil, err
 		}
 	} else { // use the ODF CR with labelSelector to deploy ODF on only worker nodes
-		odfSC, err = generateStorageClusterManifest(ocsSc, odfConfig.ODFDisksAvailable)
+		odfSC, err = generateStorageClusterManifest(ocsSc, numberOfDisks)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -72,7 +72,16 @@ func Manifests(odfConfig *Config, openshiftVersion string) (map[string][]byte, [
 	}
 	openshiftManifests["50_openshift-odf_subscription.yaml"] = []byte(odfSubscription)
 	openshiftManifests["50_openshift-odf_operator_group.yaml"] = []byte(odfOperatorGroup)
-	odfSC = append([]byte(odfStorageSystem+"\n---\n"), odfSC...)
+
+	// StorageSystem manifest is only needed for OCP versions up to 4.18
+	constraintsPre419, subErr := version.NewConstraint("< 4.19.0")
+	if subErr != nil {
+		return nil, nil, subErr
+	}
+	if constraintsPre419.Check(v1) {
+		odfSC = append([]byte(odfStorageSystem+"\n---\n"), odfSC...)
+	}
+
 	return openshiftManifests, odfSC, nil
 }
 
@@ -143,6 +152,7 @@ metadata:
   name: openshift-storage
 spec: {}`
 
+// TODO: Remove this section when versions under 4.19 are no longer supported
 const odfStorageSystem = `apiVersion: odf.openshift.io/v1alpha1
 kind: StorageSystem
 metadata:

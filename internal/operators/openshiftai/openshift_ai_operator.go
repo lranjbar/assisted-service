@@ -1,0 +1,289 @@
+package openshiftai
+
+import (
+	"context"
+	"fmt"
+	"text/template"
+
+	"github.com/kelseyhightower/envconfig"
+	"github.com/lib/pq"
+	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/operators/amdgpu"
+	"github.com/openshift/assisted-service/internal/operators/api"
+	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/lvm"
+	"github.com/openshift/assisted-service/internal/operators/nvidiagpu"
+	"github.com/openshift/assisted-service/internal/templating"
+	"github.com/openshift/assisted-service/models"
+	"github.com/openshift/assisted-service/pkg/conversions"
+	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID    = string(models.ClusterValidationIDOpenshiftAiRequirementsSatisfied)
+	clusterGPUValidationID = string(models.ClusterValidationIDOpenshiftAiGpuRequirementsSatisfied)
+	hostValidationID       = string(models.HostValidationIDOpenshiftAiRequirementsSatisfied)
+)
+
+var Operator = models.MonitoredOperator{
+	Namespace:        "redhat-ods-operator",
+	Name:             "openshift-ai",
+	OperatorType:     models.OperatorTypeOlm,
+	SubscriptionName: "rhods-operator",
+	TimeoutSeconds:   30 * 60,
+	Bundles: pq.StringArray{
+		operatorscommon.BundleOpenShiftAI.ID,
+	},
+}
+
+// operator is an OpenShift AI OLM operator plugin.
+type operator struct {
+	log       logrus.FieldLogger
+	config    *Config
+	templates *template.Template
+}
+
+// NewOpenShiftAIOperator creates new OpenShift AI operator.
+func NewOpenShiftAIOperator(log logrus.FieldLogger) *operator {
+	config := &Config{}
+	err := envconfig.Process(common.EnvConfigPrefix, config)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	templates, err := templating.LoadTemplates(templatesRoot)
+	if err != nil {
+		log.Fatal(err.Error())
+	}
+	return &operator{
+		log:       log,
+		config:    config,
+		templates: templates,
+	}
+}
+
+// GetName reports the name of an operator.
+func (o *operator) GetName() string {
+	return Operator.Name
+}
+
+func (o *operator) GetFullName() string {
+	return "OpenShift AI"
+}
+
+// GetDependencies provides a list of dependencies of the Operator.
+// GPU vendors (NVIDIA, AMD) are no longer auto-selected as dependencies — users
+// must explicitly choose them via the bundle's optional_operators.
+func (o *operator) GetDependencies(c *common.Cluster) []string {
+	if common.IsSingleNodeCluster(c) {
+		return []string{lvm.Operator.Name}
+	}
+
+	return []string{}
+}
+
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{models.FeatureSupportLevelIDLVM}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the operator.
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
+}
+
+// GetHostValidationID returns host validation ID for the operator.
+func (o *operator) GetHostValidationID() string {
+	return hostValidationID
+}
+
+// ValidateCluster checks if the cluster satisfies the requirements to install the operator.
+func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	workerValidation := o.validateWorkers(cluster)
+
+	gpuValidation, err := o.validateGPU(cluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate GPU: %w", err)
+	}
+
+	return []api.ValidationResult{workerValidation, gpuValidation}, nil
+}
+
+func (o *operator) validateWorkers(cluster *common.Cluster) api.ValidationResult {
+	result := api.ValidationResult{
+		ValidationId: clusterValidationID,
+		Status:       api.Success,
+	}
+
+	if common.IsSingleNodeCluster(cluster) {
+		return result
+	}
+
+	// Check the number of worker nodes:
+	workerCount := int64(common.NumberOfWorkers(cluster))
+	if workerCount < o.config.MinWorkerNodes {
+		result.Status = api.Failure
+		result.Reasons = []string{
+			fmt.Sprintf(
+				"OpenShift AI requires at least %d worker nodes, but the cluster has %d.",
+				o.config.MinWorkerNodes, workerCount,
+			),
+		}
+
+		return result
+	}
+
+	return result
+}
+
+func (o *operator) validateGPU(cluster *common.Cluster) (api.ValidationResult, error) {
+	result := api.ValidationResult{
+		ValidationId: clusterGPUValidationID,
+		Status:       api.Success,
+	}
+
+	hasGPUOperator := operatorscommon.HasOperator(cluster.MonitoredOperators, nvidiagpu.Operator.Name) ||
+		operatorscommon.HasOperator(cluster.MonitoredOperators, amdgpu.Operator.Name)
+
+	if !hasGPUOperator {
+		result.Reasons = []string{"No GPU vendor selected - OpenShift AI will be installed without GPU support"}
+	}
+
+	return result, nil
+}
+
+// ValidateHost returns validationResult based on node type requirements such as memory and CPU.
+func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host,
+	_ *models.ClusterHostRequirementsDetails) (result api.ValidationResult, err error) {
+	result.ValidationId = o.GetHostValidationID()
+
+	if host.Inventory == "" {
+		result.Status = api.Pending
+		result.Reasons = []string{
+			"Missing inventory in the host",
+		}
+		return
+	}
+	inventory, err := common.UnmarshalInventory(host.Inventory)
+	if err != nil {
+		result.Status = api.Pending
+		result.Reasons = []string{
+			"Failed to get inventory from host",
+		}
+		return
+	}
+
+	requirements, err := o.GetHostRequirements(ctx, cluster, host)
+	if err != nil {
+		result.Status = api.Pending
+		result.Reasons = []string{
+			fmt.Sprintf(
+				"Failed to get host requirements for host with id '%s'",
+				host.ID,
+			),
+		}
+		return
+	}
+
+	effectiveRole := common.GetEffectiveRole(host)
+
+	// Check CPU:
+	requiredCPUCores := requirements.CPUCores
+	usableCPUCores := inventory.CPU.Count
+	if usableCPUCores < requiredCPUCores {
+		result.Reasons = append(
+			result.Reasons,
+			fmt.Sprintf(
+				"Insufficient CPU to deploy OpenShift AI on the %s role, requires an additional %d CPU cores (included in the total required for the %s role) but found %d.",
+				effectiveRole, requiredCPUCores, effectiveRole, usableCPUCores,
+			),
+		)
+	}
+
+	// Check memory:
+	requiredMemoryBytes := conversions.MibToBytes(requirements.RAMMib)
+	usableMemoryBytes := inventory.Memory.UsableBytes
+	if usableMemoryBytes < requiredMemoryBytes {
+		result.Reasons = append(
+			result.Reasons,
+			fmt.Sprintf(
+				"Insufficient memory to deploy OpenShift AI on the %s role, requires an additional %s (included in the total required for the %s role) but found %s.",
+				effectiveRole,
+				conversions.BytesToString(requiredMemoryBytes),
+				effectiveRole,
+				conversions.BytesToString(usableMemoryBytes),
+			),
+		)
+	}
+
+	if len(result.Reasons) > 0 {
+		result.Status = api.Failure
+	} else {
+		result.Status = api.Success
+	}
+	return
+}
+
+// GetProperties provides description of operator properties.
+func (o *operator) GetProperties() models.OperatorProperties {
+	return models.OperatorProperties{}
+}
+
+// GetMonitoredOperator returns the information that describes how to monitor the operator.
+func (o *operator) GetMonitoredOperator() *models.MonitoredOperator {
+	return &Operator
+}
+
+// GetHostRequirements provides the requirements that the host needs to satisfy in order to be able to install the
+// operator.
+func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Cluster,
+	host *models.Host) (result *models.ClusterHostRequirementsDetails, err error) {
+	preflightRequirements := o.GetPreflightRequirements(ctx, cluster)
+
+	switch common.GetEffectiveRole(host) {
+	case models.HostRoleMaster:
+		result = preflightRequirements.Requirements.Master.Quantitative
+	case models.HostRoleWorker:
+		result = preflightRequirements.Requirements.Worker.Quantitative
+	default:
+		result = &models.ClusterHostRequirementsDetails{}
+	}
+	return
+}
+
+// GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only.
+func (o *operator) GetPreflightRequirements(context context.Context, cluster *common.Cluster) *models.OperatorHardwareRequirements {
+	return &models.OperatorHardwareRequirements{
+		OperatorName: o.GetName(),
+		Dependencies: o.GetDependencies(cluster),
+		Requirements: &models.HostTypeHardwareRequirementsWrapper{
+			Master: &models.HostTypeHardwareRequirements{
+				Qualitative: []string{},
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores: 0,
+					RAMMib:   0,
+				},
+			},
+			Worker: &models.HostTypeHardwareRequirements{
+				Qualitative: []string{},
+				Quantitative: &models.ClusterHostRequirementsDetails{
+					CPUCores: o.config.MinWorkerCPUCores,
+					RAMMib:   conversions.GibToMib(o.config.MinWorkerMemoryGiB),
+				},
+			},
+		},
+	}
+}
+
+func (o *operator) GetSupportedArchitectures() []string {
+	return []string{
+		common.X86CPUArchitecture,
+	}
+}
+
+func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
+	return models.FeatureSupportLevelIDOPENSHIFTAI
+}
+
+// GetBundleLabels returns the bundle labels for the OpenShift AI operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	return []string(Operator.Bundles)
+}

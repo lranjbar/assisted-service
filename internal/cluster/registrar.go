@@ -26,17 +26,35 @@ type registrar struct {
 }
 
 func (r *registrar) RegisterCluster(ctx context.Context, cluster *common.Cluster) error {
-	return r.registerCluster(cluster, models.ClusterStatusInsufficient, StatusInfoInsufficient, time.Now())
+	return r.registerCluster(cluster)
 }
 
-func (r *registrar) RegisterAddHostsCluster(ctx context.Context, cluster *common.Cluster) error {
-	return r.registerCluster(cluster, models.ClusterStatusAddingHosts, statusInfoAddingHosts, time.Now())
+func (r *registrar) getStatusByClusterKind(kind string) (string, string) {
+	switch kind {
+	case models.ClusterKindCluster:
+		return models.ClusterStatusInsufficient, StatusInfoInsufficient
+	case models.ClusterKindAddHostsCluster:
+		return models.ClusterStatusAddingHosts, statusInfoAddingHosts
+	case models.ClusterKindDisconnectedCluster:
+		return models.ClusterStatusUnmonitored, statusInfoDisconnected
+	default:
+		r.log.Warnf("Unknown cluster kind: %s, defaulting to insufficient status", kind)
+		return models.ClusterStatusInsufficient, StatusInfoInsufficient
+	}
 }
 
-func (r *registrar) registerCluster(cluster *common.Cluster, status, statusInfo string, registerTime time.Time) error {
+func (r *registrar) registerCluster(cluster *common.Cluster) error {
+	kind := models.ClusterKindCluster
+	if cluster.Kind != nil {
+		kind = *cluster.Kind
+	} else {
+		r.log.Warnf("Cluster %s has no kind specified, defaulting to %s", cluster.ID, models.ClusterKindCluster)
+		cluster.Kind = swag.String(models.ClusterKindCluster)
+	}
+	status, statusInfo := r.getStatusByClusterKind(kind)
 	cluster.Status = swag.String(status)
 	cluster.StatusInfo = swag.String(statusInfo)
-	cluster.StatusUpdatedAt = strfmt.DateTime(registerTime)
+	cluster.StatusUpdatedAt = strfmt.DateTime(time.Now())
 
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -63,17 +81,6 @@ func (r *registrar) registerCluster(cluster *common.Cluster, status, statusInfo 
 
 		return nil
 	})
-}
-
-func (r *registrar) RegisterAddHostsOCPCluster(c *common.Cluster, db *gorm.DB) error {
-	c.Status = swag.String(models.ClusterStatusAddingHosts)
-	c.StatusInfo = swag.String(StatusInfoReady)
-	err := db.Create(c).Error
-	if err != nil {
-		r.log.WithError(err).Errorf("Failed to create OCP cluster in DB")
-		return err
-	}
-	return nil
 }
 
 func (r *registrar) DeregisterCluster(ctx context.Context, cluster *common.Cluster) error {

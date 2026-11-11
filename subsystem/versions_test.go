@@ -8,11 +8,12 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/client/versions"
 	"github.com/openshift/assisted-service/models"
+	"github.com/openshift/assisted-service/subsystem/utils_test"
 )
 
 var _ = Describe("[minimal-set]test versions", func() {
 	It("get versions list", func() {
-		reply, err := userBMClient.Versions.V2ListComponentVersions(context.Background(), &versions.V2ListComponentVersionsParams{})
+		reply, err := utils_test.TestContext.UserBMClient.Versions.V2ListComponentVersions(context.Background(), &versions.V2ListComponentVersionsParams{})
 		Expect(err).ShouldNot(HaveOccurred())
 
 		// service, agent, installer, controller
@@ -20,7 +21,7 @@ var _ = Describe("[minimal-set]test versions", func() {
 	})
 
 	It("get openshift versions list", func() {
-		reply, err := userBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
+		reply, err := utils_test.TestContext.UserBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(len(reply.GetPayload())).To(BeNumerically(">=", 1))
 	})
@@ -31,19 +32,15 @@ var _ = Describe("[minimal-set]test versions", func() {
 				Skip("organization based functionality access is disabled")
 			}
 		})
-		It("Doesn't have multiarch capability", func() {
-			reply, err := userBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
+
+		It("multiarch versions are visible to all users", func() {
+			reply, err := utils_test.TestContext.UserBMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(hasMultiarch(reply.GetPayload())).Should(BeFalse())
-		})
-		It("Has multiarch capability", func() {
-			// (MGMT-11859) This test relies on the fact that multiarch release images have
-			//              "-multi" suffix when presented via SupportedOpenshiftVersions API.
-			//              As soon as we collapse single- and multiarch releases, the contract
-			//              defined by "func hasMultiarch()" will not be valid anymore.
-			reply, err := user2BMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
+			Expect(hasMultiarch(reply.GetPayload())).To(BeTrue())
+
+			reply2, err := utils_test.TestContext.User2BMClient.Versions.V2ListSupportedOpenshiftVersions(context.Background(), &versions.V2ListSupportedOpenshiftVersionsParams{})
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(hasMultiarch(reply.GetPayload())).Should(BeTrue())
+			Expect(hasMultiarch(reply2.GetPayload())).To(BeTrue())
 		})
 	})
 })

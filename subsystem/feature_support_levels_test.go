@@ -12,6 +12,7 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/models"
+	"github.com/openshift/assisted-service/subsystem/utils_test"
 	"github.com/thoas/go-funk"
 )
 
@@ -28,7 +29,7 @@ var _ = Describe("Feature support levels API", func() {
 				PlatformType:     platformType,
 				CPUArchitecture:  cpuArchitecture,
 			}
-			supportedFeaturesOK, err := user2BMClient.Installer.GetSupportedFeatures(ctx, &params)
+			supportedFeaturesOK, err := utils_test.TestContext.User2BMClient.Installer.GetSupportedFeatures(ctx, &params)
 			if err != nil {
 				return nil, err
 			}
@@ -36,15 +37,15 @@ var _ = Describe("Feature support levels API", func() {
 			return &supportedFeaturesOK.Payload.Features, nil
 		}
 
-		registerNewCluster := func(version, cpuArchitecture, highAvailabilityMode string, userManagedNetworking *bool) (*installer.V2RegisterClusterCreated, error) {
-			cluster, errRegisterCluster := user2BMClient.Installer.V2RegisterCluster(ctx, &installer.V2RegisterClusterParams{
+		registerNewCluster := func(version, cpuArchitecture string, ctrlPlaneCount int64, userManagedNetworking *bool) (*installer.V2RegisterClusterCreated, error) {
+			cluster, errRegisterCluster := utils_test.TestContext.User2BMClient.Installer.V2RegisterCluster(ctx, &installer.V2RegisterClusterParams{
 				NewClusterParams: &models.ClusterCreateParams{
 					Name:                  swag.String("test-cluster"),
 					OpenshiftVersion:      swag.String(version),
-					PullSecret:            swag.String(fmt.Sprintf(psTemplate, FakePS2)),
+					PullSecret:            swag.String(fmt.Sprintf(psTemplate, utils_test.FakePS2)),
 					BaseDNSDomain:         "example.com",
 					CPUArchitecture:       cpuArchitecture,
-					HighAvailabilityMode:  swag.String(highAvailabilityMode),
+					ControlPlaneCount:     swag.Int64(ctrlPlaneCount),
 					UserManagedNetworking: userManagedNetworking,
 				},
 			})
@@ -57,12 +58,12 @@ var _ = Describe("Feature support levels API", func() {
 		}
 
 		registerNewInfraEnv := func(id *strfmt.UUID, version, cpuArchitecture string) (*installer.RegisterInfraEnvCreated, error) {
-			infraEnv, errRegisterInfraEnv := user2BMClient.Installer.RegisterInfraEnv(context.Background(), &installer.RegisterInfraEnvParams{
+			infraEnv, errRegisterInfraEnv := utils_test.TestContext.User2BMClient.Installer.RegisterInfraEnv(context.Background(), &installer.RegisterInfraEnvParams{
 				InfraenvCreateParams: &models.InfraEnvCreateParams{
 					Name:             swag.String("test-infra-env"),
 					OpenshiftVersion: version,
-					PullSecret:       swag.String(fmt.Sprintf(psTemplate, FakePS2)),
-					SSHAuthorizedKey: swag.String(sshPublicKey),
+					PullSecret:       swag.String(fmt.Sprintf(psTemplate, utils_test.FakePS2)),
+					SSHAuthorizedKey: swag.String(utils_test.SshPublicKey),
 					ImageType:        models.ImageTypeFullIso,
 					ClusterID:        id,
 					CPUArchitecture:  cpuArchitecture,
@@ -75,7 +76,7 @@ var _ = Describe("Feature support levels API", func() {
 		Context("GetSupportedFeatures", func() {
 
 			It("With Platform", func() {
-				features, err := featureSupport("4.14", swag.String("external"), swag.String(models.ClusterCPUArchitectureX8664))
+				features, err := featureSupport(common.TestVersion().Version(), swag.String("external"), swag.String(models.ClusterCPUArchitectureX8664))
 				Expect(err).NotTo(HaveOccurred())
 
 				Expect(funk.Contains(*features, string(models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING))).To(Equal(true))
@@ -87,7 +88,7 @@ var _ = Describe("Feature support levels API", func() {
 			})
 
 			It("Without Platform", func() {
-				features, err := featureSupport("4.14", nil, swag.String(models.ClusterCPUArchitectureX8664))
+				features, err := featureSupport(common.TestVersion().Version(), nil, swag.String(models.ClusterCPUArchitectureX8664))
 				Expect(err).NotTo(HaveOccurred())
 
 				Expect(funk.Contains(*features, string(models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING))).To(Equal(false))
@@ -101,12 +102,12 @@ var _ = Describe("Feature support levels API", func() {
 		})
 
 		Context("Update cluster", func() {
-			It("Update umn true won't fail on 4.13 with s390x without infra-env", func() {
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+			It("Update umn true won't fail on multi release without infra-env", func() {
+				cluster, err := registerNewCluster(multiarchOpenshiftVersion, common.MultiCPUArchitecture, int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 
-				_, err = user2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
+				_, err = utils_test.TestContext.User2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
 					ClusterUpdateParams: &models.V2ClusterUpdateParams{
 						UserManagedNetworking: swag.Bool(false),
 					},
@@ -115,17 +116,16 @@ var _ = Describe("Feature support levels API", func() {
 				Expect(err).NotTo(HaveOccurred())
 			})
 
-			It("Update umn true fail on 4.13 with s390x with infra-env", func() {
-				expectedError := "cannot use Cluster Managed Networking because it's not compatible with the s390x architecture on version 4.13"
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+			It("Update umn true fail with s390x with infra-env", func() {
+				cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), common.S390xCPUArchitecture, int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 
-				infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, "4.13", "s390x")
+				infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, common.TestVersion().ForArch("s390x").Version(), "s390x")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(infraEnv.Payload.CPUArchitecture).To(Equal("s390x"))
 
-				_, err = user2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
+				_, err = utils_test.TestContext.User2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
 					ClusterUpdateParams: &models.V2ClusterUpdateParams{
 						UserManagedNetworking: swag.Bool(false),
 					},
@@ -133,16 +133,16 @@ var _ = Describe("Feature support levels API", func() {
 				})
 				Expect(err).To(HaveOccurred())
 				err2 := err.(*installer.V2UpdateClusterBadRequest)
-				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(expectedError))
+				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(
+					fmt.Sprintf("cannot use Cluster Managed Networking because it's not compatible with the s390x architecture on version %s of OpenShift", cluster.Payload.OpenshiftVersion)))
 			})
 
 			It("Create infra-env after updating OLM operators on s390x architecture ", func() {
-				expectedError := "cannot use OpenShift Virtualization because it's not compatible with the s390x architecture on version 4.13"
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+				cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), common.S390xCPUArchitecture, int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 
-				_, err = user2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
+				_, err = utils_test.TestContext.User2BMClient.Installer.V2UpdateCluster(ctx, &installer.V2UpdateClusterParams{
 					ClusterUpdateParams: &models.V2ClusterUpdateParams{
 						OlmOperators: []*models.OperatorCreateParams{
 							{Name: "odf"},
@@ -154,17 +154,18 @@ var _ = Describe("Feature support levels API", func() {
 				})
 				Expect(err).ToNot(HaveOccurred())
 
-				_, err = registerNewInfraEnv(cluster.Payload.ID, "4.13", "s390x")
+				_, err = registerNewInfraEnv(cluster.Payload.ID, common.TestVersion().ForArch("s390x").Version(), "s390x")
 				err2 := err.(*installer.RegisterInfraEnvBadRequest)
-				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(expectedError))
+				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(
+					fmt.Sprintf("cannot use OpenShift Virtualization because it's not compatible with the s390x architecture on version %s of OpenShift", cluster.Payload.OpenshiftVersion)))
 			})
 			Context("UpdateInfraEnv", func() {
 				It("Update ppc64le infra env minimal iso without cluster", func() {
-					infraEnv, err := registerNewInfraEnv(nil, "4.12", models.ClusterCPUArchitecturePpc64le)
+					infraEnv, err := registerNewInfraEnv(nil, common.TestVersion().ForArch("ppc64le").Version(), models.ClusterCPUArchitecturePpc64le)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(common.ImageTypeValue(infraEnv.Payload.Type)).ToNot(Equal(models.ImageTypeMinimalIso))
 
-					updatedInfraEnv, err := user2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
+					updatedInfraEnv, err := utils_test.TestContext.User2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
 						InfraEnvID: *infraEnv.Payload.ID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
 							ImageType: models.ImageTypeMinimalIso,
@@ -173,14 +174,14 @@ var _ = Describe("Feature support levels API", func() {
 					Expect(common.ImageTypeValue(updatedInfraEnv.Payload.Type)).To(Equal(models.ImageTypeMinimalIso))
 				})
 				It("Update ppc64le infra env minimal iso with cluster", func() {
-					cluster, err := registerNewCluster("4.12", models.ClusterCPUArchitecturePpc64le, models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+					cluster, err := registerNewCluster(common.TestVersion().ForArch("ppc64le").MultiVersion(), models.ClusterCPUArchitecturePpc64le, int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 					Expect(err).NotTo(HaveOccurred())
 
-					infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, "4.12", models.ClusterCPUArchitecturePpc64le)
+					infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, common.TestVersion().ForArch("ppc64le").Version(), models.ClusterCPUArchitecturePpc64le)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(common.ImageTypeValue(infraEnv.Payload.Type)).ToNot(Equal(models.ImageTypeMinimalIso))
 
-					updatedInfraEnv, err := user2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
+					updatedInfraEnv, err := utils_test.TestContext.User2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
 						InfraEnvID: *infraEnv.Payload.ID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
 							ImageType: models.ImageTypeMinimalIso,
@@ -189,63 +190,63 @@ var _ = Describe("Feature support levels API", func() {
 					Expect(common.ImageTypeValue(updatedInfraEnv.Payload.Type)).To(Equal(models.ImageTypeMinimalIso))
 				})
 				It("Update s390x infra env minimal iso with cluster - fail", func() {
-					cluster, err := registerNewCluster("4.12", "s390x", models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+					cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), "s390x", int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 					Expect(err).NotTo(HaveOccurred())
 
-					infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, "4.12", models.ClusterCPUArchitectureS390x)
+					infraEnv, err := registerNewInfraEnv(cluster.Payload.ID, common.TestVersion().ForArch("s390x").Version(), models.ClusterCPUArchitectureS390x)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(common.ImageTypeValue(infraEnv.Payload.Type)).ToNot(Equal(models.ImageTypeMinimalIso))
 
-					_, err = user2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
+					_, err = utils_test.TestContext.User2BMClient.Installer.UpdateInfraEnv(ctx, &installer.UpdateInfraEnvParams{
 						InfraEnvID: *infraEnv.Payload.ID,
 						InfraEnvUpdateParams: &models.InfraEnvUpdateParams{
 							ImageType: models.ImageTypeMinimalIso,
 						}})
 					Expect(err).To(HaveOccurred())
 					err2 := err.(*installer.UpdateInfraEnvBadRequest)
-					ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring("cannot use Minimal ISO because it's not compatible with the s390x architecture on version 4.12"))
+					ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(
+						fmt.Sprintf("cannot use Minimal ISO because it's not compatible with the s390x architecture on version %s of OpenShift", cluster.Payload.OpenshiftVersion)))
 				})
 			})
 		})
 
 		Context("Register cluster", func() {
-			It("Register cluster won't fail on 4.13 with s390x", func() {
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeFull, swag.Bool(true))
+			It("Register cluster won't fail with s390x", func() {
+				cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), "s390x", int64(common.MinMasterHostsNeededForInstallationInHaMode), swag.Bool(true))
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 			})
 
-			It("Register cluster won't fail on 4.13 with s390x without UMN", func() {
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeFull, nil)
+			It("Register cluster won't fail with s390x without UMN", func() {
+				cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), "s390x", int64(common.MinMasterHostsNeededForInstallationInHaMode), nil)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
 			})
 
-			It("SNO with s390x 4.10 fails on architecture- failure", func() {
-				expectedError := "Requested CPU architecture s390x is not available"
-				_, err := registerNewCluster("4.10", "s390x", models.ClusterHighAvailabilityModeNone, swag.Bool(true))
+			// s390x architecture support was added in OCP 4.11
+			It("SNO with s390x fails on architecture when version lacks s390x support", func() {
+				version, ok := common.TestVersion().LessThan("4.11").TryVersion()
+				if !ok {
+					Skip("s390x rejection requires OCP < 4.11")
+				}
+				_, err := registerNewCluster(version, "s390x", int64(1), swag.Bool(true))
 				Expect(err).To(HaveOccurred())
 				err2 := err.(*installer.V2RegisterClusterBadRequest)
-				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(expectedError))
+				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring("Requested CPU architecture s390x is not available"))
 			})
-			It("SNO with s390x fails on SNO isn't compatible with architecture success on 4.13", func() {
-				cluster, err := registerNewCluster("4.13", "s390x", models.ClusterHighAvailabilityModeNone, nil)
+			It("SNO with s390x succeeds when version supports s390x", func() {
+				cluster, err := registerNewCluster(common.TestVersion().ForArch("s390x").MultiVersion(), "s390x", int64(1), nil)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(cluster.Payload.CPUArchitecture).To(Equal("multi"))
-				Expect(swag.StringValue(cluster.Payload.HighAvailabilityMode)).To(Equal(models.ClusterHighAvailabilityModeNone))
+				Expect(cluster.Payload.CPUArchitecture).To(Equal(common.MultiCPUArchitecture))
+				Expect(cluster.Payload.ControlPlaneCount).To(Equal(int64(1)))
 
-			})
-			It("SNO with s390x fails on SNO isn't compatible with architecture on 4.12 - failure", func() {
-				expectedError := "cannot use Single Node OpenShift because it's not compatible with the s390x architecture on version 4.12"
-				_, err := registerNewCluster("4.12", "s390x", models.ClusterHighAvailabilityModeNone, swag.Bool(true))
-				Expect(err).To(HaveOccurred())
-				err2 := err.(*installer.V2RegisterClusterBadRequest)
-				ExpectWithOffset(1, *err2.Payload.Reason).To(ContainSubstring(expectedError))
 			})
 		}) // Register cluster
 
 		Context("Supported features", func() {
-			availableVersions := []string{"4.8", "4.9", "4.10", "4.11", "4.12", "4.13"}
+			oldestVersion := common.TestVersion().Oldest().Version()
+			latestVersion := common.TestVersion().Version()
+			availableVersions := []string{oldestVersion, latestVersion}
 
 			var params installer.GetSupportedFeaturesParams
 			arch := models.ClusterCPUArchitectureX8664
@@ -258,7 +259,7 @@ var _ = Describe("Feature support levels API", func() {
 						OpenshiftVersion: version,
 						CPUArchitecture:  swag.String(arch),
 					}
-					response, err := userBMClient.Installer.GetSupportedFeatures(ctx, &params)
+					response, err := utils_test.TestContext.UserBMClient.Installer.GetSupportedFeatures(ctx, &params)
 					Expect(err).ShouldNot(HaveOccurred())
 
 					for featureID, supportLevel := range response.Payload.Features {
@@ -269,7 +270,7 @@ var _ = Describe("Feature support levels API", func() {
 				})
 
 				It(fmt.Sprintf("GetSupportedFeatures with empty CPU architectrue, OCP version %s", version), func() {
-					response, err := userBMClient.Installer.GetSupportedFeatures(ctx, &installer.GetSupportedFeaturesParams{OpenshiftVersion: version})
+					response, err := utils_test.TestContext.UserBMClient.Installer.GetSupportedFeatures(ctx, &installer.GetSupportedFeaturesParams{OpenshiftVersion: version})
 					Expect(err).ShouldNot(HaveOccurred())
 
 					for featureID, supportLevel := range response.Payload.Features {
@@ -284,11 +285,15 @@ var _ = Describe("Feature support levels API", func() {
 		Context("Supported architectures", func() {
 			var params installer.GetSupportedArchitecturesParams
 
-			It("GetSupportedArchitectures with OCP version 4.6", func() {
-				version := "4.6"
+			// arm64 support added in 4.10; versions below only support x86_64
+			It("GetSupportedArchitectures with old OCP version supporting only x86_64", func() {
+				version, ok := common.TestVersion().LessThan("4.10").TryVersion()
+				if !ok {
+					Skip("x86_64-only architecture check requires OCP < 4.10")
+				}
 				params.OpenshiftVersion = version
 
-				response, err := userBMClient.Installer.GetSupportedArchitectures(ctx, &params)
+				response, err := utils_test.TestContext.UserBMClient.Installer.GetSupportedArchitectures(ctx, &params)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				architecturesSupportLevel := response.Payload.Architectures
@@ -300,27 +305,14 @@ var _ = Describe("Feature support levels API", func() {
 				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDMULTIARCHRELEASEIMAGE)]).To(BeEquivalentTo(models.SupportLevelUnavailable))
 			})
 
-			It("GetSupportedArchitectures with OCP version 4.12", func() {
-				version := "4.12"
+			It("GetSupportedArchitectures with OCP version supporting multiple architectures", func() {
+				version, ok := common.TestVersion().AvailableForArches(common.X86CPUArchitecture, common.ARM64CPUArchitecture).TryVersion()
+				if !ok {
+					Skip("no available version present in all architectures")
+				}
 				params.OpenshiftVersion = version
 
-				response, err := userBMClient.Installer.GetSupportedArchitectures(ctx, &params)
-				Expect(err).ShouldNot(HaveOccurred())
-
-				architecturesSupportLevel := response.Payload.Architectures
-
-				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDX8664ARCHITECTURE)]).To(BeEquivalentTo(models.SupportLevelSupported))
-				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDARM64ARCHITECTURE)]).To(BeEquivalentTo(models.SupportLevelSupported))
-				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDS390XARCHITECTURE)]).To(BeEquivalentTo(models.SupportLevelTechPreview))
-				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDPPC64LEARCHITECTURE)]).To(BeEquivalentTo(models.SupportLevelTechPreview))
-				Expect(architecturesSupportLevel[string(models.ArchitectureSupportLevelIDMULTIARCHRELEASEIMAGE)]).To(BeEquivalentTo(models.SupportLevelTechPreview))
-			})
-
-			It("GetSupportedArchitectures with OCP version 4.13", func() {
-				version := "4.13"
-				params.OpenshiftVersion = version
-
-				response, err := userBMClient.Installer.GetSupportedArchitectures(ctx, &params)
+				response, err := utils_test.TestContext.UserBMClient.Installer.GetSupportedArchitectures(ctx, &params)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				architecturesSupportLevel := response.Payload.Architectures

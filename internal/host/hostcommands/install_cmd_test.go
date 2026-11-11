@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -20,10 +20,12 @@ import (
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/oc"
+	"github.com/openshift/assisted-service/internal/provider/external"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -71,8 +73,8 @@ var _ = Describe("installcmd", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockVersions = versions.NewMockHandler(ctrl)
 		mockRelease = oc.NewMockRelease(ctrl)
-		installCmd = NewInstallCmd(common.GetTestLog(), db, mockValidator, mockRelease, instructionConfig, mockEvents, mockVersions, true)
-		cluster = createClusterInDb(db, models.ClusterHighAvailabilityModeFull)
+		installCmd = NewInstallCmd(common.GetTestLog(), db, mockValidator, mockRelease, instructionConfig, mockEvents, mockVersions, true, true)
+		cluster = createClusterInDb(db, common.MinMasterHostsNeededForInstallationInHaMode)
 		clusterId = *cluster.ID
 		infraEnv = createInfraEnvInDb(db, clusterId)
 		infraEnvId = *infraEnv.ID
@@ -80,7 +82,7 @@ var _ = Describe("installcmd", func() {
 	})
 
 	mockGetReleaseImage := func(times int) {
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(times)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(times)
 	}
 
 	mockImages := func(times int) {
@@ -108,8 +110,8 @@ var _ = Describe("installcmd", func() {
 		})
 	})
 	DescribeTable("enable MCO reboot values",
-		func(enableMcoReboot bool, version string, architecture string, expected bool) {
-			installCommand := NewInstallCmd(common.GetTestLog(), db, mockValidator, mockRelease, instructionConfig, mockEvents, mockVersions, enableMcoReboot)
+		func(enableMcoReboot bool, version string, architecture string, day2 bool, deviceMapperDevice bool, expected bool) {
+			installCommand := NewInstallCmd(common.GetTestLog(), db, mockValidator, mockRelease, instructionConfig, mockEvents, mockVersions, enableMcoReboot, true)
 			mockValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return(common.TestDiskId).Times(1)
 			mockGetReleaseImage(1)
 			mockImages(1)
@@ -117,18 +119,53 @@ var _ = Describe("installcmd", func() {
 				"openshift_version": version,
 				"cpu_architecture":  architecture,
 			}).Error).ToNot(HaveOccurred())
+
+			if day2 {
+				host.Kind = swag.String(models.HostKindAddToExistingClusterHost)
+			}
+
+			if deviceMapperDevice {
+				var inventory models.Inventory
+				Expect(json.Unmarshal([]byte(host.Inventory), &inventory)).ToNot(HaveOccurred())
+				Expect(inventory.Disks).To(HaveLen(1))
+				inventory.Disks[0].Path = "/dev/dm-0"
+				newInventoryBytes, err := json.Marshal(inventory)
+				Expect(err).ToNot(HaveOccurred())
+				host.Inventory = string(newInventoryBytes)
+			}
+
 			installCmdSteps, stepErr = installCommand.GetSteps(ctx, &host)
-			validateInstallCommand(installCommand, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, models.ClusterHighAvailabilityModeFull, expected, version)
+			validateInstallCommand(installCommand, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, expected, version, true)
 		},
-		Entry("Enbale MCO reboot is false", false, "4.15.0", models.ClusterCPUArchitectureX8664, false),
-		Entry("Enbale MCO reboot is true. Lower version", true, "4.14.0", models.ClusterCPUArchitectureX8664, false),
-		Entry("Enbale MCO reboot is true. Equal version", true, "4.15.0", models.ClusterCPUArchitectureX8664, true),
-		Entry("Enbale MCO reboot is true. Empty version", true, "", models.ClusterCPUArchitectureX8664, false),
-		Entry("Enbale MCO reboot is true. Higher version - x86_64", true, "4.16.0", models.ClusterCPUArchitectureX8664, true),
-		Entry("Enbale MCO reboot is true. Higher version - aarch64", true, "4.16.0", models.ClusterCPUArchitectureAarch64, true),
-		Entry("Enbale MCO reboot is true. Higher version - arm64", true, "4.16.0", models.ClusterCPUArchitectureArm64, true),
-		Entry("Enbale MCO reboot is true. Higher version - ppc64le", true, "4.16.0", models.ClusterCPUArchitecturePpc64le, true),
-		Entry("Enbale MCO reboot is true. Higher version - s390x", true, "4.16.0", models.ClusterCPUArchitectureS390x, false),
+		Entry("Enable MCO reboot is false", false, "4.15.0", models.ClusterCPUArchitectureX8664, false, false, false),
+		Entry("Enable MCO reboot is true. day2 host", true, "4.16.0", models.ClusterCPUArchitectureX8664, true, false, true),
+		Entry("Enable MCO reboot is true. day1 host", true, "4.16.0", models.ClusterCPUArchitectureX8664, false, false, true),
+		Entry("Enable MCO reboot is true. Lower version", true, "4.14.0", models.ClusterCPUArchitectureX8664, false, false, false),
+		Entry("Enable MCO reboot is true. Equal version", true, "4.15.0", models.ClusterCPUArchitectureX8664, false, false, true),
+		Entry("Enable MCO reboot is true. Empty version", true, "", models.ClusterCPUArchitectureX8664, false, false, false),
+		Entry("Enable MCO reboot is true. Higher version - x86_64", true, "4.16.0", models.ClusterCPUArchitectureX8664, false, false, true),
+		Entry("Enable MCO reboot is true. Higher version - aarch64", true, "4.16.0", models.ClusterCPUArchitectureAarch64, false, false, true),
+		Entry("Enable MCO reboot is true. Higher version - arm64", true, "4.16.0", models.ClusterCPUArchitectureArm64, false, false, true),
+		Entry("Enable MCO reboot is true. Higher version - ppc64le", true, "4.16.0", models.ClusterCPUArchitecturePpc64le, false, false, true),
+		Entry("Enable MCO reboot is true. Higher version - s390x", true, "4.16.0", models.ClusterCPUArchitectureS390x, false, false, false),
+		Entry("Enable MCO reboot is false. Higher version - installation disk is device mapper device", true, "4.16.0", models.ClusterCPUArchitectureX8664, false, true, false),
+	)
+
+	DescribeTable("notify num reboots",
+		func(notifyNumReboots bool) {
+			installCommand := NewInstallCmd(common.GetTestLog(), db, mockValidator, mockRelease, instructionConfig, mockEvents, mockVersions, true, notifyNumReboots)
+			mockValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return(common.TestDiskId).Times(1)
+			mockGetReleaseImage(1)
+			mockImages(1)
+			Expect(db.Model(&common.Cluster{}).Where("id = ?", *host.ClusterID).Updates(map[string]interface{}{
+				"openshift_version": "4.16",
+				"cpu_architecture":  "x86_64",
+			}).Error).ToNot(HaveOccurred())
+			installCmdSteps, stepErr = installCommand.GetSteps(ctx, &host)
+			validateInstallCommand(installCommand, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, true, "4.16", notifyNumReboots)
+		},
+		Entry("notify num reboots is false", false),
+		Entry("notify num reboots is true", true),
 	)
 
 	It("get_step_one_master_success", func() {
@@ -137,7 +174,19 @@ var _ = Describe("installcmd", func() {
 		mockImages(1)
 		installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 		postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
+		hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
+		Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
+	})
+
+	It("get_step_pre_4.15_skip_mco_reboot_disabled", func() {
+		Expect(db.Model(&common.Cluster{}).Where("id = ?", clusterId).Update("openshift_version", "4.14").Error).ToNot(HaveOccurred())
+		mockValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return(common.TestDiskId).Times(1)
+		mockGetReleaseImage(1)
+		mockImages(1)
+		installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
+		postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
+		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, false, "4.14", true)
 		hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
 		Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
 	})
@@ -150,13 +199,13 @@ var _ = Describe("installcmd", func() {
 		mockImages(3)
 		installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 		postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 		installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host2)
 		postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host2.ID, common.TestDiskId, nil, models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host2.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 		installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host3)
 		postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleBootstrap)
-		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleBootstrap, infraEnvId, clusterId, *host3.ID, common.TestDiskId, nil, models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+		validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleBootstrap, infraEnvId, clusterId, *host3.ID, common.TestDiskId, nil, common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 	})
 	It("invalid_inventory", func() {
 		host.Inventory = "blah"
@@ -219,17 +268,26 @@ var _ = Describe("installcmd", func() {
 		sdh := createDisk("sdh", false)
 		sdc := createDisk("sdc", true)
 
-		It("Doesn't format removable disks", func() {
-			disks := []*models.Disk{
-				createRemovableDisk("sda", true), //removable disk
-				sdb,                              //installation disk
-			}
-			host.Inventory = getInventory(disks)
-			mockFormatEvent(disks[0], 0)
-			prepareGetStep(sdb)
-			installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
-			verifyDiskFormatCommand(installCmdSteps[0], disks[0].ID, false)
-		})
+		DescribeTable("Doesn't format",
+			func(disk *models.Disk) {
+				disks := []*models.Disk{
+					disk,
+					sdb, // installation disk
+				}
+				host.Inventory = getInventory(disks)
+				host.InstallationDiskID = sdb.ID
+				mockFormatEvent(disks[0], 0)
+				prepareGetStep(sdb)
+				installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
+				verifyDiskFormatCommand(installCmdSteps[0], disks[0].ID, false)
+			},
+			Entry("when disk is removable", createRemovableDisk("sda", true)),
+			Entry("when disk path contains mmcblk", &models.Disk{DriveType: models.DriveTypeHDD, ID: "/dev/disk/by-id/wwn-someid", ByPath: "/dev/mmcblk0", Name: "sda", SizeBytes: int64(128849018880), Bootable: true}),
+			Entry("when disk type is LVM", &models.Disk{DriveType: models.DriveTypeLVM, ID: "/dev/disk/by-id/wwn-someid", Name: "sda", SizeBytes: int64(128849018880), Bootable: true}),
+			Entry("when disk type is iSCSI", &models.Disk{DriveType: models.DriveTypeISCSI, ID: "/dev/disk/by-id/wwn-someid", Name: "sda", SizeBytes: int64(128849018880), Bootable: true}),
+			Entry("when disk type is FC", &models.Disk{DriveType: models.DriveTypeFC, ID: "/dev/disk/by-id/wwn-someid", Name: "sda", SizeBytes: int64(128849018880), Bootable: true}),
+			Entry("when disk type is multipath", &models.Disk{DriveType: models.DriveTypeMultipath, ID: "/dev/disk/by-id/wwn-someid", Name: "sda", SizeBytes: int64(128849018880), Bootable: true}),
+		)
 
 		It("Formats a single removable disk", func() {
 			disks := []*models.Disk{
@@ -238,11 +296,12 @@ var _ = Describe("installcmd", func() {
 				sdh, //non-bootable, non-installation
 			}
 			host.Inventory = getInventory(disks)
+			host.InstallationDiskID = sdb.ID
 			mockFormatEvent(sda, 1)
 			prepareGetStep(sdb)
 			installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 			postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sdb.ID, getBootableDiskNames(disks), models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sdb.ID, getBootableDiskNames(disks), common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 			hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
 			Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
 			verifyDiskFormatCommand(installCmdSteps[0], sda.ID, true)
@@ -258,12 +317,13 @@ var _ = Describe("installcmd", func() {
 				sdh,  //non-bootable, non-installation
 			}
 			host.Inventory = getInventory(disks)
+			host.InstallationDiskID = sddd.ID
 			mockFormatEvent(sda, 1)
 			mockFormatEvent(sddd, 1)
 			prepareGetStep(sddd)
 			installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 			postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sddd.ID, getBootableDiskNames(disks), models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sddd.ID, getBootableDiskNames(disks), common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 			hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
 			Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
 			verifyDiskFormatCommand(installCmdSteps[0], sda.ID, true)
@@ -280,12 +340,13 @@ var _ = Describe("installcmd", func() {
 			}
 			host.Inventory = getInventory(disks)
 			host.InstallerArgs = `["--save-partindex","5","--copy-network"]`
+			host.InstallationDiskID = sddd.ID
 			mockFormatEvent(sda, 1)
 			mockSkipFormatEvent(sddd, 1)
 			prepareGetStep(sddd)
 			installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 			postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sddd.ID, getBootableDiskNames(disks), models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sddd.ID, getBootableDiskNames(disks), common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 			hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
 			Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
 			verifyDiskFormatCommand(installCmdSteps[0], sda.ID, true)
@@ -324,6 +385,7 @@ var _ = Describe("installcmd", func() {
 			}
 			host.Inventory = getInventory(disks)
 			host.SkipFormattingDisks = "/dev/disk/by-id/wwn-sdt,/dev/disk/by-id/wwn-sdq"
+			host.InstallationDiskID = sdb.ID
 			mockFormatEvent(sda, 1)
 			mockFormatEvent(sdc, 1)
 			mockSkipFormatEvent(sdt, 1)
@@ -331,7 +393,7 @@ var _ = Describe("installcmd", func() {
 			prepareGetStep(sdb)
 			installCmdSteps, stepErr = installCmd.GetSteps(ctx, &host)
 			postvalidation(false, false, installCmdSteps[0], stepErr, models.HostRoleMaster)
-			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sdb.ID, []string{sda.ID, sdc.ID}, models.ClusterHighAvailabilityModeFull, false, common.TestDefaultConfig.OpenShiftVersion)
+			validateInstallCommand(installCmd, installCmdSteps[0], models.HostRoleMaster, infraEnvId, clusterId, *host.ID, sdb.ID, []string{sda.ID, sdc.ID}, common.MinMasterHostsNeededForInstallationInHaMode, true, common.TestDefaultConfig.OpenShiftVersion, true)
 			hostFromDb := hostutil.GetHostFromDB(*host.ID, infraEnvId, db)
 			Expect(hostFromDb.InstallerVersion).Should(Equal(DefaultInstructionConfig.InstallerImage))
 			verifyDiskFormatCommand(installCmdSteps[0], sda.ID, true)
@@ -376,7 +438,7 @@ var _ = Describe("installcmd arguments", func() {
 
 	BeforeEach(func() {
 		db, dbName = common.PrepareTestDB()
-		cluster = createClusterInDb(db, models.ClusterHighAvailabilityModeNone)
+		cluster = createClusterInDb(db, 1)
 		infraEnv = createInfraEnvInDb(db, *cluster.ID)
 		infraEnvId = *infraEnv.ID
 		host = createHostInDb(db, infraEnvId, *cluster.ID, models.HostRoleMaster, false, "")
@@ -386,7 +448,7 @@ var _ = Describe("installcmd arguments", func() {
 		mockEvents = eventsapi.NewMockHandler(ctrl)
 		mockRelease = oc.NewMockRelease(ctrl)
 		mockVersions = versions.NewMockHandler(ctrl)
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).AnyTimes()
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).AnyTimes()
 		mockImages()
 	})
 
@@ -398,7 +460,7 @@ var _ = Describe("installcmd arguments", func() {
 	Context("configuration_params", func() {
 		It("check_cluster_version_is_false_by_default", func() {
 			config := &InstructionConfig{}
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true)
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
@@ -410,7 +472,7 @@ var _ = Describe("installcmd arguments", func() {
 			config := &InstructionConfig{
 				CheckClusterVersion: false,
 			}
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true)
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
@@ -422,7 +484,7 @@ var _ = Describe("installcmd arguments", func() {
 			config := &InstructionConfig{
 				CheckClusterVersion: true,
 			}
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true)
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, *config, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
@@ -430,13 +492,13 @@ var _ = Describe("installcmd arguments", func() {
 			Expect(swag.BoolValue(request.CheckCvo)).To(BeTrue())
 		})
 
-		It("verify high-availability-mode is None", func() {
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true)
+		It("verify control-plane-count is 1", func() {
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
 			request := generateRequestForStep(stepReply[0])
-			Expect(*request.HighAvailabilityMode).To(Equal(models.ClusterHighAvailabilityModeNone))
+			Expect(request.ControlPlaneCount).To(Equal(int64(1)))
 		})
 
 		It("verify empty value", func() {
@@ -444,7 +506,7 @@ var _ = Describe("installcmd arguments", func() {
 			mockRelease.EXPECT().GetMCOImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
 			mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMustGatherVersion, nil).AnyTimes()
 
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true)
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
@@ -454,7 +516,7 @@ var _ = Describe("installcmd arguments", func() {
 
 		It("no must-gather , mco and openshift version in day2 installation", func() {
 			db.Model(&cluster).Update("kind", models.ClusterKindAddHostsCluster)
-			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true)
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true, true)
 			stepReply, err := installCmd.GetSteps(ctx, &host)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(stepReply).NotTo(BeNil())
@@ -462,6 +524,90 @@ var _ = Describe("installcmd arguments", func() {
 			Expect(request.McoImage).To(BeEmpty())
 			Expect(request.OpenshiftVersion).To(BeEmpty())
 			Expect(request.MustGatherImage).To(BeEmpty())
+		})
+
+		It("provides the coreos image when the boot device is persistent", func() {
+			var inventory models.Inventory
+			Expect(json.Unmarshal([]byte(host.Inventory), &inventory)).ToNot(HaveOccurred())
+			inventory.Boot = &models.Boot{DeviceType: models.BootDeviceTypePersistent}
+			newInventoryBytes, err := json.Marshal(inventory)
+			Expect(err).ToNot(HaveOccurred())
+			host.Inventory = string(newInventoryBytes)
+			testCoreOSImage := "example.com/coreos/image:latest"
+			mockRelease = oc.NewMockRelease(ctrl)
+			mockRelease.EXPECT().GetMCOImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+			mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMustGatherVersion, nil).AnyTimes()
+			mockRelease.EXPECT().GetCoreOSImage(gomock.Any(), *common.TestDefaultConfig.ReleaseImage.URL, gomock.Any(), gomock.Any()).Return(testCoreOSImage, nil).AnyTimes()
+
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true, true)
+			stepReply, err := installCmd.GetSteps(ctx, &host)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stepReply).NotTo(BeNil())
+			request := generateRequestForStep(stepReply[0])
+			Expect(request.CoreosImage).To(Equal(testCoreOSImage))
+		})
+
+		It("provides the coreos image when the boot device is persistent for day2 cluters", func() {
+			var inventory models.Inventory
+			Expect(json.Unmarshal([]byte(host.Inventory), &inventory)).ToNot(HaveOccurred())
+			inventory.Boot = &models.Boot{DeviceType: models.BootDeviceTypePersistent}
+			newInventoryBytes, err := json.Marshal(inventory)
+			Expect(err).ToNot(HaveOccurred())
+			host.Inventory = string(newInventoryBytes)
+			Expect(db.Model(cluster).UpdateColumn("kind", models.ClusterKindAddHostsCluster).Error).ToNot(HaveOccurred())
+			testCoreOSImage := "example.com/coreos/image:latest"
+			mockRelease = oc.NewMockRelease(ctrl)
+			mockRelease.EXPECT().GetMCOImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+			mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMustGatherVersion, nil).AnyTimes()
+			mockRelease.EXPECT().GetCoreOSImage(gomock.Any(), *common.TestDefaultConfig.ReleaseImage.URL, gomock.Any(), gomock.Any()).Return(testCoreOSImage, nil).AnyTimes()
+
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, InstructionConfig{}, mockEvents, mockVersions, true, true)
+			stepReply, err := installCmd.GetSteps(ctx, &host)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stepReply).NotTo(BeNil())
+			request := generateRequestForStep(stepReply[0])
+			Expect(request.CoreosImage).To(Equal(testCoreOSImage))
+		})
+
+	})
+
+	Context("day2 persistent-boot without release image", func() {
+		var (
+			noReleaseVersions *versions.MockHandler
+			noReleaseMock     *oc.MockRelease
+		)
+
+		BeforeEach(func() {
+			noReleaseMock = oc.NewMockRelease(ctrl)
+			noReleaseVersions = versions.NewMockHandler(ctrl)
+			noReleaseVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("release image not found")).AnyTimes()
+
+			var inventory models.Inventory
+			Expect(json.Unmarshal([]byte(host.Inventory), &inventory)).ToNot(HaveOccurred())
+			inventory.Boot = &models.Boot{DeviceType: models.BootDeviceTypePersistent}
+			newInventoryBytes, err := json.Marshal(inventory)
+			Expect(err).ToNot(HaveOccurred())
+			host.Inventory = string(newInventoryBytes)
+			Expect(db.Model(cluster).UpdateColumn("kind", models.ClusterKindAddHostsCluster).Error).ToNot(HaveOccurred())
+		})
+
+		It("falls back to CoreOS image from worker ignition", func() {
+			testCoreOSImage := "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:abc123"
+			host.APIVipConnectivity = buildAPIVipConnectivityWithCoreOSImage(testCoreOSImage)
+
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, noReleaseMock, InstructionConfig{}, mockEvents, noReleaseVersions, true, true)
+			stepReply, err := installCmd.GetSteps(ctx, &host)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stepReply).NotTo(BeNil())
+			request := generateRequestForStep(stepReply[0])
+			Expect(request.CoreosImage).To(Equal(testCoreOSImage))
+		})
+
+		It("fails when worker ignition has no CoreOS image", func() {
+			installCmd := NewInstallCmd(common.GetTestLog(), db, validator, noReleaseMock, InstructionConfig{}, mockEvents, noReleaseVersions, true, true)
+			_, err := installCmd.GetSteps(ctx, &host)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("cannot determine CoreOS image"))
 		})
 	})
 
@@ -473,7 +619,7 @@ var _ = Describe("installcmd arguments", func() {
 
 		BeforeEach(func() {
 			instructionConfig = DefaultInstructionConfig
-			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true)
+			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true, true)
 		})
 
 		It("valid installer args", func() {
@@ -553,7 +699,7 @@ var _ = Describe("installcmd arguments", func() {
 
 		BeforeEach(func() {
 			instructionConfig = DefaultInstructionConfig
-			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true)
+			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true, true)
 		})
 
 		It("single argument with ocp image only", func() {
@@ -585,7 +731,7 @@ var _ = Describe("installcmd arguments", func() {
 
 		BeforeEach(func() {
 			instructionConfig = DefaultInstructionConfig
-			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true)
+			installCmd = NewInstallCmd(common.GetTestLog(), db, validator, mockRelease, instructionConfig, mockEvents, mockVersions, true, true)
 		})
 		It("no-proxy without httpProxy", func() {
 			args := installCmd.getProxyArguments("t-cluster", "proxy.org", "", "", "domain.com,192.168.1.0/24")
@@ -614,6 +760,101 @@ var _ = Describe("installcmd arguments", func() {
 			Expect(swag.StringValue(noProxy.HTTPProxy)).Should(Equal("http://10.56.20.90:8080"))
 			Expect(swag.StringValue(noProxy.NoProxy)).Should(Equal("*"))
 		})
+		It("should not create duplicate no_proxy values", func() {
+			noProxy := installCmd.getProxyArguments("t-cluster", "proxy.org", "http://10.56.20.90:8080", "", "127.0.0.1,localhost")
+			Expect(strings.Split(swag.StringValue(noProxy.NoProxy), ",")).Should(ConsistOf("127.0.0.1", "localhost", ".svc", ".cluster.local", "api-int.t-cluster.proxy.org"))
+		})
+	})
+})
+
+var _ = Describe("isOciCluster", func() {
+	hostWithInventory := func(inv *models.Inventory) models.Host {
+		data, err := json.Marshal(inv)
+		Expect(err).NotTo(HaveOccurred())
+		return models.Host{Inventory: string(data)}
+	}
+
+	ociPlatform := &models.Platform{
+		Type: models.PlatformTypeExternal.Pointer(),
+		External: &models.PlatformExternal{
+			PlatformName:           swag.String(common.ExternalPlatformNameOci),
+			CloudControllerManager: swag.String(models.PlatformExternalCloudControllerManagerExternal),
+		},
+	}
+
+	It("returns true when OCI external platform is set, without reading host (day-2)", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind:     swag.String(models.ClusterKindAddHostsCluster),
+				Platform: ociPlatform,
+			},
+		}
+		oci, err := isOciCluster(c, models.Host{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oci).To(BeTrue())
+	})
+
+	It("returns true when OCI platform is set even if not day-2", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind:     nil,
+				Platform: ociPlatform,
+			},
+		}
+		oci, err := isOciCluster(c, models.Host{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oci).To(BeTrue())
+	})
+
+	It("returns true for day-2 with no platform when host inventory is OCI", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind: swag.String(models.ClusterKindAddHostsCluster),
+			},
+		}
+		h := hostWithInventory(&models.Inventory{
+			SystemVendor: &models.SystemVendor{Manufacturer: external.OCIManufacturer},
+		})
+		oci, err := isOciCluster(c, h)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oci).To(BeTrue())
+	})
+
+	It("returns false for day-2 with no platform when host is not OCI", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind: swag.String(models.ClusterKindAddHostsCluster),
+			},
+		}
+		h := hostWithInventory(&models.Inventory{
+			SystemVendor: &models.SystemVendor{Manufacturer: "Dell Inc."},
+		})
+		oci, err := isOciCluster(c, h)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oci).To(BeFalse())
+	})
+
+	It("returns false for day-2 with no platform and empty host inventory", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind: swag.String(models.ClusterKindAddHostsCluster),
+			},
+		}
+		oci, err := isOciCluster(c, models.Host{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(oci).To(BeFalse())
+	})
+
+	It("returns an error for day-2 with no platform and invalid host inventory JSON", func() {
+		c := common.Cluster{
+			Cluster: models.Cluster{
+				Kind: swag.String(models.ClusterKindAddHostsCluster),
+			},
+		}
+		h := models.Host{Inventory: "not-json"}
+		oci, err := isOciCluster(c, h)
+		Expect(err).To(HaveOccurred())
+		Expect(oci).To(BeFalse())
 	})
 })
 
@@ -674,7 +915,87 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","root=/dev/disk/by-label/dm-mpath-root","--append-karg","rw","--append-karg","rd.multipath=default"]`))
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default"]`), fmt.Sprintf("debugging info: expected args: %s", args))
+	})
+	It("multipath iSCSI installation disk", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "other-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Debug info: Unmarshalled Inventory: %+v, Host's Inventory: %s", inventory, host.Inventory))
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`), fmt.Sprintf("Debug info: Actual args returned: %s", args))
+	})
+	It("multipath iSCSI installation disk with 2 different nics", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "other-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.81"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.20.81/25"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Debug info: Unmarshalled Inventory: %+v, Host's Inventory: %s", inventory, host.Inventory))
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp","--append-karg","ip=07-08-09-0A-0B-0C:dhcp"]`), fmt.Sprintf("Debug info: Actual args returned: %s", args))
 	})
 	It("non-multipath installation disk", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
@@ -691,7 +1012,7 @@ var _ = Describe("construct host install arguments", func() {
 			],
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.20.80/25"]
 				}
 			]
@@ -701,10 +1022,260 @@ var _ = Describe("construct host install arguments", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(args).To(BeEmpty())
 	})
-	It("iSCSI installation disk on OCI", func() {
+	It("iSCSI installation disk - Host IPv4 address", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI, models.DriveTypeSSD)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
+	})
+	It("iSCSI installation disk - Host IPv6 address", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "2002:db8::1"
+					}
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv6_addresses":["2002:db8::1/64"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI, models.DriveTypeSSD)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp6"]`))
+	})
+	It("iSCSI installation disk - static network configuration uses iBFT instead of DHCP", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		infraEnv.StaticNetworkConfig = "something"
+		cluster.ImageInfo.StaticNetworkConfig = "something"
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI, models.DriveTypeSSD)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:ibft","--copy-network"]`))
+	})
+	It("iSCSI installation disk - static network with IPv6 host address uses iBFT (not dhcp6)", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		infraEnv.StaticNetworkConfig = "something"
+		cluster.ImageInfo.StaticNetworkConfig = "something"
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "2002:db8::1"
+					}
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv6_addresses":["2002:db8::1/64"]
+				}
+			]
+		}`, models.DriveTypeISCSI, models.DriveTypeSSD)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:ibft","--copy-network"]`))
+	})
+	It("multipath iSCSI installation disk - static network configuration uses iBFT instead of DHCP", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		infraEnv.StaticNetworkConfig = "something"
+		cluster.ImageInfo.StaticNetworkConfig = "something"
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "other-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "other-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.81"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.20.81/25"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Debug info: Unmarshalled Inventory: %+v, Host's Inventory: %s", inventory, host.Inventory))
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:ibft","--append-karg","ip=07-08-09-0A-0B-0C:ibft","--copy-network"]`), fmt.Sprintf("Debug info: Actual args returned: %s", args))
+	})
+	It("iSCSI installation disk - IP configuration is not appended if user already added it", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		kargs := `["--append-karg","ip=dhcp"]`
+		host.InstallerArgs = kargs
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","ip=dhcp","--append-karg","rd.iscsi.firmware=1"]`))
+	})
+	It("iSCSI installation disk - Host IP address is invalid", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "invalid IP"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		_, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Equal("Cannot parse iSCSI host IP invalid IP: ParseAddr(\"invalid IP\"): unable to parse IP"))
+	})
+	It("iSCSI installation disk - No interface found for host IP address", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.21.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		_, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(Equal("Cannot find the interface belonging to iSCSI host IP: Cannot find the network interface on which the IP 10.56.21.80 is set"))
+	})
+	It("iSCSI installation disk - OCI - IPv4 address is left un-configured on machine networks interface", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "10.56.21.0/25"}}
 		cluster.Platform = &models.Platform{
-			Type: common.PlatformTypePtr(models.PlatformTypeExternal),
+			Type: models.PlatformTypeExternal.Pointer(),
 			External: &models.PlatformExternal{
 				PlatformName:           swag.String(common.ExternalPlatformNameOci),
 				CloudControllerManager: swag.String(models.PlatformExternalCloudControllerManagerExternal),
@@ -714,7 +1285,10 @@ var _ = Describe("construct host install arguments", func() {
 			"disks":[
 				{
 					"id": "install-id",
-					"drive_type": "%s"
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
 				},
 				{
 					"id": "other-id",
@@ -723,22 +1297,332 @@ var _ = Describe("construct host install arguments", func() {
 			],
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
 				}
 			]
 		}`, models.DriveTypeISCSI, models.DriveTypeSSD)
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=ibft"]`))
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
+	})
+	It("Day2 iSCSI installation disk - ip kernel args skipped when machine network unknown", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = nil
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["192.168.1.10/24"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1"]`))
+	})
+	It("Day2 multipath iSCSI installation disk - ip kernel args skipped when machine network unknown", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = nil
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "iscsi-id-1",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "iscsi-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.81"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.20.81/25"]
+				},
+				{
+					"mac_address": "0D:0E:0F:10:11:12",
+					"ipv4_addresses":["192.168.1.10/24"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1"]`))
+	})
+	It("Day2 OCI iSCSI installation disk - ip kernel args added when machine network unknown (not skipped like non-OCI Day2)", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = nil
+		cluster.Platform = &models.Platform{
+			Type: models.PlatformTypeExternal.Pointer(),
+			External: &models.PlatformExternal{
+				PlatformName:           swag.String(common.ExternalPlatformNameOci),
+				CloudControllerManager: swag.String(models.PlatformExternalCloudControllerManagerExternal),
+			},
+		}
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["192.168.1.10/24"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
+	})
+	It("Day2 OCI iSCSI - platform unset, OCI from host inventory, ip kernel args when machine network unknown", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = nil
+		cluster.Platform = nil
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"system_vendor": { "manufacturer": "OracleCloud.com" },
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["192.168.1.10/24"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
+	})
+	It("Day2 OCI multipath iSCSI installation disk - ip kernel args added when machine network unknown", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = nil
+		cluster.Platform = &models.Platform{
+			Type: models.PlatformTypeExternal.Pointer(),
+			External: &models.PlatformExternal{
+				PlatformName:           swag.String(common.ExternalPlatformNameOci),
+				CloudControllerManager: swag.String(models.PlatformExternalCloudControllerManagerExternal),
+			},
+		}
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "iscsi-id-1",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "iscsi-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.81"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.20.81/25"]
+				},
+				{
+					"mac_address": "0D:0E:0F:10:11:12",
+					"ipv4_addresses":["192.168.1.10/24"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp","--append-karg","ip=07-08-09-0A-0B-0C:dhcp"]`))
+	})
+	It("Day2 iSCSI installation disk - ip kernel args added when machine network known", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					}
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
+	})
+	It("Day2 multipath iSCSI installation disk - ip kernel args added when machine network known", func() {
+		cluster.Kind = swag.String(models.ClusterKindAddHostsCluster)
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+				{
+					"id": "install-id",
+					"drive_type": "%s",
+					"name": "dm-0"
+				},
+				{
+					"id": "iscsi-id-1",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.80"
+					},
+					"holders": "dm-0"
+				},
+				{
+					"id": "iscsi-id-2",
+					"drive_type": "%s",
+					"iscsi": {
+						"host_ip_address": "10.56.20.81"
+					},
+					"holders": "dm-0"
+				}
+			],
+			"interfaces":[
+				{
+					"mac_address": "01:02:03:04:05:06",
+					"ipv4_addresses":["10.56.20.80/25"]
+				},
+				{
+					"mac_address": "07:08:09:0A:0B:0C",
+					"ipv4_addresses":["10.56.20.81/25"]
+				},
+				{
+					"mac_address": "0D:0E:0F:10:11:12",
+					"ipv4_addresses":["10.56.21.80/25"]
+				}
+			]
+		}`, models.DriveTypeMultipath, models.DriveTypeISCSI, models.DriveTypeISCSI)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rw","--append-karg","rd.multipath=default","--append-karg","rd.iscsi.firmware=1","--append-karg","ip=01-02-03-04-05-06:dhcp","--append-karg","ip=07-08-09-0A-0B-0C:dhcp"]`))
+	})
+	It("Raid installation disk - Host IPv4 address", func() {
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/25"}}
+		host.InstallerArgs = ""
+		host.Inventory = fmt.Sprintf(`{
+			"disks":[
+					{
+						"id": "other-id",
+						"drive_type": "HDD"
+					},
+					{
+						"id": "install-id",
+						"drive_type": "%s"
+					}
+			],
+			"interfaces":[
+				{
+					"name": "eth1",
+					"ipv4_addresses":["10.56.20.80/25"]
+				}
+			]
+		}`, models.DriveTypeRAID)
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.md=1","--append-karg","rd.auto=1"]`))
 	})
 	It("ip=<nic>:dhcp6 added when machine CIDR is IPv6", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "2001:db8::/64"}}
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv6_addresses":["2001:db8::a/120"]
 				}
 			]
@@ -746,14 +1630,14 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth0:dhcp6"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=01-02-03-04-05-06:dhcp6"]`))
 	})
-	It("ip=<nic>:dhcp6 not added when machine CIDR is IPv6 and no matching interface", func() {
+	It("ip=<nic>:dhcp6 not added whachine CIDR is IPv6 and no matching interface", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "2001:db8::/64"}}
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv6_addresses":["2002:db8::a/120"]
 				}
 			]
@@ -768,7 +1652,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/25"]
 				}
 			]
@@ -776,14 +1660,14 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth1:dhcp"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
 	})
 	It("ip=<nic>:dhcp added when machine CIDR is IPv4 and multiple addresses", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.20.80/24", "192.186.10.10/25"]
 				}
 			]
@@ -791,18 +1675,18 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth1:dhcp"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
 	})
 	It("ip=<nic>:dhcp added when machine CIDR is IPv4 and multiple interfaces", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.20.80/24"]
 				},
 				{
-					"name": "eth1",
+					"mac_address": "07:08:09:0A:0B:0C",
 					"ipv4_addresses":["192.186.10.10/25"]
 				}
 			]
@@ -810,14 +1694,14 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth1:dhcp"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=07-08-09-0A-0B-0C:dhcp"]`))
 	})
 	It("ip=<nic>:dhcp not added when machine CIDR is IPv4 and no matching interface", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.20.80/25"]
 				}
 			]
@@ -843,7 +1727,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv6_addresses":["2002:db8::b/120"]
 				}
 			]
@@ -851,7 +1735,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth0:dhcp6"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=01-02-03-04-05-06:dhcp6"]`))
 	})
 	It("ip=<nic>:dhcp6 not added when there's no machine CIDR, bootstrap is IPv6, but no matching interface", func() {
 		cluster.Hosts = []*models.Host{
@@ -869,7 +1753,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv6_addresses":["2001:db8::b/120"]
 				}
 			]
@@ -895,7 +1779,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"]
 				}
 			]
@@ -903,7 +1787,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","ip=eth1:dhcp"]`))
+		Expect(args).To(Equal(`["--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
 	})
 	It("ip=<nic>:dhcp not added when there's no machine CIDR, bootstrap is IPv4, but no matching interface", func() {
 		cluster.Hosts = []*models.Host{
@@ -921,7 +1805,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["10.56.10.10/24"]
 				}
 			]
@@ -938,7 +1822,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"]
 				}
 			]
@@ -956,7 +1840,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth0",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"]
 				}
 			]
@@ -972,7 +1856,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "ens3",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"]
 				}
 			]
@@ -980,7 +1864,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--copy-network","--append-karg","ip=ens3:dhcp"]`))
+		Expect(args).To(Equal(`["--copy-network","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
 	})
 	It("existing args updated with ip=<nic>:dhcp6 when machine CIDR is IPv6", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "2001:db8::/120"}}
@@ -988,7 +1872,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv6_addresses":["2001:db8::b/120"]
 				}
 			]
@@ -996,7 +1880,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=eth1:dhcp6"]`))
+		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=01-02-03-04-05-06:dhcp6"]`))
 	})
 	It("existing args updated with ip=<nic>:dhcp,dhcp6 dual stuck", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}, {Cidr: "2001:db8::/120"}}
@@ -1004,7 +1888,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth1",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"],
 					"ipv6_addresses":["2001:db8::b/120"]
 				}
@@ -1013,7 +1897,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=eth1:dhcp,dhcp6"]`))
+		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=01-02-03-04-05-06:dhcp,dhcp6"]`))
 	})
 	It("existing args updated with ip=<nic>:dhcp when machine CIDR is IPv4", func() {
 		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "192.186.10.0/24"}}
@@ -1021,7 +1905,7 @@ var _ = Describe("construct host install arguments", func() {
 		host.Inventory = `{
 			"interfaces":[
 				{
-					"name": "eth2",
+					"mac_address": "01:02:03:04:05:06",
 					"ipv4_addresses":["192.186.10.10/24"]
 				}
 			]
@@ -1029,7 +1913,7 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=eth2:dhcp"]`))
+		Expect(args).To(Equal(`["--append-karg","rd.break=cmdline","--append-karg","ip=01-02-03-04-05-06:dhcp"]`))
 	})
 	It("don't add ip arg if ip=dhcp added by user", func() {
 		kargs := `["--append-karg","ip=dhcp"]`
@@ -1163,7 +2047,7 @@ var _ = Describe("construct host install arguments", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(args).To(Equal(`["--append-karg","rd.neednet=1","--append-karg","zfcp.allow_lun_scan=0","--append-karg","rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1","--append-karg","rd.dasd=0.0.5235","--append-karg","rd.dasd=0.0.5236"]`))
 	})
-	It("s390x and LPAR - static ip w/o nmstate, fcp", func() {
+	It("s390x and LPAR - static ip w/o nmstate(ip cfg override set), fcp", func() {
 		host.Inventory = `{
 				"interfaces":[
 					{
@@ -1176,7 +2060,26 @@ var _ = Describe("construct host install arguments", func() {
 		inventory, _ := common.UnmarshalInventory(host.Inventory)
 		inventory.SystemVendor = &models.SystemVendor{Manufacturer: "IBM/S390"}
 		inventory.SystemVendor.ProductName = ""
-		inventory.Boot = &models.Boot{CommandLine: "rd.neednet=1 console=ttysclp0 coreos.live.rootfs_url=http://172.23.236.156:8080/assisted-installer/rootfs.img ip=10.14.6.3::10.14.6.1:255.255.255.0:master-0.boea3e06.lnxero1.boe:encbdd0:none nameserver=10.14.6.1 ip=[fd00::3]::[fd00::1]:64::encbdd0:none nameserver=[fd00::1] zfcp.allow_lun_scan=0 rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1 rd.zfcp=0.0.8002,0x500507630400d1e3,0x4000404600000000 random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8"}
+		inventory.Boot = &models.Boot{CommandLine: "rd.neednet=1 ai.ip_cfg_override=1 console=ttysclp0 coreos.live.rootfs_url=http://172.23.236.156:8080/assisted-installer/rootfs.img ip=10.14.6.3::10.14.6.1:255.255.255.0:master-0.boea3e06.lnxero1.boe:encbdd0:none nameserver=10.14.6.1 ip=[fd00::3]::[fd00::1]:64::encbdd0:none nameserver=[fd00::1] zfcp.allow_lun_scan=0 rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1 rd.zfcp=0.0.8002,0x500507630400d1e3,0x4000404600000000 random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8"}
+
+		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(args).To(Equal(`["--append-karg","rd.neednet=1","--append-karg","ip=10.14.6.3::10.14.6.1:255.255.255.0:master-0.boea3e06.lnxero1.boe:encbdd0:none","--append-karg","nameserver=10.14.6.1","--append-karg","ip=[fd00::3]::[fd00::1]:64::encbdd0:none","--append-karg","nameserver=[fd00::1]","--append-karg","zfcp.allow_lun_scan=0","--append-karg","rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1","--append-karg","rd.zfcp=0.0.8002,0x500507630400d1e3,0x4000404600000000"]`))
+	})
+	It("s390x and LPAR - ip cfg override=0, fcp", func() {
+		host.Inventory = `{
+				"interfaces":[
+					{
+						"name": "eth0",
+						"ipv4_addresses":["192.186.10.12/24"]
+					}
+				]
+			}`
+		cluster.MachineNetworks = []*models.MachineNetwork{{Cidr: "2001:db8::/120"}}
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		inventory.SystemVendor = &models.SystemVendor{Manufacturer: "IBM/S390"}
+		inventory.SystemVendor.ProductName = ""
+		inventory.Boot = &models.Boot{CommandLine: "rd.neednet=1 ai.ip_cfg_override=0 console=ttysclp0 coreos.live.rootfs_url=http://172.23.236.156:8080/assisted-installer/rootfs.img ip=10.14.6.3::10.14.6.1:255.255.255.0:master-0.boea3e06.lnxero1.boe:encbdd0:none nameserver=10.14.6.1 ip=[fd00::3]::[fd00::1]:64::encbdd0:none nameserver=[fd00::1] zfcp.allow_lun_scan=0 rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1 rd.zfcp=0.0.8002,0x500507630400d1e3,0x4000404600000000 random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal console=tty1 console=ttyS1,115200n8"}
 
 		args, err := constructHostInstallerArgs(cluster, host, inventory, infraEnv, log)
 		Expect(err).NotTo(HaveOccurred())
@@ -1270,13 +2173,13 @@ func verifyDiskFormatCommand(generatedStep *models.Step, diskID string, expectWi
 	}
 }
 
-func createClusterInDb(db *gorm.DB, haMode string) common.Cluster {
+func createClusterInDb(db *gorm.DB, ctrlCount int64) common.Cluster {
 	clusterId := strfmt.UUID(uuid.New().String())
 	cluster := common.Cluster{Cluster: models.Cluster{
-		ID:                   &clusterId,
-		OpenshiftVersion:     common.TestDefaultConfig.OpenShiftVersion,
-		HighAvailabilityMode: &haMode,
-		MachineNetworks:      []*models.MachineNetwork{{Cidr: "10.56.20.0/24"}},
+		ID:                &clusterId,
+		OpenshiftVersion:  common.TestDefaultConfig.OpenShiftVersion,
+		ControlPlaneCount: ctrlCount,
+		MachineNetworks:   []*models.MachineNetwork{{Cidr: "10.56.20.0/24"}},
 	}}
 	Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 	return cluster
@@ -1297,14 +2200,15 @@ func createInfraEnvInDb(db *gorm.DB, clusterId strfmt.UUID) common.InfraEnv {
 func createHostInDb(db *gorm.DB, infraEnvId, clusterId strfmt.UUID, role models.HostRole, bootstrap bool, hostname string) models.Host {
 	id := strfmt.UUID(uuid.New().String())
 	host := models.Host{
-		ID:                &id,
-		ClusterID:         &clusterId,
-		InfraEnvID:        infraEnvId,
-		Status:            swag.String(models.HostStatusDiscovering),
-		Role:              role,
-		Bootstrap:         bootstrap,
-		Inventory:         common.GenerateTestDefaultInventory(),
-		RequestedHostname: hostname,
+		ID:                 &id,
+		ClusterID:          &clusterId,
+		InfraEnvID:         infraEnvId,
+		Status:             swag.String(models.HostStatusDiscovering),
+		Role:               role,
+		Bootstrap:          bootstrap,
+		Inventory:          common.GenerateTestDefaultInventory(),
+		RequestedHostname:  hostname,
+		InstallationDiskID: common.TestDiskId,
 	}
 	Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
 	return host
@@ -1324,8 +2228,31 @@ func postvalidation(isstepreplynil bool, issteperrnil bool, expectedstepreply *m
 	}
 }
 
+func buildAPIVipConnectivityWithCoreOSImage(osImageURL string) string {
+	mcJSON := fmt.Sprintf(`{"apiVersion":"machineconfiguration.openshift.io/v1","kind":"MachineConfig","spec":{"osImageURL":"%s","config":{"ignition":{"version":"3.5.0"}}}}`, osImageURL)
+	source := "data:," + url.PathEscape(mcJSON)
+	ign := map[string]interface{}{
+		"ignition": map[string]interface{}{"version": "3.2.0"},
+		"storage": map[string]interface{}{
+			"files": []map[string]interface{}{
+				{
+					"path":     "/etc/ignition-machine-config-encapsulated.json",
+					"contents": map[string]interface{}{"source": source},
+				},
+			},
+		},
+	}
+	ignBytes, _ := json.Marshal(ign)
+	resp := models.APIVipConnectivityResponse{
+		IsSuccess: true,
+		Ignition:  string(ignBytes),
+	}
+	respBytes, _ := json.Marshal(resp)
+	return string(respBytes)
+}
+
 func validateInstallCommand(installCmd *installCmd, reply *models.Step, role models.HostRole, infraEnvId, clusterId, hostId strfmt.UUID,
-	bootDevice string, bootableDisks []string, haMode string, enableSkipMcoReboot bool, version string) {
+	bootDevice string, bootableDisks []string, ctrlCount int64, enableSkipMcoReboot bool, version string, notifyNumReboots bool) {
 	ExpectWithOffset(1, reply.StepType).To(Equal(models.StepTypeInstall))
 	mustGatherImage, _ := installCmd.getMustGatherArgument(defaultMustGatherVersion)
 	request := models.InstallCmdRequest{}
@@ -1334,7 +2261,7 @@ func validateInstallCommand(installCmd *installCmd, reply *models.Step, role mod
 	Expect(request.InfraEnvID.String()).To(Equal(infraEnvId.String()))
 	Expect(request.ClusterID.String()).To(Equal(clusterId.String()))
 	Expect(request.HostID.String()).To(Equal(hostId.String()))
-	Expect(swag.StringValue(request.HighAvailabilityMode)).To(Equal(haMode))
+	Expect(request.ControlPlaneCount).To(Equal(ctrlCount))
 	Expect(request.OpenshiftVersion).To(Equal(version))
 	Expect(*request.Role).To(Equal(role))
 	Expect(swag.StringValue(request.BootDevice)).To(Equal(bootDevice))
@@ -1342,4 +2269,5 @@ func validateInstallCommand(installCmd *installCmd, reply *models.Step, role mod
 	Expect(swag.StringValue(request.ControllerImage)).To(Equal(installCmd.instructionConfig.ControllerImage))
 	Expect(request.MustGatherImage).To(Equal(mustGatherImage))
 	Expect(request.EnableSkipMcoReboot).To(Equal(enableSkipMcoReboot))
+	Expect(request.NotifyNumReboots).To(Equal(notifyNumReboots))
 }

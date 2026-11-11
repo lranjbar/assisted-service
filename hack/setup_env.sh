@@ -12,19 +12,19 @@ function print_help() {
 
 function spectral() {
   echo "Installing spectral..."
-  curl --retry 5 --connect-timeout 30 -L https://github.com/stoplightio/spectral/releases/download/v5.9.1/spectral-linux -o /usr/local/bin/spectral
+  curl --retry 5 --connect-timeout 30 -sL https://github.com/stoplightio/spectral/releases/download/v5.9.1/spectral-linux --output /usr/local/bin/spectral
   chmod +x /usr/local/bin/spectral
 }
 
 function jq() {
   echo "Installing jq..."
-  curl --retry 5 --connect-timeout 30 -L https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 --output /usr/local/bin/jq
+  curl --retry 5 --connect-timeout 30 -sL https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 --output /usr/local/bin/jq
   chmod +x /usr/local/bin/jq
 }
 
 function awscli() {
   echo "Installing aws-cli..."
-  curl --retry 5 --connect-timeout 30 -L "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+  curl --retry 5 --connect-timeout 30 -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" --output "/tmp/awscliv2.zip"
   unzip -q /tmp/awscliv2.zip
   ./aws/install
   rm -f /tmp/awscliv2.zip
@@ -43,26 +43,43 @@ function podman_remote() {
   rm -f podman-remote4.tar.gz
 }
 
+function envtest() {
+  # Branch 'release-0.22' is the newest version that can be installed with the current 
+  # version of Go (1.25.5). This should be updated when we update the version of Go.
+  go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
+
+  # The unit tests will try to use the 'setup-envtest' tool to download and locate the required assets. But that doesn't
+  # work in the CI environment because that tool saves the assets to a directory in the home of the user, which may not
+  # be writeable. To avoid that we download them here, and we move them to the default directory where the unit tests
+  # expect them.
+  src=$(setup-envtest use --print path 1.30.0)
+  dst="/usr/local/kubebuilder/bin"
+  mkdir -p "${dst}"
+  mv "${src}"/* "${dst}"/.
+  setup-envtest cleanup
+}
+
 function test_tools() {
   go install github.com/onsi/ginkgo/ginkgo@v1.16.4
-  go install github.com/golang/mock/mockgen@v1.6.0
+  go install go.uber.org/mock/mockgen@v0.6.0
   go install github.com/vektra/mockery/v2@v2.12.3
   go install gotest.tools/gotestsum@v1.6.3
-  go install github.com/axw/gocov/gocov@latest
-  go install github.com/AlekSi/gocov-xml@v0.0.0-20190121064608-3a14fb1c4737
+  go install github.com/axw/gocov/gocov@v1.1.0
+  go install github.com/AlekSi/gocov-xml@v1.1.0
+  envtest
 }
 
 function assisted_service() {
   ARCH=$(case $(arch) in x86_64) echo -n amd64 ;; aarch64) echo -n arm64 ;; *) echo -n $(arch) ;; esac)
 
-  latest_kubectl_version=$(curl --retry 5 --connect-timeout 30 -L -s https://dl.k8s.io/release/stable.txt)
-  curl --retry 5 --connect-timeout 30 -L "https://dl.k8s.io/release/${latest_kubectl_version}/bin/linux/amd64/kubectl" -o /tmp/kubectl
-  install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-  rm -f /tmp/kubectl
+  OPERATOR_SDK_VERSION=v1.42.3
+  curl --retry 5 --connect-timeout 30 -sL "https://github.com/operator-framework/operator-sdk/releases/download/${OPERATOR_SDK_VERSION}/operator-sdk_$(uname)_${ARCH}" --output /usr/local/bin/operator-sdk
+  curl --retry 5 --connect-timeout 30 -sL "https://mirror.openshift.com/pub/openshift-v4/multi/clients/ocp/latest/${ARCH}/openshift-client-linux.tar.gz" | tar -C /usr/local/bin -xz
+
+  chmod +x /usr/local/bin/kubectl /usr/local/bin/oc  /usr/local/bin/operator-sdk
 
   dnf install -y unzip diffutils python3-pip genisoimage skopeo
-  dnf clean all
-  rm -rf /var/cache/yum
+  dnf clean all && rm -rf /var/cache/yum
 
   jq
 
@@ -72,16 +89,12 @@ function assisted_service() {
 
   test_tools
 
-  OS=$(uname | awk '{print tolower($0)}')
-  OPERATOR_SDK_DL_URL=https://github.com/operator-framework/operator-sdk/releases/download/v1.10.1
-  curl --retry 5 --connect-timeout 30 -LO ${OPERATOR_SDK_DL_URL}/operator-sdk_${OS}_${ARCH}
-  chmod +x operator-sdk_${OS}_${ARCH}
-  install operator-sdk_${OS}_${ARCH} /usr/local/bin/operator-sdk
 
-  go install golang.org/x/tools/cmd/goimports@v0.1.5
-  go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.6.2
+  go install golang.org/x/tools/cmd/goimports@v0.34.0
+  go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
 
   python3 -m venv ${VIRTUAL_ENV:-/opt/venv}
+  source ${VIRTUAL_ENV:-/opt/venv}/bin/activate
   python3 -m pip install --upgrade pip
   python3 -m pip install --no-cache-dir -r ./dev-requirements.txt
 }

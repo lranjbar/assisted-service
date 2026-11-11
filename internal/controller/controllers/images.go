@@ -18,13 +18,23 @@ package controllers
 
 import (
 	"os"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
 	OsImagesEnvVar string = "OS_IMAGES"
+	// leaving this here to ensure it's consistent with the previous implementation if/when it is needed for el9/10
+	serviceImageBaseAnnotation string = "agent-install.openshift.io/service-image-base"
 )
 
-func ServiceImage() string {
+const defaultDatabaseImage = "quay.io/sclorg/postgresql-16-c9s:latest"
+
+func ServiceImage(asc client.Object) string {
+	return serviceImageDefault()
+}
+
+func serviceImageDefault() string {
 	return getEnvVar("SERVICE_IMAGE", "quay.io/edge-infrastructure/assisted-service:latest")
 }
 
@@ -33,7 +43,7 @@ func ImageServiceImage() string {
 }
 
 func DatabaseImage() string {
-	return getEnvVar("DATABASE_IMAGE", "quay.io/centos7/postgresql-12-centos7:latest")
+	return getEnvVar("DATABASE_IMAGE", defaultDatabaseImage)
 }
 
 func AgentImage() string {
@@ -61,7 +71,7 @@ func MustGatherImages() string {
 }
 
 func getEnvVar(key, def string) string {
-	if value, ok := os.LookupEnv(key); ok {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
 		return value
 	}
 	return def

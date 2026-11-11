@@ -103,33 +103,9 @@ metadata:
               },
               {
                 "cpuArchitecture": "x86_64",
-                "openshiftVersion": "4.12",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-x86_64-live.x86_64.iso",
-                "version": "412.86.202308081039-0"
-              },
-              {
-                "cpuArchitecture": "arm64",
-                "openshiftVersion": "4.12",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-aarch64-live.aarch64.iso",
-                "version": "412.86.202308081039-0"
-              },
-              {
-                "cpuArchitecture": "s390x",
-                "openshiftVersion": "4.12",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-s390x-live.s390x.iso",
-                "version": "412.86.202308081039-0"
-              },
-              {
-                "cpuArchitecture": "ppc64le",
-                "openshiftVersion": "4.12",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-ppc64le-live.ppc64le.iso",
-                "version": "412.86.202308081039-0"
-              },
-              {
-                "cpuArchitecture": "x86_64",
                 "openshiftVersion": "4.13",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-x86_64-live.x86_64.iso",
-                "version": "413.92.202307260246-0"
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.13/4.13.72/rhcos-4.13.72-x86_64-live.x86_64.iso",
+                "version": "413.92.202402131523-0"
               },
               {
                 "cpuArchitecture": "arm64",
@@ -152,50 +128,242 @@ metadata:
               {
                 "cpuArchitecture": "x86_64",
                 "openshiftVersion": "4.14",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-x86_64-live.x86_64.iso",
-                "version": "414.92.202310170514-0"
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-x86_64-live.x86_64.iso",
+                "version": "414.92.202407091253-0"
               },
               {
                 "cpuArchitecture": "arm64",
                 "openshiftVersion": "4.14",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-aarch64-live.aarch64.iso",
-                "version": "414.92.202310170514-0"
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-aarch64-live.aarch64.iso",
+                "version": "414.92.202407091253-0"
               },
               {
                 "cpuArchitecture": "ppc64le",
                 "openshiftVersion": "4.14",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-ppc64le-live.ppc64le.iso",
-                "version": "414.92.202309201615-0"
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-ppc64le-live.ppc64le.iso",
+                "version": "414.92.202407091253-0"
               },
               {
                 "cpuArchitecture": "s390x",
                 "openshiftVersion": "4.14",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-s390x-live.s390x.iso",
-                "version": "414.92.202309201615-0"
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-s390x-live.s390x.iso",
+                "version": "414.92.202407091253-0"
               },
               {
                 "cpuArchitecture": "x86_64",
-                "openshiftVersion": "4.15",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-x86_64-live.x86_64.iso",
-                "version": "415.92.202311241643-0"
+                "openshiftVersion": "4.16",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-x86_64-live.x86_64.iso",
+                "version": "416.94.202610242150-0"
               },
               {
                 "cpuArchitecture": "arm64",
-                "openshiftVersion": "4.15",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-aarch64-live.aarch64.iso",
-                "version": "415.92.202311241643-0"
+                "openshiftVersion": "4.16",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-aarch64-live.aarch64.iso",
+                "version": "416.94.202610242150-0"
               },
               {
                 "cpuArchitecture": "ppc64le",
-                "openshiftVersion": "4.15",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-ppc64le-live.ppc64le.iso",
-                "version": "415.92.202311241643-0"
+                "openshiftVersion": "4.16",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-ppc64le-live.ppc64le.iso",
+                "version": "416.94.202610242150-0"
               },
               {
                 "cpuArchitecture": "s390x",
-                "openshiftVersion": "4.15",
-                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-s390x-live.s390x.iso",
-                "version": "415.92.202311241643-0"
+                "openshiftVersion": "4.16",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-s390x-live.s390x.iso",
+                "version": "416.94.202610242150-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.17",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-x86_64-live.x86_64.iso",
+                "version": "417.94.202607240132-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.17",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-aarch64-live.aarch64.iso",
+                "version": "417.94.202607240132-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.17",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-ppc64le-live.ppc64le.iso",
+                "version": "417.94.202607240132-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.17",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-s390x-live.s390x.iso",
+                "version": "417.94.202607240132-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.18",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-x86_64-live.x86_64.iso",
+                "version": "418.94.202610242013-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.18",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-aarch64-live.aarch64.iso",
+                "version": "418.94.202610242013-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.18",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-ppc64le-live.ppc64le.iso",
+                "version": "418.94.202610242013-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.18",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-s390x-live.s390x.iso",
+                "version": "418.94.202610242013-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.19",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-x86_64-live-iso.x86_64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.19",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-aarch64-live-iso.aarch64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.19",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.19",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-s390x-live-iso.s390x.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.20",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-x86_64-live-iso.x86_64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.20",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-aarch64-live-iso.aarch64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.20",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.20",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-s390x-live-iso.s390x.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.21",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-x86_64-live-iso.x86_64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.21",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-aarch64-live-iso.aarch64.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.21",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.21",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-s390x-live-iso.s390x.iso",
+                "version": "9.6.20261027-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "4.22",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-x86_64-live-iso.x86_64.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "4.22",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-aarch64-live-iso.aarch64.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "4.22",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "4.22",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-s390x-live-iso.s390x.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "5.0",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-x86_64-live-iso.x86_64.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "5.0",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-aarch64-live-iso.aarch64.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "5.0",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "5.0",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-s390x-live-iso.s390x.iso",
+                "version": "9.8.20261026-0"
+              },
+              {
+                "cpuArchitecture": "x86_64",
+                "openshiftVersion": "5.1",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-x86_64-live-iso.x86_64.iso",
+                "version": "9.8.20260428-0"
+              },
+              {
+                "cpuArchitecture": "arm64",
+                "openshiftVersion": "5.1",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-aarch64-live-iso.aarch64.iso",
+                "version": "9.8.20260428-0"
+              },
+              {
+                "cpuArchitecture": "ppc64le",
+                "openshiftVersion": "5.1",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-ppc64le-live-iso.ppc64le.iso",
+                "version": "9.8.20260428-0"
+              },
+              {
+                "cpuArchitecture": "s390x",
+                "openshiftVersion": "5.1",
+                "url": "https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-s390x-live-iso.s390x.iso",
+                "version": "9.8.20260428-0"
               }
             ]
           }
@@ -209,8 +377,8 @@ metadata:
       for managing the deployment of the Assisted Service.
     olm.skipRange: '>=0.0.1 <99.0.0-unreleased'
     operatorframework.io/suggested-namespace: assisted-installer
-    operators.operatorframework.io/builder: operator-sdk-v1.10.0+git
-    operators.operatorframework.io/project_layout: go.kubebuilder.io/v3
+    operators.operatorframework.io/builder: operator-sdk-v1.42.3
+    operators.operatorframework.io/project_layout: go.kubebuilder.io/v4
     repository: https://github.com/openshift/assisted-service
     support: https://github.com/openshift/assisted-service/issues/new
   name: assisted-service-operator.v99.0.0-unreleased
@@ -218,19 +386,26 @@ spec:
   apiservicedefinitions: {}
   customresourcedefinitions:
     owned:
-    - kind: AgentClassification
+    - description: AgentClassification is the Schema for the AgentClassifications
+        API
+      displayName: Agent Classification
+      kind: AgentClassification
       name: agentclassifications.agent-install.openshift.io
       version: v1beta1
     - kind: AgentClusterInstall
       name: agentclusterinstalls.extensions.hive.openshift.io
       version: v1beta1
-    - displayName: Agent
+    - description: |-
+        Agent represents a host that has been discovered by booting from an InfraEnv discovery image
+        and can be installed as part of an OpenShift cluster.
+      displayName: Agent
       kind: Agent
       name: agents.agent-install.openshift.io
       version: v1beta1
-    - description: AgentServiceConfig represents an Assisted Service deployment. Only
-        an AgentServiceConfig with name="agent" will be reconciled. All other names
-        will be rejected.
+    - description: |-
+        AgentServiceConfig represents an Assisted Service deployment.
+        Only an AgentServiceConfig with name="agent" will be reconciled. All other
+        names will be rejected.
       displayName: Agent Service Config
       kind: AgentServiceConfig
       name: agentserviceconfigs.agent-install.openshift.io
@@ -239,66 +414,95 @@ spec:
           a headers and query parameters to be used during OS image fetch.
         displayName: OS Images additional parameters reference
         path: OSImageAdditionalParamsRef
-      - description: OSImageCACertRef is a reference to a config map containing a
-          certificate authority certificate this is an optional certificate to allow
-          a user to add a certificate authority for a HTTPS source of images this
-          certificate will be used by the assisted-image-service when pulling OS images.
+      - description: |-
+          OSImageCACertRef is a reference to a config map containing a certificate authority certificate
+          this is an optional certificate to allow a user to add a certificate authority for a HTTPS source of images
+          this certificate will be used by the assisted-image-service when pulling OS images.
         displayName: OS Image CA Cert ConfigMap reference
         path: OSImageCACertRef
-      - description: DatabaseStorage defines the spec of the PersistentVolumeClaim
-          to be created for the database's filesystem. With respect to the resource
-          requests, minimum 10GiB is recommended.
+      - description: |-
+          DatabaseStorage defines the spec of the PersistentVolumeClaim to be
+          created for the database's filesystem.
+          With respect to the resource requests, minimum 10GiB is recommended.
         displayName: Storage for database
         path: databaseStorage
-      - description: FileSystemStorage defines the spec of the PersistentVolumeClaim
-          to be created for the assisted-service's filesystem (logs, etc). With respect
-          to the resource requests, the amount of filesystem storage consumed will
-          depend largely on the number of clusters created (~200MB per cluster and
-          ~2-3GiB per supported OpenShift version). Minimum 100GiB recommended.
+      - description: |-
+          FileSystemStorage defines the spec of the PersistentVolumeClaim to be
+          created for the assisted-service's filesystem (logs, etc).
+          With respect to the resource requests, the amount of filesystem storage
+          consumed will depend largely on the number of clusters created (~200MB
+          per cluster and ~2-3GiB per supported OpenShift version). Minimum 100GiB
+          recommended.
         displayName: Storage for service filesystem
         path: filesystemStorage
-      - description: 'IPXEHTTPRoute is controlling whether the operator is creating
-          plain HTTP routes iPXE hosts may not work with router cyphers and may access
-          artifacts via HTTP only This setting accepts "enabled,disabled", defaults
-          to disabled. Empty value defaults to disabled The following endpoints would
-          be exposed via http: * api/assisted-installer/v2/infra-envs/<id>/downloads/files?file_name=ipxe-script
-          in assisted-service * boot-artifacts/ and images/<infra-enf id>/pxe-initrd
-          in -image-service'
+      - description: |-
+          IPXEHTTPRoute is controlling whether the operator is creating plain HTTP routes
+          iPXE hosts may not work with router cyphers and may access artifacts via HTTP only
+          This setting accepts "enabled,disabled", defaults to disabled. Empty value defaults to disabled
+          The following endpoints would be exposed via http:
+          * api/assisted-installer/v2/infra-envs/<id>/downloads/files?file_name=ipxe-script in assisted-service
+          * boot-artifacts/ and images/<infra-enf id>/pxe-initrd in -image-service
         displayName: Expose IPXE HTTP route
         path: iPXEHTTPRoute
-      - description: ImageStorage defines the spec of the PersistentVolumeClaim to
-          be created for each replica of the image service. If a PersistentVolumeClaim
-          is provided 2GiB per OSImage entry is required
+      - description: |-
+          ImageStorage defines the spec of the PersistentVolumeClaim to be
+          created for each replica of the image service.
+          If a PersistentVolumeClaim is provided 2GiB per OSImage entry is required
         displayName: Storage for images
         path: imageStorage
-      - description: 'MirrorRegistryRef is the reference to the configmap that contains
-          mirror registry configuration In case no configuration is need, this field
-          will be nil. ConfigMap must contain to entries: ca-bundle.crt - hold the
-          contents of mirror registry certificate/s registries.conf - holds the content
-          of registries.conf file configured with mirror registries'
+      - description: |-
+          Ingress contains configuration for the ingress resources.
+          Has no effect when running on an OpenShift cluster.
+        displayName: Ingress
+        path: ingress
+      - description: |-
+          AssistedServiceHostname is the hostname to be assigned to the assisted-service ingress.
+          Has no effect when running on an OpenShift cluster.
+        displayName: Assisted Service hostname
+        path: ingress.assistedServiceHostname
+      - description: |-
+          ClassName is the name of the ingress class to be used when configuring ingress resources.
+          Has no effect when running on an OpenShift cluster.
+        displayName: Class Name
+        path: ingress.className
+      - description: |-
+          ImageServiceHostname is the hostname to be assigned to the assisted-image-service ingress.
+          Has no effect when running on an OpenShift cluster.
+        displayName: Assisted Image Service hostname
+        path: ingress.imageServiceHostname
+      - description: |-
+          MirrorRegistryRef is the reference to the configmap that contains mirror registry configuration
+          In case no configuration is need, this field will be nil. ConfigMap must contain to entries:
+          ca-bundle.crt - hold the contents of mirror registry certificate/s
+          registries.conf - holds the content of registries.conf file configured with mirror registries
         displayName: Mirror Registry and Certificate ConfigMap Name
         path: mirrorRegistryRef
-      - description: MustGatherImages defines a collection of operator related must-gather
-          images that are used if one the operators fails to be successfully deployed
+      - description: |-
+          MustGatherImages defines a collection of operator related must-gather images
+          that are used if one the operators fails to be successfully deployed
         displayName: Must-Gather Images
         path: mustGatherImages
-      - description: OSImages defines a collection of Operating System images (ie.
-          RHCOS images) that the assisted-service should use as the base when generating
-          discovery ISOs.
+      - description: |-
+          OSImages defines a collection of Operating System images (ie. RHCOS images)
+          that the assisted-service should use as the base when generating discovery ISOs.
         displayName: Operating System Images
         path: osImages
-      - description: UnauthenticatedRegistries is a list of registries from which
-          container images can be pulled without authentication. They will be appended
-          to the default list (quay.io, registry.svc.ci.openshift.org). Any registry
-          on this list will not require credentials to be in the pull secret validated
-          by the assisted-service.
+      - description: |-
+          UnauthenticatedRegistries is a list of registries from which container images can be pulled
+          without authentication. They will be appended to the default list (quay.io,
+          registry.ci.openshift.org). Any registry on this list will not require credentials
+          to be in the pull secret validated by the assisted-service.
         displayName: List of container registries without authentication
         path: unauthenticatedRegistries
       version: v1beta1
     - kind: HypershiftAgentServiceConfig
       name: hypershiftagentserviceconfigs.agent-install.openshift.io
       version: v1beta1
-    - displayName: InfraEnv
+    - description: |-
+        InfraEnv represents an infrastructure environment for discovering and booting hosts. It generates
+        a discovery ISO or iPXE configuration that hosts can boot from to register as Agents. Multiple
+        Agents can be discovered from a single InfraEnv, and can later be assigned to different clusters.
+      displayName: Infra Env
       kind: InfraEnv
       name: infraenvs.agent-install.openshift.io
       version: v1beta1
@@ -389,9 +593,17 @@ spec:
           - ""
           resources:
           - configmaps
+          - persistentvolumeclaims
+          - secrets
+          - serviceaccounts
+          - services
           verbs:
+          - create
+          - delete
           - get
           - list
+          - patch
+          - update
           - watch
         - apiGroups:
           - ""
@@ -410,42 +622,9 @@ spec:
           - list
           - watch
         - apiGroups:
-          - ""
-          resources:
-          - secrets
-          verbs:
-          - create
-          - get
-          - list
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - serviceaccounts
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
           - admissionregistration.k8s.io
           resources:
           - mutatingwebhookconfigurations
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - admissionregistration.k8s.io
-          resources:
           - validatingwebhookconfigurations
           verbs:
           - create
@@ -459,109 +638,9 @@ spec:
           - agent-install.openshift.io
           resources:
           - agentclassifications
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agentclassifications/finalizers
-          verbs:
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agentclassifications/status
-          verbs:
-          - get
-          - patch
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
           - agents
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agents/ai-deprovision
-          verbs:
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agents/status
-          verbs:
-          - get
-          - patch
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
           - agentserviceconfigs
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agentserviceconfigs/finalizers
-          verbs:
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - agentserviceconfigs/status
-          verbs:
-          - get
-          - patch
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
           - hypershiftagentserviceconfigs
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - hypershiftagentserviceconfigs/finalizers
-          verbs:
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
-          - hypershiftagentserviceconfigs/status
-          verbs:
-          - get
-          - patch
-          - update
-        - apiGroups:
-          - agent-install.openshift.io
-          resources:
           - infraenvs
           verbs:
           - create
@@ -574,6 +653,19 @@ spec:
         - apiGroups:
           - agent-install.openshift.io
           resources:
+          - agentclassifications/finalizers
+          - agents/ai-deprovision
+          - agentserviceconfigs/finalizers
+          - hypershiftagentserviceconfigs/finalizers
+          verbs:
+          - update
+        - apiGroups:
+          - agent-install.openshift.io
+          resources:
+          - agentclassifications/status
+          - agents/status
+          - agentserviceconfigs/status
+          - hypershiftagentserviceconfigs/status
           - infraenvs/status
           verbs:
           - get
@@ -611,17 +703,6 @@ spec:
           - apps
           resources:
           - deployments
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - apps
-          resources:
           - statefulsets
           verbs:
           - create
@@ -638,6 +719,27 @@ spec:
           verbs:
           - create
         - apiGroups:
+          - cert-manager.io
+          resources:
+          - certificates
+          - issuers
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - cluster.open-cluster-management.io
+          resources:
+          - managedclusters
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
           - cluster.open-cluster-management.io
           resources:
           - managedclustersets/join
@@ -646,29 +748,12 @@ spec:
         - apiGroups:
           - config.openshift.io
           resources:
+          - apiservers
           - clusteroperators
-          verbs:
-          - get
-          - list
-          - watch
-        - apiGroups:
-          - config.openshift.io
-          resources:
           - clusterversions
-          verbs:
-          - get
-          - list
-          - watch
-        - apiGroups:
-          - config.openshift.io
-          resources:
           - dnses
-          verbs:
-          - get
-        - apiGroups:
-          - config.openshift.io
-          resources:
           - infrastructures
+          - proxies
           verbs:
           - get
           - list
@@ -677,66 +762,6 @@ spec:
           - coordination.k8s.io
           resources:
           - leases
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - configmaps
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - persistentvolumeclaims
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - secrets
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - serviceaccounts
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - ""
-          resources:
-          - services
           verbs:
           - create
           - delete
@@ -819,6 +844,15 @@ spec:
         - apiGroups:
           - metal3.io
           resources:
+          - baremetalhosts/status
+          - preprovisioningimages/status
+          verbs:
+          - get
+          - patch
+          - update
+        - apiGroups:
+          - metal3.io
+          resources:
           - preprovisioningimages
           verbs:
           - create
@@ -828,14 +862,6 @@ spec:
           - patch
           - update
           - watch
-        - apiGroups:
-          - metal3.io
-          resources:
-          - preprovisioningimages/status
-          verbs:
-          - get
-          - patch
-          - update
         - apiGroups:
           - metal3.io
           resources:
@@ -855,44 +881,24 @@ spec:
           - update
           - watch
         - apiGroups:
+          - networking.k8s.io
+          resources:
+          - ingresses
+          - networkpolicies
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
           - rbac.authorization.k8s.io
           resources:
           - clusterrolebindings
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - rbac.authorization.k8s.io
-          resources:
           - clusterroles
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - rbac.authorization.k8s.io
-          resources:
           - rolebindings
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - rbac.authorization.k8s.io
-          resources:
           - roles
           verbs:
           - create
@@ -906,17 +912,6 @@ spec:
           - route.openshift.io
           resources:
           - routes
-          verbs:
-          - create
-          - delete
-          - get
-          - list
-          - patch
-          - update
-          - watch
-        - apiGroups:
-          - route.openshift.io
-          resources:
           - routes/custom-host
           verbs:
           - create
@@ -928,7 +923,9 @@ spec:
           - watch
         serviceAccountName: assisted-service
       deployments:
-      - name: infrastructure-operator
+      - label:
+          control-plane: infrastructure-operator
+        name: infrastructure-operator
         spec:
           replicas: 1
           selector:
@@ -951,7 +948,13 @@ spec:
                 - name: IMAGE_SERVICE_IMAGE
                   value: quay.io/edge-infrastructure/assisted-image-service:latest
                 - name: DATABASE_IMAGE
-                  value: quay.io/centos7/postgresql-12-centos7:latest
+                  value: quay.io/sclorg/postgresql-16-c9s:latest
+                - name: DATABASE_IMAGE_VERSION
+                  value: "16"
+                - name: DATABASE_IMAGE_PG13
+                  value: quay.io/sclorg/postgresql-13-c9s:latest
+                - name: DATABASE_IMAGE_PG15
+                  value: quay.io/sclorg/postgresql-15-c9s:latest
                 - name: AGENT_IMAGE
                   value: quay.io/edge-infrastructure/assisted-installer-agent:latest
                 - name: CONTROLLER_IMAGE
@@ -959,7 +962,7 @@ spec:
                 - name: INSTALLER_IMAGE
                   value: quay.io/edge-infrastructure/assisted-installer:latest
                 - name: OS_IMAGES
-                  value: '[{"openshift_version":"4.9","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.9/4.9.45/rhcos-4.9.45-x86_64-live.x86_64.iso","version":"49.84.202207192205-0"},{"openshift_version":"4.10","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.10/4.10.37/rhcos-4.10.37-x86_64-live.x86_64.iso","version":"410.84.202210040010-0"},{"openshift_version":"4.10","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.10/4.10.37/rhcos-4.10.37-aarch64-live.aarch64.iso","version":"410.84.202210040011-0"},{"openshift_version":"4.11","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-x86_64-live.x86_64.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-aarch64-live.aarch64.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-s390x-live.s390x.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-ppc64le-live.ppc64le.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.12","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-x86_64-live.x86_64.iso","version":"412.86.202308081039-0"},{"openshift_version":"4.12","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-aarch64-live.aarch64.iso","version":"412.86.202308081039-0"},{"openshift_version":"4.12","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-s390x-live.s390x.iso","version":"412.86.202308081039-0"},{"openshift_version":"4.12","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.12/4.12.30/rhcos-4.12.30-ppc64le-live.ppc64le.iso","version":"412.86.202308081039-0"},{"openshift_version":"4.13","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-x86_64-live.x86_64.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.13","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-aarch64-live.aarch64.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.13","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-ppc64le-live.ppc64le.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.13","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-s390x-live.s390x.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.14","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-x86_64-live.x86_64.iso","version":"414.92.202310170514-0"},{"openshift_version":"4.14","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-aarch64-live.aarch64.iso","version":"414.92.202310170514-0"},{"openshift_version":"4.14","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-ppc64le-live.ppc64le.iso","version":"414.92.202309201615-0"},{"openshift_version":"4.14","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.14/4.14.0/rhcos-4.14.0-s390x-live.s390x.iso","version":"414.92.202309201615-0"},{"openshift_version":"4.15","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-x86_64-live.x86_64.iso","version":"415.92.202311241643-0"},{"openshift_version":"4.15","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-aarch64-live.aarch64.iso","version":"415.92.202311241643-0"},{"openshift_version":"4.15","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-ppc64le-live.ppc64le.iso","version":"415.92.202311241643-0"},{"openshift_version":"4.15","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/pre-release/4.15.0-rc.0/rhcos-4.15.0-rc.0-s390x-live.s390x.iso","version":"415.92.202311241643-0"}]'
+                  value: '[{"openshift_version":"4.9","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.9/4.9.45/rhcos-4.9.45-x86_64-live.x86_64.iso","version":"49.84.202207192205-0"},{"openshift_version":"4.10","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.10/4.10.37/rhcos-4.10.37-x86_64-live.x86_64.iso","version":"410.84.202210040010-0"},{"openshift_version":"4.10","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.10/4.10.37/rhcos-4.10.37-aarch64-live.aarch64.iso","version":"410.84.202210040011-0"},{"openshift_version":"4.11","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-x86_64-live.x86_64.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-aarch64-live.aarch64.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-s390x-live.s390x.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.11","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.11/4.11.48/rhcos-4.11.48-ppc64le-live.ppc64le.iso","version":"411.86.202308081056-0"},{"openshift_version":"4.13","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.13/4.13.72/rhcos-4.13.72-x86_64-live.x86_64.iso","version":"413.92.202402131523-0"},{"openshift_version":"4.13","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-aarch64-live.aarch64.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.13","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-ppc64le-live.ppc64le.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.13","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.13/4.13.10/rhcos-4.13.10-s390x-live.s390x.iso","version":"413.92.202307260246-0"},{"openshift_version":"4.14","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-x86_64-live.x86_64.iso","version":"414.92.202407091253-0"},{"openshift_version":"4.14","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-aarch64-live.aarch64.iso","version":"414.92.202407091253-0"},{"openshift_version":"4.14","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-ppc64le-live.ppc64le.iso","version":"414.92.202407091253-0"},{"openshift_version":"4.14","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.14/4.14.77/rhcos-4.14.77-s390x-live.s390x.iso","version":"414.92.202407091253-0"},{"openshift_version":"4.16","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-x86_64-live.x86_64.iso","version":"416.94.202610242150-0"},{"openshift_version":"4.16","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-aarch64-live.aarch64.iso","version":"416.94.202610242150-0"},{"openshift_version":"4.16","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-ppc64le-live.ppc64le.iso","version":"416.94.202610242150-0"},{"openshift_version":"4.16","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.16/4.16.75/rhcos-4.16.75-s390x-live.s390x.iso","version":"416.94.202610242150-0"},{"openshift_version":"4.17","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-x86_64-live.x86_64.iso","version":"417.94.202607240132-0"},{"openshift_version":"4.17","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-aarch64-live.aarch64.iso","version":"417.94.202607240132-0"},{"openshift_version":"4.17","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-ppc64le-live.ppc64le.iso","version":"417.94.202607240132-0"},{"openshift_version":"4.17","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.17/4.17.59/rhcos-4.17.59-s390x-live.s390x.iso","version":"417.94.202607240132-0"},{"openshift_version":"4.18","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-x86_64-live.x86_64.iso","version":"418.94.202610242013-0"},{"openshift_version":"4.18","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-aarch64-live.aarch64.iso","version":"418.94.202610242013-0"},{"openshift_version":"4.18","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-ppc64le-live.ppc64le.iso","version":"418.94.202610242013-0"},{"openshift_version":"4.18","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.18/4.18.60/rhcos-4.18.60-s390x-live.s390x.iso","version":"418.94.202610242013-0"},{"openshift_version":"4.19","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-x86_64-live-iso.x86_64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.19","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-aarch64-live-iso.aarch64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.19","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-ppc64le-live-iso.ppc64le.iso","version":"9.6.20261027-0"},{"openshift_version":"4.19","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.19/4.19.55/rhcos-4.19.55-s390x-live-iso.s390x.iso","version":"9.6.20261027-0"},{"openshift_version":"4.20","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-x86_64-live-iso.x86_64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.20","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-aarch64-live-iso.aarch64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.20","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-ppc64le-live-iso.ppc64le.iso","version":"9.6.20261027-0"},{"openshift_version":"4.20","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.20/4.20.45/rhcos-4.20.45-s390x-live-iso.s390x.iso","version":"9.6.20261027-0"},{"openshift_version":"4.21","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-x86_64-live-iso.x86_64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.21","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-aarch64-live-iso.aarch64.iso","version":"9.6.20261027-0"},{"openshift_version":"4.21","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-ppc64le-live-iso.ppc64le.iso","version":"9.6.20261027-0"},{"openshift_version":"4.21","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.21/4.21.41/rhcos-4.21.41-s390x-live-iso.s390x.iso","version":"9.6.20261027-0"},{"openshift_version":"4.22","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-x86_64-live-iso.x86_64.iso","version":"9.8.20261026-0"},{"openshift_version":"4.22","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-aarch64-live-iso.aarch64.iso","version":"9.8.20261026-0"},{"openshift_version":"4.22","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-ppc64le-live-iso.ppc64le.iso","version":"9.8.20261026-0"},{"openshift_version":"4.22","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/4.22/4.22.21/rhcos-4.22.21-s390x-live-iso.s390x.iso","version":"9.8.20261026-0"},{"openshift_version":"5.0","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-x86_64-live-iso.x86_64.iso","version":"9.8.20261026-0"},{"openshift_version":"5.0","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-aarch64-live-iso.aarch64.iso","version":"9.8.20261026-0"},{"openshift_version":"5.0","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-ppc64le-live-iso.ppc64le.iso","version":"9.8.20261026-0"},{"openshift_version":"5.0","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/5.0/5.0.0/rhcos-5.0.0-s390x-live-iso.s390x.iso","version":"9.8.20261026-0"},{"openshift_version":"5.1","cpu_architecture":"x86_64","url":"https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-x86_64-live-iso.x86_64.iso","version":"9.8.20260428-0"},{"openshift_version":"5.1","cpu_architecture":"arm64","url":"https://mirror.openshift.com/pub/openshift-v4/aarch64/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-aarch64-live-iso.aarch64.iso","version":"9.8.20260428-0"},{"openshift_version":"5.1","cpu_architecture":"ppc64le","url":"https://mirror.openshift.com/pub/openshift-v4/ppc64le/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-ppc64le-live-iso.ppc64le.iso","version":"9.8.20260428-0"},{"openshift_version":"5.1","cpu_architecture":"s390x","url":"https://mirror.openshift.com/pub/openshift-v4/s390x/dependencies/rhcos/pre-release/5.1.0-ec.2/rhcos-5.1.0-ec.2-s390x-live-iso.s390x.iso","version":"9.8.20260428-0"}]'
                 - name: SERVICE_ACCOUNT_NAME
                   valueFrom:
                     fieldRef:
@@ -992,6 +995,7 @@ spec:
                     memory: 200Mi
                 securityContext:
                   allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
               serviceAccountName: assisted-service
               terminationGracePeriodSeconds: 10
       permissions:
@@ -1089,8 +1093,12 @@ spec:
     name: controller
   - image: quay.io/edge-infrastructure/assisted-image-service:latest
     name: image-service
-  - image: quay.io/centos7/postgresql-12-centos7:latest
+  - image: quay.io/sclorg/postgresql-16-c9s:latest
     name: postgresql
+  - image: quay.io/sclorg/postgresql-13-c9s:latest
+    name: postgresql-13
+  - image: quay.io/sclorg/postgresql-15-c9s:latest
+    name: postgresql-15
   - image: quay.io/edge-infrastructure/assisted-installer:latest
     name: installer
   - image: quay.io/edge-infrastructure/assisted-installer-agent:latest

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 
+	certtypes "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	certmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/go-openapi/swag"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -13,7 +15,6 @@ import (
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/testing"
-	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -21,6 +22,8 @@ import (
 	"github.com/thoas/go-funk"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	netv1 "k8s.io/api/networking/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +50,15 @@ const (
 	testOSImagesAdditionalParamsName = "test-os-images-additional-params-secret"
 )
 
+// mockPodIntrospector is a mock implementation of PodIntrospector for testing
+type mockPodIntrospector struct {
+	imagePullSecrets []corev1.LocalObjectReference
+}
+
+func (m *mockPodIntrospector) GetImagePullSecrets(ctx context.Context) []corev1.LocalObjectReference {
+	return m.imagePullSecrets
+}
+
 func newTestReconciler(initObjs ...client.Object) *AgentServiceConfigReconciler {
 	schemes := GetKubeClientSchemes()
 
@@ -62,7 +75,9 @@ func newTestReconciler(initObjs ...client.Object) *AgentServiceConfigReconciler 
 			Log:    logrus.New(),
 			// TODO(djzager): If we need to verify emitted events
 			// https://github.com/kubernetes/kubernetes/blob/ea0764452222146c47ec826977f49d7001b0ea8c/pkg/controller/statefulset/stateful_pod_control_test.go#L474
-			Recorder: record.NewFakeRecorder(10),
+			Recorder:        record.NewFakeRecorder(10),
+			IsOpenShift:     true,
+			PodIntrospector: &mockPodIntrospector{imagePullSecrets: nil}, // Default to no imagePullSecrets
 		},
 		Client:    c,
 		Namespace: testNamespace,
@@ -123,7 +138,7 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -133,7 +148,7 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -143,7 +158,7 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,
 					},
-					Resources: corev1.ResourceRequirements{
+					Resources: corev1.VolumeResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceStorage: resource.MustParse("1Ti"),
 						},
@@ -161,13 +176,24 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 		// Create the reconciler:
 		reconciler = &AgentServiceConfigReconciler{
 			AgentServiceConfigReconcileContext: AgentServiceConfigReconcileContext{
-				Scheme:   cluster.Scheme(),
-				Log:      logrusLogger,
-				Recorder: cluster.Recorder(),
+				Scheme:          cluster.Scheme(),
+				Log:             logrusLogger,
+				Recorder:        cluster.Recorder(),
+				IsOpenShift:     true,
+				PodIntrospector: &mockPodIntrospector{imagePullSecrets: nil}, // Default to no imagePullSecrets
 			},
 			Client:    client,
 			Namespace: "assisted-installer",
 		}
+
+		clusterTrustedCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: reconciler.Namespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
+		Expect(client.Create(ctx, clusterTrustedCM)).To(Succeed())
 	})
 
 	AfterEach(func() {
@@ -362,22 +388,7 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 	It("Should not accept an OSImageCACert Config Map that contains multiple files", func() {
 		osImageCACertConfigMap := getOSImageCACertConfigMap(
 			map[string]string{
-				osImageDownloadTrustedCAFilename: "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
-				"CA2.pem":                        "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUSS+V3nF9Pb7SGXTKq0Ggca5Ed6owDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA1MjZaFw0zNDAxMDYx\nMzA1MjZaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQDK7E8quzVQkdBcRFeNJNVLgnERkTWGaacbTlFYVJi04BRENc4i\nWc/4zvt+VxLeGLFUA6fLGtNjiPhaqw5Tg7IjRd8t6Ho0+xODdADP3phg1bPZN2VL\neWpuNiszngk9CAZ8s2qWDFyY6FoNk3zykH4G69vyXS2DXjlX+y7MJpjuTsHqBhNS\nfg4oJNy/XtIm4eeGVa3o3A23qZkpI3JeZAdPEjsSwxYzsD93dMmZKbqZ0UkU9sbF\nVMbuwPOEde1eBAdIdg2K51SGwL84RUGsMUCcS2ASqED9wdEcFQfCbg8MtdwdUkT8\nNXsw3MuehcRXksLfMntg97mJJ7v3wJLahlcdAgMBAAGjUzBRMB0GA1UdDgQWBBQA\nP+6zc3wM6V0dVswyGh0sOsEkCzAfBgNVHSMEGDAWgBQAP+6zc3wM6V0dVswyGh0s\nOsEkCzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCWQXTdQOvX\neE+9PZye/xhxxGrjNlyrhzUk3+uVR0bFgoucakF7qfIFph/EPCfY7jR14Gwnlaty\nhZ/bpH4yh3Y6gAXztGkfyZW39x4MBKyUuD49ZW6BKz8daWR3TVBWU9yJLE53aJUD\nYLVSeglquQOjnfclL+0jE8mYCld6K9mxYrIjig58JQ24NcHMfpzcRgf5qYMpY2nj\ni5aXTd8D2FBs5a2/5rGQDG/9tN8YKPoFpg7V+UnBH9yaVL7LkTZUjZVzy8sGLpZ2\nXz2WeZ9oFpBEi+dYMtLnwkHwc5IOCsj6aK5/TTQlW8AyUO9iSUpShrADoANQzNsY\ni7xTDV88P0fU\n-----END CERTIFICATE-----\n",
-			})
-		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
-			Name: osImageCACertConfigMap.Name,
-		}
-		err := client.Create(ctx, osImageCACertConfigMap)
-		Expect(err).ToNot(HaveOccurred())
-		err = client.Create(ctx, subject)
-		Expect(err).ToNot(HaveOccurred())
-		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, fmt.Sprintf("ConfigMap referenced by OSImgaeCACertRef is expected to contain a single key named \"%s\"", osImageDownloadTrustedCAFilename))
-	})
-
-	It("Should not accept an OSImageCACert Config Map that contains an incorrectly named file", func() {
-		osImageCACertConfigMap := getOSImageCACertConfigMap(
-			map[string]string{
+				"name.ca": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
 				"CA2.pem": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUSS+V3nF9Pb7SGXTKq0Ggca5Ed6owDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA1MjZaFw0zNDAxMDYx\nMzA1MjZaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQDK7E8quzVQkdBcRFeNJNVLgnERkTWGaacbTlFYVJi04BRENc4i\nWc/4zvt+VxLeGLFUA6fLGtNjiPhaqw5Tg7IjRd8t6Ho0+xODdADP3phg1bPZN2VL\neWpuNiszngk9CAZ8s2qWDFyY6FoNk3zykH4G69vyXS2DXjlX+y7MJpjuTsHqBhNS\nfg4oJNy/XtIm4eeGVa3o3A23qZkpI3JeZAdPEjsSwxYzsD93dMmZKbqZ0UkU9sbF\nVMbuwPOEde1eBAdIdg2K51SGwL84RUGsMUCcS2ASqED9wdEcFQfCbg8MtdwdUkT8\nNXsw3MuehcRXksLfMntg97mJJ7v3wJLahlcdAgMBAAGjUzBRMB0GA1UdDgQWBBQA\nP+6zc3wM6V0dVswyGh0sOsEkCzAfBgNVHSMEGDAWgBQAP+6zc3wM6V0dVswyGh0s\nOsEkCzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQCWQXTdQOvX\neE+9PZye/xhxxGrjNlyrhzUk3+uVR0bFgoucakF7qfIFph/EPCfY7jR14Gwnlaty\nhZ/bpH4yh3Y6gAXztGkfyZW39x4MBKyUuD49ZW6BKz8daWR3TVBWU9yJLE53aJUD\nYLVSeglquQOjnfclL+0jE8mYCld6K9mxYrIjig58JQ24NcHMfpzcRgf5qYMpY2nj\ni5aXTd8D2FBs5a2/5rGQDG/9tN8YKPoFpg7V+UnBH9yaVL7LkTZUjZVzy8sGLpZ2\nXz2WeZ9oFpBEi+dYMtLnwkHwc5IOCsj6aK5/TTQlW8AyUO9iSUpShrADoANQzNsY\ni7xTDV88P0fU\n-----END CERTIFICATE-----\n",
 			})
 		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
@@ -387,25 +398,74 @@ var _ = Describe("Agent service config controller ConfigMap validation", func() 
 		Expect(err).ToNot(HaveOccurred())
 		err = client.Create(ctx, subject)
 		Expect(err).ToNot(HaveOccurred())
-		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, fmt.Sprintf("ConfigMap referenced by OSImgaeCACertRef is expected to contain a single key named \"%s\"", osImageDownloadTrustedCAFilename))
+		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, "ConfigMap referenced by OSImageCACertRef must contain exactly one key")
+	})
 
-		// Now update the config map and see that the condition changes...
-		osImageCACertConfigMap = getOSImageCACertConfigMap(
+	It("Should not accept an OSImageCACert Config Map with invalid certificate", func() {
+		osImageCACertConfigMap := getOSImageCACertConfigMap(
 			map[string]string{
-				osImageDownloadTrustedCAFilename: "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
+				"cert.ca": "invalid certificate",
 			})
-		err = client.Update(ctx, osImageCACertConfigMap)
+		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
+			Name: osImageCACertConfigMap.Name,
+		}
+		err := client.Create(ctx, osImageCACertConfigMap)
 		Expect(err).ToNot(HaveOccurred())
-		awaitValidationSuccess()
+		err = client.Create(ctx, subject)
+		Expect(err).ToNot(HaveOccurred())
+		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, "file cert.ca does not contain a valid PEM certificate, trailing content found after the last certificate block")
+	})
 
-		// Grab the statefulset and verify that a volume has been mapped
-		assertOSImageCACertVolumePresent()
+	It("Should not accept an OSImageCACert Config Map with empty certificate file", func() {
+		osImageCACertConfigMap := getOSImageCACertConfigMap(
+			map[string]string{
+				"cert.ca": "",
+			})
+		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
+			Name: osImageCACertConfigMap.Name,
+		}
+		err := client.Create(ctx, osImageCACertConfigMap)
+		Expect(err).ToNot(HaveOccurred())
+		err = client.Create(ctx, subject)
+		Expect(err).ToNot(HaveOccurred())
+		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, "file cert.ca does not contain a valid PEM certificate, certificate bundle is empty")
+	})
+
+	It("Should not accept an OSImageCACert Config Map with valid ca certificate with additional string", func() {
+		osImageCACertConfigMap := getOSImageCACertConfigMap(
+			map[string]string{
+				"cert.ca": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\nabc",
+			})
+		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
+			Name: osImageCACertConfigMap.Name,
+		}
+		err := client.Create(ctx, osImageCACertConfigMap)
+		Expect(err).ToNot(HaveOccurred())
+		err = client.Create(ctx, subject)
+		Expect(err).ToNot(HaveOccurred())
+		awaitValidationFail(aiv1beta1.ReasonOSImageCACertRefFailure, "file cert.ca does not contain a valid PEM certificate, trailing content found after the last certificate block")
 	})
 
 	It("Should add volume and volumemap for OSImageCACert when OSImageCACertRef is provided", func() {
 		osImageCACertConfigMap := getOSImageCACertConfigMap(
 			map[string]string{
-				osImageDownloadTrustedCAFilename: "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
+				"cert.ca": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
+			})
+		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
+			Name: osImageCACertConfigMap.Name,
+		}
+		err := client.Create(ctx, osImageCACertConfigMap)
+		Expect(err).ToNot(HaveOccurred())
+		err = client.Create(ctx, subject)
+		Expect(err).ToNot(HaveOccurred())
+		awaitValidationSuccess()
+		assertOSImageCACertVolumePresent()
+	})
+
+	It("Should add volume and volumemap for OSImageCACert when OSImageCACertRef content is bundle", func() {
+		osImageCACertConfigMap := getOSImageCACertConfigMap(
+			map[string]string{
+				"cert.ca": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
 			})
 		subject.Spec.OSImageCACertRef = &corev1.LocalObjectReference{
 			Name: osImageCACertConfigMap.Name,
@@ -459,6 +519,14 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 				Host: fmt.Sprintf("%s.images", testHost),
 			},
 		}
+
+		clusterTrustedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
 	)
 
 	BeforeEach(func() {
@@ -503,7 +571,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 					Namespace: testNamespace,
 				},
 			}
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 			Expect(result).To(Equal(ctrl.Result{}))
@@ -592,10 +660,10 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 				},
 			},
 		}
-		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 
-		Expect(err).NotTo(Succeed())
+		Expect(err).To(BeNil())
 		Expect(result).NotTo(Equal(ctrl.Result{}))
 
 		instance := &aiv1beta1.AgentServiceConfig{}
@@ -643,10 +711,10 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 				Namespace: testNamespace,
 			},
 		}
-		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 
-		Expect(err).NotTo(Succeed())
+		Expect(err).To(BeNil())
 		Expect(result).NotTo(Equal(ctrl.Result{}))
 
 		instance := &aiv1beta1.AgentServiceConfig{}
@@ -709,7 +777,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 				},
 			},
 		}
-		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 
 		Expect(err).To(Succeed())
@@ -728,7 +796,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 
 		Expect(err).NotTo(Succeed())
-		Expect(result).NotTo(Equal(ctrl.Result{}))
+		Expect(result).To(Equal(ctrl.Result{}))
 
 		instance := &aiv1beta1.AgentServiceConfig{}
 		err = ascr.Get(ctx, types.NamespacedName{Name: "agent"}, instance)
@@ -736,6 +804,94 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 		condition := conditionsv1.FindStatusCondition(instance.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
 		Expect(condition).ToNot(BeNil())
 		Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+	})
+
+	It("creates the cluster trusted CA cert config map", func() {
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterTrustedCM)
+		_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+
+		cm := corev1.ConfigMap{}
+		key := types.NamespacedName{
+			Name:      clusterCAConfigMapName,
+			Namespace: ascr.Namespace,
+		}
+		Expect(ascr.Get(ctx, key, &cm)).To(Succeed())
+		Expect(cm.GetLabels()[injectTrustedCALabel]).To(Equal("true"))
+
+	})
+
+	It("copies the contents of the cluster trusted CA cert config map into the assisted cert config map", func() {
+		testClusterCert := "-----BEGIN CERTIFICATE-----\nMIIFNDCCAxygAwIBAgIUIuI4RrUYvTSrIKq0XPr9eZB42CEwDQYJKoZIhvcNAQEL\nBQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wHhcNMjQwNzIyMjAwMDA2WhcNMzQw\nNzIwMjAwMDA2WjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCAiIwDQYJKoZIhvcN\nAQEBBQADggIPADCCAgoCggIBAMr6JdHm+2dYV486In1PKN7K2Bp2nbFt+JjE9UjN\nLy5spMEU1nBTTdQp7X2o5IrxcmQm2eWUZsQqRzsipWGLGY433cCHxozJSqincPIz\n3k5vU7nctt0vY8Gd+vX1KggmRVgfRatp2C0We56K3JzpnXk33/X/eI+PATS1LvU+\nJwz1zkoCURos9NJtVKmO/mZsdu1kn7lcA+OXxAkUVuhl4OQYDmhAqFn0HWCP/OYD\nVSKUBegf0TrelkmwqX/50hW1dWCiB39pJqhchLn1EZOrt69YUrfU2cEfw6SnMhaO\neSLBAf9d9krbrNNH8hBfOMxErz3OnHG4hMWnsuUpZlDQOgS5SFOPIVoY70izLDbv\nG6eoVSpC7+ZgotEEPxW3drEMHkzcCMgXCFD3uDJRScoKy2VbovOz8POvjCuYbB6H\nJDoy17w9h8Jk11fBWWG3jU9cgI8xaz7uZB+ctPhfTdV3YxdWvwuvrNPEyZ7QoSt1\nU06l0nnI24zMYnBK4Ogct/mqW4M10027wrTKiEi0PL7U8Rdnfy4Z6WK82uUdYfRC\nNMJw0uhxVyQTxDf0+kwDH82vprbjlAQkRsW+6CLfy2nVJYDkbAI4DnxFdlGnL3Mh\nHkMN7gSIIlI13uQnzPino/QuswV+kFHUSaoheAZlaGaORR3F5DIqf5t0H732X4Qn\nR731AgMBAAGjejB4MB0GA1UdDgQWBBRgPTn7qENgjkciUw2qrJBF3dgNUTAfBgNV\nHSMEGDAWgBRgPTn7qENgjkciUw2qrJBF3dgNUTAPBgNVHRMBAf8EBTADAQH/MCUG\nA1UdEQQeMByCC2V4YW1wbGUuY29tgg0qLmV4YW1wbGUuY29tMA0GCSqGSIb3DQEB\nCwUAA4ICAQAc4YcvCHxaAVcN//4/lnxUKC1T7r2i+jGimgUWWqaER8WH1md2My77\n0HOa0gs4SKJLvxssmyOVaie+prJAl/hyV2T7N4E7fnIVvyBsRqYgrXdISS07/WHc\n1Nz1/qOx7iEt4pB2lVm8PGVZvos97YzYw1odzadMP+J6b3JbYdK/s5iRqULgFzL8\nTNUXM83jTpSTa5SKIyf+RZgdMYasLdla5rChKlc0mpWVvr+mvY+ziKjmZPp6RcKC\nRyddKecwHLClIXz1IuUK0Wdjrr5OwBXnMMy+eIuHFaYYIlt0IYsl3ecT1zRrSVT9\niMulnPLh3TRJ9DC6FcYmy0TXgC3OyAhGFB+hFbqzillqjN4tI6M4GipSAq63IVya\nOxms940SIHS/Jph/ynqncM9bPKuDeKR4BUikLPuOAhogmJ/2vnkQS7VP2TqVjFNZ\nmrxoNHE8eKl7QUJR0Bk6aLkc2wjlHPyqFpgUMhKU+TnRRSGUgmT0fRHkGHwEdsQ4\nqx2r18pk+1fUGqma9P4zDod44iVstpQHZ4iWMtZc/KAvG1fwDJVnEJzOOytoNrc0\nxRu491o2EAUIk2/mfDln5vg8gKNGqARuOc5PEAKGrGthYIluoz6JRSm92khf19fe\nQyFF2sYgIrz/h6L+kx4WTEPQPhQWkeJ/NIiCc687ZP1yNmJI/GcUdg==\n-----END CERTIFICATE-----\n"
+		clusterCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: ascr.Namespace,
+				Labels:    map[string]string{injectTrustedCALabel: "true"},
+			},
+			Data: map[string]string{caBundleKey: testClusterCert},
+		}
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterCM)
+		_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+
+		cm := corev1.ConfigMap{}
+		key := types.NamespacedName{
+			Name:      assistedCAConfigMapName,
+			Namespace: ascr.Namespace,
+		}
+		Expect(ascr.Get(ctx, key, &cm)).To(Succeed())
+		Expect(cm.Data[caBundleKey]).To(Equal(testClusterCert))
+	})
+
+	It("combines the cluter trusted CA cert content with user mirror registry certs in the assissted cert config map", func() {
+		testClusterCert := "-----BEGIN CERTIFICATE-----\nMIIFNDCCAxygAwIBAgIUIuI4RrUYvTSrIKq0XPr9eZB42CEwDQYJKoZIhvcNAQEL\nBQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wHhcNMjQwNzIyMjAwMDA2WhcNMzQw\nNzIwMjAwMDA2WjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCAiIwDQYJKoZIhvcN\nAQEBBQADggIPADCCAgoCggIBAMr6JdHm+2dYV486In1PKN7K2Bp2nbFt+JjE9UjN\nLy5spMEU1nBTTdQp7X2o5IrxcmQm2eWUZsQqRzsipWGLGY433cCHxozJSqincPIz\n3k5vU7nctt0vY8Gd+vX1KggmRVgfRatp2C0We56K3JzpnXk33/X/eI+PATS1LvU+\nJwz1zkoCURos9NJtVKmO/mZsdu1kn7lcA+OXxAkUVuhl4OQYDmhAqFn0HWCP/OYD\nVSKUBegf0TrelkmwqX/50hW1dWCiB39pJqhchLn1EZOrt69YUrfU2cEfw6SnMhaO\neSLBAf9d9krbrNNH8hBfOMxErz3OnHG4hMWnsuUpZlDQOgS5SFOPIVoY70izLDbv\nG6eoVSpC7+ZgotEEPxW3drEMHkzcCMgXCFD3uDJRScoKy2VbovOz8POvjCuYbB6H\nJDoy17w9h8Jk11fBWWG3jU9cgI8xaz7uZB+ctPhfTdV3YxdWvwuvrNPEyZ7QoSt1\nU06l0nnI24zMYnBK4Ogct/mqW4M10027wrTKiEi0PL7U8Rdnfy4Z6WK82uUdYfRC\nNMJw0uhxVyQTxDf0+kwDH82vprbjlAQkRsW+6CLfy2nVJYDkbAI4DnxFdlGnL3Mh\nHkMN7gSIIlI13uQnzPino/QuswV+kFHUSaoheAZlaGaORR3F5DIqf5t0H732X4Qn\nR731AgMBAAGjejB4MB0GA1UdDgQWBBRgPTn7qENgjkciUw2qrJBF3dgNUTAfBgNV\nHSMEGDAWgBRgPTn7qENgjkciUw2qrJBF3dgNUTAPBgNVHRMBAf8EBTADAQH/MCUG\nA1UdEQQeMByCC2V4YW1wbGUuY29tgg0qLmV4YW1wbGUuY29tMA0GCSqGSIb3DQEB\nCwUAA4ICAQAc4YcvCHxaAVcN//4/lnxUKC1T7r2i+jGimgUWWqaER8WH1md2My77\n0HOa0gs4SKJLvxssmyOVaie+prJAl/hyV2T7N4E7fnIVvyBsRqYgrXdISS07/WHc\n1Nz1/qOx7iEt4pB2lVm8PGVZvos97YzYw1odzadMP+J6b3JbYdK/s5iRqULgFzL8\nTNUXM83jTpSTa5SKIyf+RZgdMYasLdla5rChKlc0mpWVvr+mvY+ziKjmZPp6RcKC\nRyddKecwHLClIXz1IuUK0Wdjrr5OwBXnMMy+eIuHFaYYIlt0IYsl3ecT1zRrSVT9\niMulnPLh3TRJ9DC6FcYmy0TXgC3OyAhGFB+hFbqzillqjN4tI6M4GipSAq63IVya\nOxms940SIHS/Jph/ynqncM9bPKuDeKR4BUikLPuOAhogmJ/2vnkQS7VP2TqVjFNZ\nmrxoNHE8eKl7QUJR0Bk6aLkc2wjlHPyqFpgUMhKU+TnRRSGUgmT0fRHkGHwEdsQ4\nqx2r18pk+1fUGqma9P4zDod44iVstpQHZ4iWMtZc/KAvG1fwDJVnEJzOOytoNrc0\nxRu491o2EAUIk2/mfDln5vg8gKNGqARuOc5PEAKGrGthYIluoz6JRSm92khf19fe\nQyFF2sYgIrz/h6L+kx4WTEPQPhQWkeJ/NIiCc687ZP1yNmJI/GcUdg==\n-----END CERTIFICATE-----\n"
+		clusterCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: ascr.Namespace,
+				Labels:    map[string]string{injectTrustedCALabel: "true"},
+			},
+			Data: map[string]string{caBundleKey: testClusterCert},
+		}
+
+		testUserCert := "-----BEGIN CERTIFICATE-----\nMIIFNDCCAxygAwIBAgIUdfm4+FGEMjiv2FGF6IqcNx4aSp8wDQYJKoZIhvcNAQEL\nBQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5vcmcwHhcNMjQwNzE5MjA0MDI3WhcNMzQw\nNzE3MjA0MDI3WjAWMRQwEgYDVQQDDAtleGFtcGxlLm9yZzCCAiIwDQYJKoZIhvcN\nAQEBBQADggIPADCCAgoCggIBAO2DhLgDYi7zwhQXxJ0XWd9UHNE4dnHWX2f5zhXT\n8qrEm8ieXKFt87AUooZcyXn5WH5geiauO+sBQ6ksqvb8Jfuj26YbhCeyxAHoKnne\nU9zKpuNr5nM4GIHd7J8X5LATszdXYIr5ghZ2jwhKYKz4Q0g4kObASISGpDODfqKs\nR+ZjIXI3rWcnSWFTbd5ZkOw+xLvNE58f/K1W8ejCU0oFZ0npyfYgfrmteqfiB4Ra\nta9jXThwPgY8psVMAXF8JGl+4t7s1XWHmeIZm3Pjv84Rg2h/2rPcCT5LBBB2W2b8\n2vaHhhLihAFeyZ5D1XRC+wyVIVXpjSgEvWCaAIfjNZaOe1BWa93s10zmLKH4A1yC\nsJj/hmYY/X2MzgRz3vfKAXSEfcTl1hXSDt+NoXaEJDvPF+g4jO0z9/ajFEu4mb1v\nUhUIr3P7AWVaAyvhoORW0D4t3f9mm9QDT7hLetGDU/gEMa53QehC+mCoHbtWiN7y\n394pdXORm2mzNfXoKlBXF1aiDtUE60h+U+uBoK3sxSZVgJq6anqlOE6ILUQNxFZt\nCiMGPeOoyBQmIqiAfGE2Kkz8Jz/7YuNZLlG9jbQy3JwGMX2I12BvXWcG2ScbITqT\n7NhkUCYKQEzUEeOToIsE7nnnxKi2vKnCvtqPFCR/HX5TetHahFo3TTqO0KIx3KXh\nNUzVAgMBAAGjejB4MB0GA1UdDgQWBBQmtTZjMDEVuVrhdqNXmdMqwqlE9TAfBgNV\nHSMEGDAWgBQmtTZjMDEVuVrhdqNXmdMqwqlE9TAPBgNVHRMBAf8EBTADAQH/MCUG\nA1UdEQQeMByCC2V4YW1wbGUub3Jngg0qLmV4YW1wbGUub3JnMA0GCSqGSIb3DQEB\nCwUAA4ICAQAPQb35BXoOE8iWtADxz7hB2KfM98U7n6robrNt6OJ5mGWgt4KoFbCP\niqdDIGxXXPiecSN1vn3GjGJX5zSojMAAhnoAnxix+0G9E08a3YwJ/VFJqMcmxiX/\n6hXOIIRLHeHOSJaYxmtNZVDFuHeL/JbUcHfWyJsGAnkRNSORm0caU5fF/NyC11KR\nbv31SN61ssO/eKJuroa7jEjg6IhhsvXE749LVXZQj4dEoxd4NS1EZNOI0r6WhXgv\nldYN8k2Mup9HA/P89VPEhjr2NhuFDrQH+ReIOCHHQz4R7AzEzwZtdn9FMkzt13D2\n3pNZgjNBTt65la3PYEaKuPBoAEyhmiykPurp5zj+xLlINHU8lgnhtneUNU3RbX4j\nWFDA+HvhwN/67p6uDW8UwQS6NB5cWflElq3zOJXAK6eO2ZetAGJuDPEXMi52U0eU\neFRHqoksH0ThI8kEU+rRbhOrZjTe/4wbsCBitAjlaKM82RlMCT188d3Y706Bcdme\nZlXFPKksDzvRc8LyoZxT5RYXKdNSS/UF3VxP9aKW+hvHzE5Hr9jeVOhrdNvjhJ5r\nWqbHAubuIFOxYN+dzLqJfhq0ee5h9xcN4JSK7Tlyur4IOaLhR0wDJxVl4+lysAxe\nZNpw+0EhyM3IloGpckyWBQZ3vs3qp2evHqbie/F8gM2v0P5VrYPFZw==\n-----END CERTIFICATE-----\n"
+		mirrorCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "mirror-registries",
+				Namespace: ascr.Namespace,
+			},
+			Data: map[string]string{
+				mirrorRegistryRefCertKey:         testUserCert,
+				mirrorRegistryRefRegistryConfKey: "someregistrieshere",
+			},
+		}
+		asc.Spec.MirrorRegistryRef = &corev1.LocalObjectReference{Name: "mirror-registries"}
+
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterCM, mirrorCM)
+		_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+
+		cm := corev1.ConfigMap{}
+		key := types.NamespacedName{
+			Name:      assistedCAConfigMapName,
+			Namespace: ascr.Namespace,
+		}
+		Expect(ascr.Get(ctx, key, &cm)).To(Succeed())
+		Expect(cm.Data[caBundleKey]).To(Equal(testClusterCert + "\n" + testUserCert))
+	})
+
+	It("should fail if the cluster trusted CA does not have the CA bundle key", func() {
+		clusterCACM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: ascr.Namespace,
+			},
+		}
+		ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterCACM)
+		_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).NotTo(BeNil())
+		Expect(err.Error()).To(Equal(fmt.Sprintf("waiting for cluster trusted CA bundle to be injected in config map %s", clusterCAConfigMapName)))
 	})
 
 	Context("IPXE routes", func() {
@@ -795,10 +951,17 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 					},
 				},
 			}
+			clusterTrustedCM = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterCAConfigMapName,
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+			}
 		})
 
 		It("should not create plain http route by default", func() {
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -810,7 +973,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 
 		It("should create plain http route", func() {
 			asc.Spec.IPXEHTTPRoute = aiv1beta1.IPXEHTTPRouteEnabled
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -824,7 +987,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 
 		It("should not create plain http route if ExposeIPXEHTTPRoute is explicitly disabled", func() {
 			asc.Spec.IPXEHTTPRoute = aiv1beta1.IPXEHTTPRouteDisabled
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -835,7 +998,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 
 		It("should not create plain http route if ExposeIPXEHTTPRoute is not unknown", func() {
 			asc.Spec.IPXEHTTPRoute = "foobar"
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -846,7 +1009,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 
 		It("should remove http route after IPXEHTTPRouteEnabled changed to disabled", func() {
 			asc.Spec.IPXEHTTPRoute = aiv1beta1.IPXEHTTPRouteEnabled
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -855,7 +1018,7 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 			Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: bootArtifactsRouteName, Namespace: testNamespace}, found)).To(Succeed())
 
 			asc.Spec.IPXEHTTPRoute = aiv1beta1.IPXEHTTPRouteDisabled
-			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment)
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, agentinstalladmissionDeployment, imageServiceStatefulSet, assistedServiceDeployment, clusterTrustedCM)
 			_, err = ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
 			Expect(err).To(Succeed())
 
@@ -864,6 +1027,285 @@ var _ = Describe("agentserviceconfig_controller reconcile", func() {
 		})
 	})
 
+	Context("with secrets prefix annotation on AgentServiceConfig", func() {
+		It("should create prefixed secret and references to it", func() {
+			asc = newASCDefault()
+			asc.ObjectMeta.Annotations = map[string]string{"unsupported.agent-install.openshift.io/assisted-service-secrets-prefix": "my-prefix-"}
+
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterTrustedCM)
+			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: "my-prefix-postgres", Namespace: testNamespace}, secret)).To(Succeed())
+
+			found := &appsv1.Deployment{}
+			Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
+
+			Expect(found.Spec.Template.Spec.Containers[0].Env).To(
+				ContainElement(
+					corev1.EnvVar{
+						Name: "DB_HOST",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: "db.host",
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "my-prefix-postgres",
+								},
+							},
+						},
+					},
+				),
+			)
+
+			Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: "my-prefix-assisted-servicelocal-auth", Namespace: testNamespace}, secret)).To(Succeed())
+			Expect(found.Spec.Template.Spec.Containers[0].Env).To(
+				ContainElement(
+					corev1.EnvVar{
+						Name: "EC_PUBLIC_KEY_PEM",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								Key: "ec-public-key.pem",
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "my-prefix-assisted-servicelocal-auth",
+								},
+							},
+						},
+					},
+				),
+			)
+		})
+	})
+
+	Context("with PVC prefix annotation on AgentServiceConfig", func() {
+		It("should create prefixed PVC names", func() {
+			asc = newASCDefault()
+			asc.ObjectMeta.Annotations = map[string]string{"unsupported.agent-install.openshift.io/assisted-service-pvc-prefix": "my-prefix-"}
+
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterTrustedCM)
+			_, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+			Expect(err).NotTo(HaveOccurred())
+			found := &appsv1.Deployment{}
+			Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
+
+			Expect(found.Spec.Template.Spec.Volumes).To(
+				ContainElement(
+					corev1.Volume{
+						Name: "bucket-filesystem",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "my-prefix-assisted-service",
+							},
+						},
+					},
+				),
+			)
+			Expect(found.Spec.Template.Spec.Volumes).To(
+				ContainElement(
+					corev1.Volume{
+						Name: "postgresdb",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "my-prefix-postgres",
+							},
+						},
+					},
+				),
+			)
+		})
+
+	})
+	Context("imagePullSecrets are not set when running on OCP", func() {
+		It("does not set imagePullSecrets when running on OCP", func() {
+			testImagePullSecrets := []corev1.LocalObjectReference{
+				{Name: "test-registry-secret-1"},
+				{Name: "test-registry-secret-2"},
+			}
+			// Create a mock PodIntrospector that returns no imagePullSecrets
+			mockPodIntrospector := &mockPodIntrospector{
+				imagePullSecrets: testImagePullSecrets,
+			}
+
+			ingressCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      defaultIngressCertCMName,
+					Namespace: defaultIngressCertCMNamespace,
+				},
+			}
+			asc = newASCDefault()
+			ascr = newTestReconciler(asc, ingressCM, route, imageRoute, clusterTrustedCM)
+			ascr.PodIntrospector = mockPodIntrospector
+			ascr.IsOpenShift = true
+			res, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+			By("checking assisted-service deployment has no imagePullSecrets")
+			deploy := appsv1.Deployment{}
+			key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+			Expect(ascr.Client.Get(ctx, key, &deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+
+			By("checking assisted-image-service statefulset has no imagePullSecrets")
+			ss := appsv1.StatefulSet{}
+			key = types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+			Expect(ascr.Client.Get(ctx, key, &ss)).To(Succeed())
+			Expect(ss.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+
+			By("checking webhook deployment has no imagePullSecrets")
+			webhookDeploy := appsv1.Deployment{}
+			key = types.NamespacedName{Name: "agentinstalladmission", Namespace: testNamespace}
+			Expect(ascr.Client.Get(ctx, key, &webhookDeploy)).To(Succeed())
+			Expect(webhookDeploy.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+		})
+	})
+
+})
+
+var _ = Describe("agentserviceconfig_controller with enable-image-service annotation", func() {
+	var (
+		asc                             *aiv1beta1.AgentServiceConfig
+		ascr                            *AgentServiceConfigReconciler
+		agentinstalladmissionDeployment *appsv1.Deployment
+
+		ctx       = context.Background()
+		ingressCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      defaultIngressCertCMName,
+				Namespace: defaultIngressCertCMNamespace,
+			},
+		}
+		route = &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: testHost,
+			},
+		}
+
+		clusterTrustedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
+	)
+
+	BeforeEach(func() {
+		asc = newASCDefault()
+		asc.ObjectMeta.Annotations = map[string]string{
+			"agent-install.openshift.io/enable-image-service": "false",
+		}
+	})
+
+	It("should not deploy image service resources when enable-image-service annotation is set to false", func() {
+		agentinstalladmissionDeployment = &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "agentinstalladmission",
+				Namespace: testNamespace,
+			},
+			Status: appsv1.DeploymentStatus{
+				Conditions: []appsv1.DeploymentCondition{
+					{
+						Type:   appsv1.DeploymentAvailable,
+						Status: corev1.ConditionTrue,
+					},
+				},
+			},
+		}
+
+		ascr = newTestReconciler(asc, ingressCM, route, agentinstalladmissionDeployment, clusterTrustedCM)
+		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(Succeed())
+		Expect(result).To(Equal(ctrl.Result{}))
+
+		// Verify that assisted-service resources ARE created (main service should still work)
+		assistedServiceFound := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assistedServiceFound)).To(Succeed())
+
+		// Verify that ENABLE_IMAGE_SERVICE env var is set in the ConfigMap (loaded via envFrom)
+		assistedCMFound := &corev1.ConfigMap{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assistedCMFound)).To(Succeed())
+		Expect(assistedCMFound.Data["ENABLE_IMAGE_SERVICE"]).To(Equal("false"), "ENABLE_IMAGE_SERVICE should be set to 'false' in the ConfigMap")
+
+		// Verify that the deployment is configured to load environment variables from the ConfigMap
+		serviceContainer := assistedServiceFound.Spec.Template.Spec.Containers[0]
+		var foundConfigMapRef bool
+		for _, envFrom := range serviceContainer.EnvFrom {
+			if envFrom.ConfigMapRef != nil && envFrom.ConfigMapRef.Name == serviceName {
+				foundConfigMapRef = true
+				break
+			}
+		}
+		Expect(foundConfigMapRef).To(BeTrue(), "Deployment should be configured to load environment variables from ConfigMap")
+
+		assistedServiceServiceFound := &corev1.Service{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assistedServiceServiceFound)).To(Succeed())
+
+		// Verify that image service resources are NOT created
+		imageServiceStatefulSetFound := &appsv1.StatefulSet{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageServiceStatefulSetFound)).ToNot(Succeed())
+
+		imageServiceServiceFound := &corev1.Service{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageServiceServiceFound)).ToNot(Succeed())
+
+		imageServiceRouteFound := &routev1.Route{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageServiceRouteFound)).ToNot(Succeed())
+
+		imageServiceSAFound := &corev1.ServiceAccount{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageServiceSAFound)).ToNot(Succeed())
+
+		imageServiceCMFound := &corev1.ConfigMap{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageServiceCMFound)).ToNot(Succeed())
+	})
+
+	It("should set empty OS_IMAGES environment variable when image service is disabled", func() {
+		agentinstalladmissionDeployment = &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "agentinstalladmission",
+				Namespace: testNamespace,
+			},
+			Status: appsv1.DeploymentStatus{
+				Conditions: []appsv1.DeploymentCondition{
+					{
+						Type:   appsv1.DeploymentAvailable,
+						Status: corev1.ConditionTrue,
+					},
+				},
+			},
+		}
+
+		ascr = newTestReconciler(asc, ingressCM, route, agentinstalladmissionDeployment, clusterTrustedCM)
+		result, err := ascr.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(Succeed())
+		Expect(result).To(Equal(ctrl.Result{}))
+
+		// Check that the assisted-service ConfigMap has empty OS_IMAGES
+		assistedCMFound := &corev1.ConfigMap{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assistedCMFound)).To(Succeed())
+		Expect(assistedCMFound.Data["OS_IMAGES"]).To(Equal("[]"))
+		Expect(assistedCMFound.Data["IMAGE_SERVICE_BASE_URL"]).To(Equal(""))
+
+		// Also verify that ENABLE_IMAGE_SERVICE env var is set in the ConfigMap (already checked above)
+		Expect(assistedCMFound.Data["ENABLE_IMAGE_SERVICE"]).To(Equal("false"), "ENABLE_IMAGE_SERVICE should be set to 'false' in the ConfigMap")
+
+		// Verify that the deployment is configured to load environment variables from the ConfigMap
+		assistedServiceFound := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assistedServiceFound)).To(Succeed())
+
+		serviceContainer := assistedServiceFound.Spec.Template.Spec.Containers[0]
+		var foundConfigMapRef bool
+		for _, envFrom := range serviceContainer.EnvFrom {
+			if envFrom.ConfigMapRef != nil && envFrom.ConfigMapRef.Name == serviceName {
+				foundConfigMapRef = true
+				break
+			}
+		}
+		Expect(foundConfigMapRef).To(BeTrue(), "Deployment should be configured to load environment variables from ConfigMap")
+	})
 })
 
 var _ = Describe("newImageServiceService", func() {
@@ -906,6 +1348,129 @@ var _ = Describe("newImageServiceService", func() {
 			Expect(found.ObjectMeta.Annotations).NotTo(BeNil())
 			Expect(found.ObjectMeta.Annotations[servingCertAnnotation]).To(Equal(imageServiceName))
 		})
+	})
+})
+
+var _ = Describe("newAssistedServiceNetworkPolicy", func() {
+	var (
+		asc  *aiv1beta1.AgentServiceConfig
+		ascr *AgentServiceConfigReconciler
+		ascc ASC
+		ctx  = context.Background()
+		log  = logrus.New()
+	)
+
+	BeforeEach(func() {
+		asc = newASCDefault()
+		ascr = newTestReconciler(asc)
+		ascc = initASC(ascr, asc)
+	})
+
+	It("should not restrict egress traffic", func() {
+		obj, mutateFn, err := newAssistedServiceNetworkPolicy(ctx, log, ascc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mutateFn()).To(Succeed())
+
+		np := obj.(*netv1.NetworkPolicy)
+		Expect(np.Spec.PolicyTypes).To(Equal([]netv1.PolicyType{netv1.PolicyTypeIngress}))
+		Expect(np.Spec.Egress).To(BeEmpty())
+	})
+
+	It("should restrict ingress to same-namespace, openshift-ingress, and monitoring", func() {
+		obj, mutateFn, err := newAssistedServiceNetworkPolicy(ctx, log, ascc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mutateFn()).To(Succeed())
+
+		np := obj.(*netv1.NetworkPolicy)
+		Expect(np.Spec.Ingress).To(HaveLen(2))
+
+		rule := np.Spec.Ingress[0]
+		Expect(rule.From).To(HaveLen(2))
+		Expect(rule.From[0].PodSelector).ToNot(BeNil())
+		Expect(rule.From[0].NamespaceSelector).To(BeNil())
+		Expect(rule.From[1].NamespaceSelector).ToNot(BeNil())
+		Expect(rule.From[1].PodSelector).To(BeNil())
+		Expect(rule.From[1].NamespaceSelector.MatchLabels).To(HaveKeyWithValue("network.openshift.io/policy-group", "ingress"))
+		Expect(rule.Ports).To(HaveLen(3))
+
+		monRule := np.Spec.Ingress[1]
+		Expect(monRule.From).To(HaveLen(1))
+		Expect(monRule.From[0].NamespaceSelector).ToNot(BeNil())
+		Expect(monRule.From[0].PodSelector).To(BeNil())
+		Expect(monRule.From[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue("network.openshift.io/policy-group", "monitoring"))
+		Expect(monRule.Ports).To(HaveLen(1))
+	})
+})
+
+var _ = Describe("newImageServiceNetworkPolicy", func() {
+	var (
+		asc  *aiv1beta1.AgentServiceConfig
+		ascr *AgentServiceConfigReconciler
+		ascc ASC
+		ctx  = context.Background()
+		log  = logrus.New()
+	)
+
+	BeforeEach(func() {
+		asc = newASCDefault()
+		ascr = newTestReconciler(asc)
+		ascc = initASC(ascr, asc)
+	})
+
+	It("should not restrict egress traffic", func() {
+		obj, mutateFn, err := newImageServiceNetworkPolicy(ctx, log, ascc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mutateFn()).To(Succeed())
+
+		np := obj.(*netv1.NetworkPolicy)
+		Expect(np.Spec.PolicyTypes).To(Equal([]netv1.PolicyType{netv1.PolicyTypeIngress}))
+		Expect(np.Spec.Egress).To(BeEmpty())
+	})
+
+	It("should restrict ingress to same-namespace and openshift-ingress only", func() {
+		obj, mutateFn, err := newImageServiceNetworkPolicy(ctx, log, ascc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mutateFn()).To(Succeed())
+
+		np := obj.(*netv1.NetworkPolicy)
+		Expect(np.Spec.Ingress).To(HaveLen(1))
+		rule := np.Spec.Ingress[0]
+		Expect(rule.From).To(HaveLen(2))
+		Expect(rule.From[0].PodSelector).ToNot(BeNil())
+		Expect(rule.From[0].NamespaceSelector).To(BeNil())
+		Expect(rule.From[1].NamespaceSelector).ToNot(BeNil())
+		Expect(rule.From[1].PodSelector).To(BeNil())
+		Expect(rule.From[1].NamespaceSelector.MatchLabels).To(HaveKeyWithValue("network.openshift.io/policy-group", "ingress"))
+		Expect(rule.Ports).To(HaveLen(2))
+	})
+})
+
+var _ = Describe("newWebhookNetworkPolicy", func() {
+	var (
+		asc  *aiv1beta1.AgentServiceConfig
+		ascr *AgentServiceConfigReconciler
+		ascc ASC
+		ctx  = context.Background()
+		log  = logrus.New()
+	)
+
+	BeforeEach(func() {
+		asc = newASCDefault()
+		ascr = newTestReconciler(asc)
+		ascc = initASC(ascr, asc)
+	})
+
+	It("should allow ingress on port 9443 from any source for kube-apiserver webhook calls", func() {
+		obj, mutateFn, err := newWebhookNetworkPolicy(ctx, log, ascc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(mutateFn()).To(Succeed())
+
+		np := obj.(*netv1.NetworkPolicy)
+		Expect(np.Spec.Ingress).To(HaveLen(1))
+		rule := np.Spec.Ingress[0]
+		Expect(rule.From).To(BeEmpty())
+		Expect(rule.Ports).To(HaveLen(1))
+		Expect(rule.Ports[0].Port.IntVal).To(Equal(int32(9443)))
 	})
 })
 
@@ -1455,7 +2020,8 @@ var _ = Describe("newServiceMonitor", func() {
 		endpoint := found.Spec.Endpoints[0]
 		Expect(endpoint.TLSConfig.CAFile).To(Equal("/etc/prometheus/configmaps/serving-certs-ca-bundle/service-ca.crt"))
 		Expect(endpoint.Scheme).To(Equal("https"))
-		Expect(endpoint.TLSConfig.ServerName).To(Equal("assisted-service.test-namespace.svc"))
+		Expect(endpoint.TLSConfig.ServerName).NotTo(BeNil())
+		Expect(*endpoint.TLSConfig.ServerName).To(Equal("assisted-service.test-namespace.svc"))
 	})
 })
 
@@ -1484,13 +2050,20 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 				"foo": "bar",
 			},
 		}
+		assistedTrustedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      assistedCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-trusted-bundle"},
+		}
 	)
 
 	Describe("AgentServiceConfig Unsupported ConfigMap annotation", func() {
 		Context("without annotation on AgentServiceConfig", func() {
 			It("should not modify assisted-service deployment", func() {
 				asc = newASCDefault()
-				ascr = newTestReconciler(asc, route, assistedCM)
+				ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
@@ -1521,7 +2094,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 						"foo": "bar",
 					},
 				}
-				ascr = newTestReconciler(asc, route, userCM, assistedCM)
+				ascr = newTestReconciler(asc, route, userCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 				found := &appsv1.Deployment{}
@@ -1567,13 +2140,13 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					},
 				}
 
-				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM)
+				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
 				found := &appsv1.Deployment{}
 				Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
-				Expect(found.Spec.Template.Spec.Volumes).To(HaveLen(5))
+				Expect(found.Spec.Template.Spec.Volumes).To(HaveLen(6))
 				Expect(found.Spec.Template.Spec.Containers[0].VolumeMounts).Should(ContainElement(
 					corev1.VolumeMount{
 						Name:      mirrorRegistryConfigVolume,
@@ -1582,7 +2155,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 				)
 				Expect(found.Spec.Template.Spec.Containers[0].VolumeMounts).ShouldNot(ContainElement(
 					corev1.VolumeMount{
-						Name:      mirrorRegistryConfigVolume,
+						Name:      mirrorRegistryCertBundleVolume,
 						MountPath: common.MirrorRegistriesCertificatePath,
 						SubPath:   common.MirrorRegistriesCertificateFile,
 					}),
@@ -1601,7 +2174,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					},
 				}
 
-				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM)
+				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
@@ -1627,13 +2200,48 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					},
 				}
 
-				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM)
+				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
 				found := &appsv1.Deployment{}
 				Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
-				Expect(found.Spec.Template.Spec.Volumes).To(HaveLen(5))
+				Expect(found.Spec.Template.Spec.Volumes).To(HaveLen(7))
+				Expect(found.Spec.Template.Spec.Volumes).To(ContainElement(
+					corev1.Volume{
+						Name: "trusted-ca-certs",
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								Items: []corev1.KeyToPath{{
+									Key:  caBundleKey,
+									Path: common.SystemCertificateBundle,
+								}},
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: assistedCAConfigMapName,
+								},
+								DefaultMode: swag.Int32(420),
+							},
+						},
+					},
+				))
+				Expect(found.Spec.Template.Spec.Volumes).To(ContainElement(
+					corev1.Volume{
+						Name: mirrorRegistryCertBundleVolume,
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								Items: []corev1.KeyToPath{{
+									Key:  mirrorRegistryRefCertKey,
+									Path: common.MirrorRegistriesCertificateFile,
+								}},
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: testMirrorRegConfigmapName,
+								},
+								DefaultMode: swag.Int32(420),
+							},
+						},
+					},
+				))
+
 				Expect(found.Spec.Template.Spec.Containers[0].VolumeMounts).Should(ContainElement(
 					corev1.VolumeMount{
 						Name:      mirrorRegistryConfigVolume,
@@ -1642,7 +2250,14 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 				)
 				Expect(found.Spec.Template.Spec.Containers[0].VolumeMounts).Should(ContainElement(
 					corev1.VolumeMount{
-						Name:      mirrorRegistryConfigVolume,
+						Name:      "trusted-ca-certs",
+						MountPath: common.SystemCertificateBundlePath,
+						SubPath:   common.SystemCertificateBundle,
+					}),
+				)
+				Expect(found.Spec.Template.Spec.Containers[0].VolumeMounts).Should(ContainElement(
+					corev1.VolumeMount{
+						Name:      mirrorRegistryCertBundleVolume,
 						MountPath: common.MirrorRegistriesCertificatePath,
 						SubPath:   common.MirrorRegistriesCertificateFile,
 					}),
@@ -1663,7 +2278,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					},
 				}
 
-				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM)
+				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileFailure(ctx, log, ascc, newAssistedServiceDeployment)
 			})
@@ -1679,10 +2294,10 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					Namespace: testNamespace,
 				},
 				Data: map[string]string{
-					osImageDownloadTrustedCAFilename: "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
+					"cert.ca": "-----BEGIN CERTIFICATE-----\nMIIDZTCCAk2gAwIBAgIUASRIJ1X9QHbJ/+daV+IjQdS1NIowDQYJKoZIhvcNAQEL\nBQAwQjELMAkGA1UEBhMCWFgxFTATBgNVBAcMDERlZmF1bHQgQ2l0eTEcMBoGA1UE\nCgwTRGVmYXVsdCBDb21wYW55IEx0ZDAeFw0yNDAxMDkxMzA0MzFaFw0zNDAxMDYx\nMzA0MzFaMEIxCzAJBgNVBAYTAlhYMRUwEwYDVQQHDAxEZWZhdWx0IENpdHkxHDAa\nBgNVBAoME0RlZmF1bHQgQ29tcGFueSBMdGQwggEiMA0GCSqGSIb3DQEBAQUAA4IB\nDwAwggEKAoIBAQC+Z9BqGKzPINWCSMdeTX52gLDoeTU3q4fH8QyHSO3hNo/eKtaE\nrHOqnsn/ntcsjFwX9Wfwxt1B73uqXkqWWCsH2QKGsw36gPJmSc6ZuqP7oUTApx0U\nOktdxOm96MouqN5OAXoPvzH5dFytJyW3TWpKJ3jP9ZWJrqmp4YcgnU+U6Vlen4iy\nN0NciJtdVDDsWoWqh0zg0YOHJpd43c7aQ0PFoPp4QEj4j29I7X91UmRP67dA8kSw\n2mPcZZFDkKY9fA0TuF1a3Dvx7yssvQoAC9F+jZYgBsTcFNGcc2roJVA8RwcdVZQ3\nbTwA0nLql5EDLdXHSthJiXHPhp6niOTsJx4bAgMBAAGjUzBRMB0GA1UdDgQWBBQr\nbklK4KlO6lgMM5MpVxqWcpWhxzAfBgNVHSMEGDAWgBQrbklK4KlO6lgMM5MpVxqW\ncpWhxzAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAEF3pv541h\nXKwDMqHShbpvqEqnhN74c6zc6b8nnIohRK5rNkEkIEf2ikJ6Pdik2te4IHEoA4V9\nHqtpKUtgNqge6GAw/p3kOB4C6eObZYZTaJ4ZiQ5UvO6R7w5MvFkjQH5hFO+fjhQv\n8whWWO7HRlt/Hll/VF3JNVALtIv2SGi51WHFqwe+ERKl0kGKWH8PyY4X6XflHQfa\n1FDev/NRnOVjRcXipsaZwRXcjRUiRX1KuOixlc8Reul8RdrL1Mt7lpl8+e/hqhoO\n2O5thhnTuV/mID3zE+5J8w6UcCdeZo4VDNWdZqPzrI/ymSgARVwUu0MFeYfCbMmB\neEpiSixb6YRM\n-----END CERTIFICATE-----\n",
 				},
 			}
-			ascr = newTestReconciler(asc, osImageCACertCM)
+			ascr = newTestReconciler(asc, osImageCACertCM, assistedTrustedCM)
 			ascc = initASC(ascr, asc)
 
 			obj, mutateFn := newImageServiceStatefulSet(ctx, log, ascc)
@@ -1706,7 +2321,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 					"query_params": []byte(`{"query_foo":"qfoo", "query_bar":"qbar"}`),
 				},
 			}
-			ascr = newTestReconciler(asc, osImageAdditionalParametersSecret)
+			ascr = newTestReconciler(asc, osImageAdditionalParametersSecret, assistedTrustedCM)
 			ascc = initASC(ascr, asc)
 			obj, mutateFn := newImageServiceStatefulSet(ctx, log, ascc)
 			_, err := controllerutil.CreateOrUpdate(ctx, ascc.Client, obj, mutateFn)
@@ -1722,14 +2337,14 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 		Context("with assisted-service configmap", func() {
 			It("should fail if assisted configMap not found", func() {
 				asc = newASCDefault()
-				ascr = newTestReconciler(asc, route)
+				ascr = newTestReconciler(asc, route, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileFailure(ctx, log, ascc, newAssistedServiceDeployment)
 			})
 
 			It("should only add assisted config hash annotation", func() {
 				asc = newASCDefault()
-				ascr = newTestReconciler(asc, route, assistedCM)
+				ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
@@ -1745,7 +2360,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 		Context("with mirror configmap", func() {
 			It("should fail if mirror configMap specified but not found", func() {
 				asc = newASCWithMirrorRegistryConfig()
-				ascr = newTestReconciler(asc, route, assistedCM)
+				ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileFailure(ctx, log, ascc, newAssistedServiceDeployment)
 			})
@@ -1761,7 +2376,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 						mirrorRegistryRefRegistryConfKey: "foo",
 					},
 				}
-				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM)
+				ascr = newTestReconciler(asc, route, mirrorCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
@@ -1777,7 +2392,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 		Context("with unsupported configMap", func() {
 			It("should fail if not found", func() {
 				asc = newASCWithCMAnnotation()
-				ascr = newTestReconciler(asc, route, assistedCM)
+				ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileFailure(ctx, log, ascc, newAssistedServiceDeployment)
 			})
@@ -1793,7 +2408,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 						"foo": "bar",
 					},
 				}
-				ascr = newTestReconciler(asc, route, userCM, assistedCM)
+				ascr = newTestReconciler(asc, route, userCM, assistedCM, assistedTrustedCM)
 				ascc = initASC(ascr, asc)
 				AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
@@ -1809,7 +2424,7 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 
 	It("should expose two ports for ipxe", func() {
 		asc = newASCDefault()
-		ascr = newTestReconciler(asc, route, assistedCM)
+		ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
 		ascc = initASC(ascr, asc)
 		AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
 
@@ -1819,6 +2434,48 @@ var _ = Describe("ensureAssistedServiceDeployment", func() {
 		Expect(found.Spec.Template.Spec.Containers[0].Ports).To(HaveLen(2))
 		Expect(found.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort).To(Equal(int32(servicePort.IntValue())))
 		Expect(found.Spec.Template.Spec.Containers[0].Ports[1].ContainerPort).To(Equal(int32(serviceHTTPPort.IntValue())))
+	})
+
+	It("adds postgres hop init containers for EUS skip-upgrades", func() {
+		asc = newASCDefault()
+		ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
+		ascc = initASC(ascr, asc)
+		AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
+
+		found := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
+		Expect(found.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+		Expect(found.Spec.Template.Spec.InitContainers[0].Name).To(Equal("postgres-upgrade-to-13"))
+		Expect(found.Spec.Template.Spec.InitContainers[0].Image).To(Equal(defaultDatabaseImagePG13))
+		Expect(found.Spec.Template.Spec.InitContainers[1].Name).To(Equal("postgres-upgrade-to-15"))
+		Expect(found.Spec.Template.Spec.InitContainers[1].Image).To(Equal(defaultDatabaseImagePG15))
+		Expect(found.Spec.Template.Spec.Containers[1].Image).To(Equal(defaultDatabaseImage))
+		Expect(found.Spec.Template.Spec.InitContainers[0].VolumeMounts).To(
+			ContainElement(corev1.VolumeMount{Name: "postgresdb", MountPath: "/var/lib/pgsql/data"}),
+		)
+	})
+
+	It("deploys the default image when no base image annotation is present", func() {
+		asc = newASCDefault()
+		ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
+		ascc = initASC(ascr, asc)
+		AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
+
+		found := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
+		Expect(found.Spec.Template.Spec.Containers[0].Image).To(Equal("quay.io/edge-infrastructure/assisted-service:latest"))
+	})
+
+	It("deploys the default image when the base image annotation is set to any value", func() {
+		asc = newASCDefault()
+		setAnnotation(&asc.ObjectMeta, serviceImageBaseAnnotation, "el10")
+		ascr = newTestReconciler(asc, route, assistedCM, assistedTrustedCM)
+		ascc = initASC(ascr, asc)
+		AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
+
+		found := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, found)).To(Succeed())
+		Expect(found.Spec.Template.Spec.Containers[0].Image).To(Equal("quay.io/edge-infrastructure/assisted-service:latest"))
 	})
 })
 
@@ -1831,28 +2488,22 @@ var _ = Describe("getMustGatherImages", func() {
 			Url:              "registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel8:v2.6.5",
 		},
 	}
-	var defaultEnvMustGatherImages = versions.MustGatherVersions{
-		"4.8": versions.MustGatherVersion{
+	var defaultEnvMustGatherImages = `
+	{
+		"4.8": {
 			"cnv": "registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel8:v2.6.5",
 			"odf": "registry.redhat.io/ocs4/ocs-must-gather-rhel8",
-			"lso": "registry.redhat.io/openshift4/ose-local-storage-mustgather-rhel8",
-		},
+			"lso": "registry.redhat.io/openshift4/ose-local-storage-mustgather-rhel8"
+		}
 	}
-	var outSpecMustGatherImages = versions.MustGatherVersions{
-		"4.8": versions.MustGatherVersion{
-			"cnv": "registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel8:v2.6.5",
-		},
+	`
+	var outSpecMustGatherImages = `
+	{
+		"4.8": {
+			"cnv": "registry.redhat.io/container-native-virtualization/cnv-must-gather-rhel8:v2.6.5"
+		}
 	}
-	var spec2string = func() string {
-		bytes, err := json.Marshal(outSpecMustGatherImages)
-		Expect(err).NotTo(HaveOccurred())
-		return string(bytes)
-	}
-	var env2string = func() string {
-		bytes, err := json.Marshal(defaultEnvMustGatherImages)
-		Expect(err).NotTo(HaveOccurred())
-		return string(bytes)
-	}
+	`
 
 	var (
 		asc *aiv1beta1.AgentServiceConfig
@@ -1862,31 +2513,31 @@ var _ = Describe("getMustGatherImages", func() {
 	tests := []struct {
 		name     string
 		spec     []aiv1beta1.MustGatherImage
-		env      versions.MustGatherVersions
+		env      string
 		expected string
 	}{
 		{
 			name:     "spec is empty - return the env configuration",
 			spec:     nil,
 			env:      defaultEnvMustGatherImages,
-			expected: env2string(),
+			expected: defaultEnvMustGatherImages,
 		},
 		{
 			name:     "images in spec - return the spec configuration",
 			spec:     defaultSpecMustGatherImages,
-			env:      nil,
-			expected: spec2string(),
+			env:      "",
+			expected: outSpecMustGatherImages,
 		},
 		{
 			name:     "both sources - return the spec configuration",
 			spec:     defaultSpecMustGatherImages,
 			env:      defaultEnvMustGatherImages,
-			expected: spec2string(),
+			expected: outSpecMustGatherImages,
 		},
 		{
 			name:     "both empty - return empty string",
 			spec:     nil,
-			env:      nil,
+			env:      "",
 			expected: "",
 		},
 	}
@@ -1901,8 +2552,8 @@ var _ = Describe("getMustGatherImages", func() {
 		It(t.name, func() {
 			//setup must gather image environment variable, if applicable
 			defer os.Unsetenv(MUST_GATHER_IMAGES_ENVVAR)
-			if t.env != nil {
-				os.Setenv(MUST_GATHER_IMAGES_ENVVAR, env2string())
+			if t.env != "" {
+				os.Setenv(MUST_GATHER_IMAGES_ENVVAR, t.env)
 			}
 			//setup must gather image SPEC configuration
 			asc.Spec.MustGatherImages = t.spec
@@ -2020,9 +2671,9 @@ var _ = Describe("getOSImages", func() {
 			asc.Spec.OSImages = t.spec
 			// verify the result
 			if t.expected != "" {
-				Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(t.expected))
+				Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(t.expected))
 			} else {
-				Expect(getOSImages(log, &asc.Spec)).To(Equal(""))
+				Expect(getOSImages(log, &asc.Spec, nil)).To(Equal(""))
 			}
 		})
 	}
@@ -2045,31 +2696,31 @@ var _ = Describe("getOSImages", func() {
 			defer os.Unsetenv(OsImagesEnvVar)
 
 			asc = newASCDefault()
-			Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(expectedEnv))
+			Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(expectedEnv))
 		})
 	})
 	Context("with OS images specified", func() {
 		It("should build OS images", func() {
 			asc, expectedEnv = newASCWithOSImages()
-			Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(expectedEnv))
+			Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(expectedEnv))
 		})
 	})
 	Context("with multiple OS images specified", func() {
 		It("should build OS images with multiple keys", func() {
 			asc, expectedEnv = newASCWithMultipleOpenshiftVersions()
-			Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(expectedEnv))
+			Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(expectedEnv))
 		})
 	})
 	Context("with duplicate OS images specified", func() {
 		It("should take the last specified version", func() {
 			asc, expectedEnv = newASCWithDuplicateOpenshiftVersions()
-			Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(expectedEnv))
+			Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(expectedEnv))
 		})
 	})
 	Context("with OS images x.y.z specified", func() {
 		It("should only specify x.y", func() {
 			asc, expectedEnv = newASCWithLongOpenshiftVersion()
-			Expect(getOSImages(log, &asc.Spec)).To(MatchJSON(expectedEnv))
+			Expect(getOSImages(log, &asc.Spec, nil)).To(MatchJSON(expectedEnv))
 		})
 	})
 })
@@ -2107,8 +2758,23 @@ var _ = Describe("newAssistedCM", func() {
 			location = "quay.io/edge-infrastructure"
 			mirror-by-digest-only = true
 	
-		[[registry.mirror]]
-			location = "mirror1.registry.corp.com:5000/edge-infrastructure"`
+			[[registry.mirror]]
+			location = "mirror1.registry.corp.com:5000/edge-infrastructure"
+
+			[[registry.mirror]]
+			location = "mirror2.registry.corp.com:5000/edge-infrastructure"
+		
+		[[registry]]
+			prefix = ""
+			location = "registry.ci.openshift.org/edge-infrastructure"
+			mirror-by-digest-only = true
+	
+			[[registry.mirror]]
+			location = "mirror-foo-bar1.registry.corp.com:5000/edge-infrastructure"
+
+			[[registry.mirror]]
+			location = "mirror-foo-bar2.registry.corp.com:5000/edge-infrastructure"`
+
 		mirrorCM = &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      testMirrorRegConfigmapName,
@@ -2118,13 +2784,20 @@ var _ = Describe("newAssistedCM", func() {
 				mirrorRegistryRefCertKey: "foo",
 			},
 		}
+		clusterTrustedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
 	)
 
 	BeforeEach(func() {
 		log = logrus.New()
 		ctx = context.Background()
 		asc = newASCDefault()
-		ascr := newTestReconciler(asc, route, imageRoute)
+		ascr := newTestReconciler(asc, route, imageRoute, clusterTrustedCM)
 		ascc = initASC(ascr, asc)
 	})
 
@@ -2138,26 +2811,52 @@ var _ = Describe("newAssistedCM", func() {
 	})
 
 	It("default public container registries", func() {
-		ensureNewAssistedConfigmapValue(ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.svc.ci.openshift.org")
+		ensureNewAssistedConfigmapValue(ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.ci.openshift.org")
+	})
+	It("adds unqualified-search-registries", func() {
+		asc.Spec.MirrorRegistryRef = &corev1.LocalObjectReference{Name: testMirrorRegConfigmapName}
+		mirrorCM.Data[mirrorRegistryRefRegistryConfKey] = registryConf
+		ascr := newTestReconciler(asc, route, imageRoute, mirrorCM, clusterTrustedCM)
+		ascc = initASC(ascr, asc)
+		ensureNewAssistedConfigmapValue(
+			ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.ci.openshift.org,registry.access.redhat.com,docker.io",
+		)
 	})
 	It("adds mirror registries", func() {
 		asc.Spec.MirrorRegistryRef = &corev1.LocalObjectReference{Name: testMirrorRegConfigmapName}
 		mirrorCM.Data[mirrorRegistryRefRegistryConfKey] = registryConf
-		ascr := newTestReconciler(asc, route, imageRoute, mirrorCM)
+		ascr := newTestReconciler(asc, route, imageRoute, mirrorCM, clusterTrustedCM)
 		ascc = initASC(ascr, asc)
-		ensureNewAssistedConfigmapValue(ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.svc.ci.openshift.org,registry.access.redhat.com,docker.io")
+		ensureNewAssistedConfigmapValue(
+			ctx,
+			log,
+			ascc,
+			"PUBLIC_CONTAINER_REGISTRIES",
+			"quay.io,registry.ci.openshift.org,registry.access.redhat.com,docker.io",
+		)
 	})
 	It("adds user-specified unauthenticated registries", func() {
 		asc.Spec.UnauthenticatedRegistries = []string{"example.com"}
-		ensureNewAssistedConfigmapValue(ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.svc.ci.openshift.org,example.com")
+		ensureNewAssistedConfigmapValue(
+			ctx,
+			log,
+			ascc,
+			"PUBLIC_CONTAINER_REGISTRIES",
+			"quay.io,registry.ci.openshift.org,example.com",
+		)
 	})
 	It("ignores duplicate values", func() {
 		asc.Spec.UnauthenticatedRegistries = []string{"example.com", "quay.io", "docker.io"}
 		asc.Spec.MirrorRegistryRef = &corev1.LocalObjectReference{Name: testMirrorRegConfigmapName}
 		mirrorCM.Data[mirrorRegistryRefRegistryConfKey] = registryConf
-		ascr := newTestReconciler(asc, route, imageRoute, mirrorCM)
+		ascr := newTestReconciler(asc, route, imageRoute, mirrorCM, clusterTrustedCM)
 		ascc = initASC(ascr, asc)
-		ensureNewAssistedConfigmapValue(ctx, log, ascc, "PUBLIC_CONTAINER_REGISTRIES", "quay.io,registry.svc.ci.openshift.org,registry.access.redhat.com,docker.io,example.com")
+		ensureNewAssistedConfigmapValue(
+			ctx,
+			log,
+			ascc,
+			"PUBLIC_CONTAINER_REGISTRIES",
+			"quay.io,registry.ci.openshift.org,registry.access.redhat.com,docker.io,example.com")
 	})
 })
 
@@ -2225,7 +2924,7 @@ var _ = Describe("getDeploymentData", func() {
 	})
 	It("sets the DEPLOYMENT TYPE and VERSION to operator when both ACM/MCE don't exist", func() {
 		getDeploymentData(ctx, cm, ascc)
-		version := ServiceImage()
+		version := ServiceImage(ascc.Object)
 		Expect(cm.Data["DEPLOYMENT_TYPE"]).To(Equal("Operator"))
 		Expect(cm.Data["DEPLOYMENT_VERSION"]).To(Equal(version))
 	})
@@ -2299,21 +2998,21 @@ func newASCDefault() *aiv1beta1.AgentServiceConfig {
 		},
 		Spec: aiv1beta1.AgentServiceConfigSpec{
 			FileSystemStorage: corev1.PersistentVolumeClaimSpec{
-				Resources: corev1.ResourceRequirements{
+				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: resource.MustParse("20Gi"),
 					},
 				},
 			},
 			DatabaseStorage: corev1.PersistentVolumeClaimSpec{
-				Resources: corev1.ResourceRequirements{
+				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: resource.MustParse("10Gi"),
 					},
 				},
 			},
 			ImageStorage: &corev1.PersistentVolumeClaimSpec{
-				Resources: corev1.ResourceRequirements{
+				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: resource.MustParse("10Gi"),
 					},
@@ -2486,3 +3185,956 @@ func newASCWithLongOpenshiftVersion() (*aiv1beta1.AgentServiceConfig, string) {
 
 	return asc, string(encoded)
 }
+
+func newASCWithForceInsecurePolicyAnnotation() *aiv1beta1.AgentServiceConfig {
+	asc := newASCDefault()
+	asc.ObjectMeta.Annotations = map[string]string{allowUnrestrictedImagePulls: "true"}
+	return asc
+}
+
+func newASCWithForceInsecurePolicyAnnotationFalse() *aiv1beta1.AgentServiceConfig {
+	asc := newASCDefault()
+	asc.ObjectMeta.Annotations = map[string]string{allowUnrestrictedImagePulls: "false"}
+	return asc
+}
+
+var _ = Describe("ForceInsecurePolicyJson annotation", func() {
+	var (
+		ctx               context.Context
+		log               logrus.FieldLogger
+		asc               *aiv1beta1.AgentServiceConfig
+		ascr              *AgentServiceConfigReconciler
+		ascc              ASC
+		route             *routev1.Route
+		imageRoute        *routev1.Route
+		assistedCM        *corev1.ConfigMap
+		assistedTrustedCM *corev1.ConfigMap
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		log = logrus.New()
+
+		route = &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: testHost,
+			},
+		}
+
+		imageRoute = &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      imageServiceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: testHost + ".images",
+			},
+		}
+
+		assistedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+		}
+
+		assistedTrustedCM = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      assistedCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-trusted-bundle"},
+		}
+	})
+
+	Context("without ForceInsecurePolicyJson annotation", func() {
+		It("should not include FORCE_INSECURE_POLICY_JSON in ConfigMap", func() {
+			asc = newASCDefault()
+			ascr = newTestReconciler(asc, route, imageRoute, assistedCM, assistedTrustedCM)
+			ascc = initASC(ascr, asc)
+
+			cm, mutateFn, err := newAssistedCM(ctx, log, ascc)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mutateFn()).To(Succeed())
+			configMap := cm.(*corev1.ConfigMap)
+
+			Expect(configMap.Data).ToNot(HaveKey("FORCE_INSECURE_POLICY_JSON"))
+		})
+	})
+
+	Context("with ForceInsecurePolicyJson annotation set to true", func() {
+		It("should include FORCE_INSECURE_POLICY_JSON=true in ConfigMap", func() {
+			asc = newASCWithForceInsecurePolicyAnnotation()
+			ascr = newTestReconciler(asc, route, imageRoute, assistedCM, assistedTrustedCM)
+			ascc = initASC(ascr, asc)
+
+			ensureNewAssistedConfigmapValue(ctx, log, ascc, "FORCE_INSECURE_POLICY_JSON", "true")
+		})
+	})
+
+	Context("with ForceInsecurePolicyJson annotation set to false", func() {
+		It("should not include FORCE_INSECURE_POLICY_JSON in ConfigMap", func() {
+			asc = newASCWithForceInsecurePolicyAnnotationFalse()
+			ascr = newTestReconciler(asc, route, imageRoute, assistedCM, assistedTrustedCM)
+			ascc = initASC(ascr, asc)
+
+			cm, mutateFn, err := newAssistedCM(ctx, log, ascc)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mutateFn()).To(Succeed())
+			configMap := cm.(*corev1.ConfigMap)
+
+			Expect(configMap.Data).ToNot(HaveKey("FORCE_INSECURE_POLICY_JSON"))
+		})
+	})
+
+	Context("with ForceInsecurePolicyJson annotation set to invalid value", func() {
+		It("should not include FORCE_INSECURE_POLICY_JSON in ConfigMap", func() {
+			asc = newASCDefault()
+			asc.ObjectMeta.Annotations = map[string]string{allowUnrestrictedImagePulls: "invalid"}
+			ascr = newTestReconciler(asc, route, imageRoute, assistedCM, assistedTrustedCM)
+			ascc = initASC(ascr, asc)
+
+			cm, mutateFn, err := newAssistedCM(ctx, log, ascc)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(mutateFn()).To(Succeed())
+			configMap := cm.(*corev1.ConfigMap)
+
+			Expect(configMap.Data).ToNot(HaveKey("FORCE_INSECURE_POLICY_JSON"))
+		})
+	})
+})
+
+var _ = Describe("Reconcile on non-OCP clusters", func() {
+	var (
+		asc        *aiv1beta1.AgentServiceConfig
+		ctx        context.Context
+		reconciler *AgentServiceConfigReconciler
+	)
+
+	BeforeEach(func() {
+		asc = newASCDefault()
+		asc.Spec.Ingress = &aiv1beta1.Ingress{
+			AssistedServiceHostname: "assisted.example.com",
+			ImageServiceHostname:    "images.example.com",
+			ClassName:               swag.String("nginx"),
+		}
+
+		ctx = context.Background()
+
+		reconciler = newTestReconciler(asc)
+		reconciler.AgentServiceConfigReconcileContext.IsOpenShift = false
+
+		// Create Certificate CRD
+		certCRD := &apiextensionsv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: certificateCRDName,
+			},
+		}
+		Expect(reconciler.Client.Create(ctx, certCRD)).To(Succeed())
+	})
+
+	expectReconcileConditionFailed := func(reason string) {
+		updated := aiv1beta1.AgentServiceConfig{}
+		Expect(reconciler.Client.Get(ctx, clnt.ObjectKey{Name: "agent"}, &updated)).To(Succeed())
+		cond := conditionsv1.FindStatusCondition(updated.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(corev1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(reason))
+	}
+
+	It("sets a validation failure condition if ingress is not specified", func() {
+		asc.Spec.Ingress = nil
+		Expect(reconciler.Client.Update(ctx, asc)).To(Succeed())
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+		expectReconcileConditionFailed(aiv1beta1.ReasonKubernetesIngressMissing)
+	})
+
+	It("sets a validation failure condition if assisted host is not specified", func() {
+		asc.Spec.Ingress.AssistedServiceHostname = ""
+		Expect(reconciler.Client.Update(ctx, asc)).To(Succeed())
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+		expectReconcileConditionFailed(aiv1beta1.ReasonKubernetesIngressMissing)
+	})
+
+	It("sets a validation failure condition if image service host is not specified", func() {
+		asc.Spec.Ingress.ImageServiceHostname = ""
+		Expect(reconciler.Client.Update(ctx, asc)).To(Succeed())
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+		expectReconcileConditionFailed(aiv1beta1.ReasonKubernetesIngressMissing)
+	})
+
+	It("sets a validation failure condition if the Certificate CRD doesn't exist", func() {
+		certCRD := &apiextensionsv1.CustomResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: certificateCRDName,
+			},
+		}
+		Expect(reconciler.Client.Delete(ctx, certCRD)).To(Succeed())
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+		expectReconcileConditionFailed(aiv1beta1.ReasonCertificateFailure)
+	})
+
+	It("does not deploy ServiceMonitors", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		smList := monitoringv1.ServiceMonitorList{}
+		Expect(reconciler.Client.List(ctx, &smList)).To(Succeed())
+		Expect(len(smList.Items)).To(Equal(0))
+	})
+
+	It("sets the CA injection annotation for the webhook API Service", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		as := &apiregv1.APIService{}
+		key := types.NamespacedName{Name: "v1.admission.agentinstall.openshift.io"}
+		Expect(reconciler.Client.Get(ctx, key, as)).To(Succeed())
+		Expect(as.GetAnnotations()[certManagerCAInjectionAnnotation]).To(Equal("test-namespace/agentinstalladmission"))
+	})
+
+	It("creates required certificates and issuers", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		By("creates the self-signed issuer")
+		is := &certtypes.Issuer{}
+		key := types.NamespacedName{Name: "assisted-installer-selfsigned-ca", Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, is)).To(Succeed())
+		Expect(is.Spec.IssuerConfig.SelfSigned).NotTo(BeNil())
+
+		By("creates the CA certificate")
+		cert := &certtypes.Certificate{}
+		key = types.NamespacedName{Name: "assisted-installer-ca", Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, cert)).To(Succeed())
+		Expect(cert.Spec.IsCA).To(BeTrue())
+		Expect(cert.Spec.SecretName).To(Equal("assisted-installer-ca"))
+		Expect(cert.Spec.IssuerRef).To(Equal(certmeta.ObjectReference{
+			Kind: "Issuer",
+			Name: "assisted-installer-selfsigned-ca",
+		}))
+
+		By("creates the CA issuer")
+		is = &certtypes.Issuer{}
+		key = types.NamespacedName{Name: "assisted-installer-ca", Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, is)).To(Succeed())
+		Expect(is.Spec.IssuerConfig.CA).To(Equal(&certtypes.CAIssuer{
+			SecretName: "assisted-installer-ca",
+		}))
+
+		By("creates the webhook certificate")
+		cert = &certtypes.Certificate{}
+		key = types.NamespacedName{Name: webhookServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, cert)).To(Succeed())
+		Expect(cert.Spec.SecretName).To(Equal(webhookServiceName))
+		Expect(cert.Spec.IssuerRef).To(Equal(certmeta.ObjectReference{
+			Kind: "Issuer",
+			Name: "assisted-installer-ca",
+		}))
+		Expect(len(cert.Spec.DNSNames)).To(Equal(2))
+		Expect(cert.Spec.DNSNames).To(ContainElement(fmt.Sprintf("%s.%s.svc", webhookServiceName, testNamespace)))
+		Expect(cert.Spec.DNSNames).To(ContainElement(fmt.Sprintf("%s.%s.svc.cluster.local", webhookServiceName, testNamespace)))
+	})
+
+	It("creates the assisted configmap without https server config and with ingress https config", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		cm := corev1.ConfigMap{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &cm)).To(Succeed())
+		Expect(cm.Data).ToNot(HaveKey("SERVE_HTTPS"))
+		Expect(cm.Data).ToNot(HaveKey("HTTPS_CERT_FILE"))
+		Expect(cm.Data).ToNot(HaveKey("HTTPS_KEY_FILE"))
+
+		Expect(cm.Data["SERVICE_CA_CERT_PATH"]).To(Equal("/etc/assisted-ingress-cert/ca.crt"))
+	})
+
+	It("creates the assisted deployment correctly", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		deploy := appsv1.Deployment{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &deploy)).To(Succeed())
+
+		var container *corev1.Container
+		for i, c := range deploy.Spec.Template.Spec.Containers {
+			if c.Name == serviceName {
+				container = &deploy.Spec.Template.Spec.Containers[i]
+			}
+		}
+
+		By("ensure no cert volumes are present")
+		Expect(container.VolumeMounts).To(ConsistOf(
+			corev1.VolumeMount{Name: "bucket-filesystem", MountPath: "/data"},
+			corev1.VolumeMount{Name: "ingress-cert", MountPath: "/etc/assisted-ingress-cert"},
+		))
+		foundIngressVol := false
+		for _, vol := range deploy.Spec.Template.Spec.Volumes {
+			Expect(vol.Name).NotTo(Equal("tls-certs"))
+			if vol.Name == "ingress-cert" {
+				foundIngressVol = true
+			}
+		}
+		Expect(foundIngressVol).To(BeTrue(), "expected ingress volume to be present")
+
+		By("ensure probe scheme is http")
+		Expect(container.ReadinessProbe.ProbeHandler.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTP))
+		Expect(container.LivenessProbe.ProbeHandler.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTP))
+
+		By("ensure fs group is set")
+		Expect(deploy.Spec.Template.Spec.SecurityContext.FSGroup).To(HaveValue(Equal(int64(0))))
+	})
+
+	It("creates the image service statefulset correctly", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		ss := appsv1.StatefulSet{}
+		key := types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ss)).To(Succeed())
+
+		Expect(len(ss.Spec.Template.Spec.Containers)).To(Equal(1))
+		container := ss.Spec.Template.Spec.Containers[0]
+
+		By("ensure no cert volumes are present")
+		Expect(container.VolumeMounts).To(Equal([]corev1.VolumeMount{{Name: "image-service-data", MountPath: "/data"}, {Name: "data-temp-volume", MountPath: "/data_temp"}}))
+		for _, vol := range ss.Spec.Template.Spec.Volumes {
+			Expect(vol.Name).NotTo(Equal("tls-certs"))
+			Expect(vol.Name).NotTo(Equal("service-cabundle"))
+		}
+
+		By("ensure env is set up for http")
+		httpsEnvVars := []string{"HTTPS_CERT_FILE", "HTTPS_KEY_FILE", "HTTPS_CA_FILE", "HTTP_LISTEN_PORT"}
+		for _, env := range container.Env {
+			Expect(env.Name).ToNot(BeElementOf(httpsEnvVars))
+			if env.Name == "ASSISTED_SERVICE_SCHEME" {
+				Expect(env.Value).To(Equal("http"))
+			}
+		}
+
+		By("ensure probe scheme is http")
+		Expect(container.ReadinessProbe.ProbeHandler.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTP))
+		Expect(container.LivenessProbe.ProbeHandler.HTTPGet.Scheme).To(Equal(corev1.URISchemeHTTP))
+
+		By("ensure fs group is set")
+		Expect(ss.Spec.Template.Spec.SecurityContext.FSGroup).To(HaveValue(Equal(int64(0))))
+	})
+
+	validateIngress := func(ingress *netv1.Ingress, host string, service string, port int32) {
+		Expect(ingress.Spec.IngressClassName).To(HaveValue(Equal(*asc.Spec.Ingress.ClassName)))
+		Expect(len(ingress.Spec.Rules)).To(Equal(1))
+
+		rule := ingress.Spec.Rules[0]
+		Expect(rule.Host).To(Equal(host))
+		Expect(rule.IngressRuleValue.HTTP).NotTo(BeNil())
+		Expect(len(rule.IngressRuleValue.HTTP.Paths)).To(Equal(1))
+		Expect(rule.IngressRuleValue.HTTP.Paths[0].Path).To(Equal("/"))
+		Expect(rule.IngressRuleValue.HTTP.Paths[0].PathType).To(HaveValue(Equal(netv1.PathTypePrefix)))
+		serviceBackend := netv1.IngressServiceBackend{
+			Name: service,
+			Port: netv1.ServiceBackendPort{Number: port},
+		}
+		Expect(rule.IngressRuleValue.HTTP.Paths[0].Backend.Service).To(HaveValue(Equal(serviceBackend)))
+
+		Expect(len(ingress.Spec.TLS)).To(Equal(1))
+		tls := ingress.Spec.TLS[0]
+		Expect(tls.Hosts).To(Equal([]string{host}))
+	}
+
+	It("creates ingress instead of routes", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		// No routes should be created
+		routeList := routev1.RouteList{}
+		Expect(reconciler.Client.List(ctx, &routeList)).To(Succeed())
+		Expect(len(routeList.Items)).To(Equal(0))
+
+		// An ingress should be created for both services
+		ingress := netv1.Ingress{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ingress)).To(Succeed())
+		validateIngress(&ingress, asc.Spec.Ingress.AssistedServiceHostname, serviceName, 8090)
+
+		key = types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ingress)).To(Succeed())
+		validateIngress(&ingress, asc.Spec.Ingress.ImageServiceHostname, imageServiceName, 8080)
+	})
+
+	It("creates the assisted configmap with the ingress host for the base URLs", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		cm := corev1.ConfigMap{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &cm)).To(Succeed())
+		Expect(cm.Data["SERVICE_BASE_URL"]).To(Equal(fmt.Sprintf("https://%s", asc.Spec.Ingress.AssistedServiceHostname)))
+		Expect(cm.Data["IMAGE_SERVICE_BASE_URL"]).To(Equal(fmt.Sprintf("https://%s", asc.Spec.Ingress.ImageServiceHostname)))
+	})
+
+	It("sets the image service base URL env to the ingress host", func() {
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		ss := appsv1.StatefulSet{}
+		key := types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ss)).To(Succeed())
+
+		Expect(len(ss.Spec.Template.Spec.Containers)).To(Equal(1))
+		var found bool
+		for _, env := range ss.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "IMAGE_SERVICE_BASE_URL" {
+				Expect(env.Value).To(Equal(fmt.Sprintf("https://%s", asc.Spec.Ingress.ImageServiceHostname)))
+				found = true
+			}
+		}
+		Expect(found).To(BeTrue(), "Expected to find the IMAGE_SERVICE_BASE_URL env var")
+	})
+
+	It("copies imagePullSecrets from operator pod to deployments and statefulsets", func() {
+		// Create a mock PodIntrospector that returns test imagePullSecrets
+		testImagePullSecrets := []corev1.LocalObjectReference{
+			{Name: "test-registry-secret-1"},
+			{Name: "test-registry-secret-2"},
+		}
+
+		mockPodIntrospector := &mockPodIntrospector{
+			imagePullSecrets: testImagePullSecrets,
+		}
+		reconciler.PodIntrospector = mockPodIntrospector
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		By("checking assisted-service deployment has imagePullSecrets")
+		deploy := appsv1.Deployment{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &deploy)).To(Succeed())
+		Expect(deploy.Spec.Template.Spec.ImagePullSecrets).To(Equal(testImagePullSecrets))
+
+		By("checking assisted-image-service statefulset has imagePullSecrets")
+		ss := appsv1.StatefulSet{}
+		key = types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ss)).To(Succeed())
+		Expect(ss.Spec.Template.Spec.ImagePullSecrets).To(Equal(testImagePullSecrets))
+
+		By("checking webhook deployment has imagePullSecrets")
+		webhookDeploy := appsv1.Deployment{}
+		key = types.NamespacedName{Name: "agentinstalladmission", Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &webhookDeploy)).To(Succeed())
+		Expect(webhookDeploy.Spec.Template.Spec.ImagePullSecrets).To(Equal(testImagePullSecrets))
+	})
+
+	It("does not set imagePullSecrets when operator pod has none", func() {
+		// Create a mock PodIntrospector that returns no imagePullSecrets
+		mockPodIntrospector := &mockPodIntrospector{
+			imagePullSecrets: nil,
+		}
+		reconciler.PodIntrospector = mockPodIntrospector
+
+		res, err := reconciler.Reconcile(ctx, newAgentServiceConfigRequest(asc))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: true}))
+
+		By("checking assisted-service deployment has no imagePullSecrets")
+		deploy := appsv1.Deployment{}
+		key := types.NamespacedName{Name: serviceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &deploy)).To(Succeed())
+		Expect(deploy.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+
+		By("checking assisted-image-service statefulset has no imagePullSecrets")
+		ss := appsv1.StatefulSet{}
+		key = types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &ss)).To(Succeed())
+		Expect(ss.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+
+		By("checking webhook deployment has no imagePullSecrets")
+		webhookDeploy := appsv1.Deployment{}
+		key = types.NamespacedName{Name: "agentinstalladmission", Namespace: testNamespace}
+		Expect(reconciler.Client.Get(ctx, key, &webhookDeploy)).To(Succeed())
+		Expect(webhookDeploy.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
+	})
+})
+
+var _ = Describe("AgentServiceConfig immutable annotations validation", func() {
+	var (
+		ctx        context.Context
+		reconciler *AgentServiceConfigReconciler
+		ascObj     *aiv1beta1.AgentServiceConfig
+		req        ctrl.Request
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		ingressCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      defaultIngressCertCMName,
+				Namespace: defaultIngressCertCMNamespace,
+			},
+		}
+		route := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: testHost,
+			},
+		}
+		imageRoute := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      imageServiceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: fmt.Sprintf("%s.images", testHost),
+			},
+		}
+		clusterTrustedCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-cluster-trusted-bundle"},
+		}
+		ascObj = &aiv1beta1.AgentServiceConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "agent",
+			},
+			Spec: aiv1beta1.AgentServiceConfigSpec{
+				DatabaseStorage: corev1.PersistentVolumeClaimSpec{
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+				FileSystemStorage: corev1.PersistentVolumeClaimSpec{
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("10Gi"),
+						},
+					},
+				},
+			},
+		}
+
+		// Enable status subresource for AgentServiceConfig type
+		reconciler = newTestReconciler(&aiv1beta1.AgentServiceConfig{}, route, imageRoute, ingressCM, clusterTrustedCM)
+
+		req = ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Name: ascObj.Name,
+			},
+		}
+	})
+
+	Context("when AgentServiceConfig is new", func() {
+		It("should pass validation when no immutable annotations are present", func() {
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result).To(Equal(ctrl.Result{Requeue: true}))
+
+			// Check that no immutable annotation failure condition exists
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+
+			// Check that initial state was recorded
+			Expect(updatedASC.Status.ImmutableAnnotations).NotTo(BeNil())
+
+			condition := conditionsv1.FindStatusCondition(updatedASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			// Expected condition from other objects
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Reason).ToNot(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+		})
+
+		It("should pass validation and set initial state when immutable annotations are present", func() {
+			ascObj.Annotations = map[string]string{
+				aiv1beta1.PVCPrefixAnnotation:     "custom-pvc",
+				aiv1beta1.SecretsPrefixAnnotation: "custom-secret",
+				"other-annotation":                "other-value",
+			}
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			// First reconcile: should try to store initial state annotation
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Check that initial state was recorded
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+			pvcPrefix, exists := updatedASC.Status.ImmutableAnnotations[aiv1beta1.PVCPrefixAnnotation]
+			Expect(exists).To(BeTrue())
+			Expect(pvcPrefix).To(Equal("custom-pvc"))
+			secretPrefix, exists := updatedASC.Status.ImmutableAnnotations[aiv1beta1.SecretsPrefixAnnotation]
+			Expect(exists).To(BeTrue())
+			Expect(secretPrefix).To(Equal("custom-secret"))
+
+			condition := conditionsv1.FindStatusCondition(updatedASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Reason).ToNot(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+		})
+
+		It("should fail when image service is disabled and osImages is populated", func() {
+			ascObj.Annotations = map[string]string{
+				"agent-install.openshift.io/enable-image-service": "false",
+			}
+			ascObj.Spec.OSImages = nil
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+
+			// Check that initial state was recorded
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+
+			condition := conditionsv1.FindStatusCondition(updatedASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Reason).ToNot(Equal(aiv1beta1.ReasonOSImagesShouldBeEmptyFailure))
+		})
+	})
+
+	Context("when AgentServiceConfig is being updated", func() {
+		It("should pass validation when immutable annotations are unchanged", func() {
+			// Create initial object with immutable annotations
+			ascObj.Annotations = map[string]string{
+				aiv1beta1.PVCPrefixAnnotation:     "custom-pvc",
+				aiv1beta1.SecretsPrefixAnnotation: "custom-secret",
+			}
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			By("reconcile and allow ASC to save initial annotation state")
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			By("reconcile again with no changes to the ASC notations")
+			result, err = reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Check that no immutable annotation failure condition exists
+			finalASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, finalASC)).To(Succeed())
+
+			condition := conditionsv1.FindStatusCondition(finalASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			// Expected condition by other objects
+			Expect(condition).NotTo(BeNil())
+			Expect(condition.Reason).ToNot(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+		})
+
+		It("should fail validation when trying to add immutable annotations", func() {
+			// Create initial object without immutable annotations
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			// First reconcile: stores initial state (empty for immutable annotations)
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Try to add immutable annotation (should fail)
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+			if updatedASC.Annotations == nil {
+				updatedASC.Annotations = make(map[string]string)
+			}
+			updatedASC.Annotations[aiv1beta1.PVCPrefixAnnotation] = "custom-pvc"
+			Expect(reconciler.Client.Update(ctx, updatedASC)).To(Succeed())
+
+			result, err = reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Validation failed, not requeuing
+			Expect(result.Requeue).To(BeFalse()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Check that immutable annotation failure condition exists
+			finalASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, finalASC)).To(Succeed())
+
+			condition := conditionsv1.FindStatusCondition(finalASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+			Expect(condition.Message).To(ContainSubstring("cannot be added after AgentServiceConfig creation"))
+		})
+
+		It("should fail validation when trying to change immutable annotation value", func() {
+			// Create initial object with immutable annotation
+			ascObj.Annotations = map[string]string{
+				aiv1beta1.PVCPrefixAnnotation: "original-pvc",
+			}
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			By("reconcile allowing ASC to store annotation's initial state")
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+			updatedASC.Annotations[aiv1beta1.PVCPrefixAnnotation] = "changed-pvc"
+			Expect(reconciler.Client.Update(ctx, updatedASC)).To(Succeed())
+
+			By("reconcile again with annotation's value changed")
+			result, err = reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Requeue).To(BeFalse()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Check that immutable annotation failure condition exists
+			finalASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, finalASC)).To(Succeed())
+
+			condition := conditionsv1.FindStatusCondition(finalASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+			Expect(condition.Message).To(ContainSubstring("cannot be changed from"))
+		})
+
+		It("should fail validation when trying to remove immutable annotations", func() {
+			// Create initial object with immutable annotation
+			ascObj.Annotations = map[string]string{
+				aiv1beta1.PVCPrefixAnnotation: "custom-pvc",
+			}
+			Expect(reconciler.Client.Create(ctx, ascObj)).To(Succeed())
+
+			result, err := reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Expected requeuing due to other objects
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck // Deprecated but require more changes
+
+			By("removing immutable annotation")
+			updatedASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, updatedASC)).To(Succeed())
+
+			delete(updatedASC.Annotations, aiv1beta1.PVCPrefixAnnotation)
+			Expect(reconciler.Client.Update(ctx, updatedASC)).To(Succeed())
+
+			result, err = reconciler.Reconcile(ctx, req)
+			Expect(err).ToNot(HaveOccurred())
+			// Validation failed, not requeuing
+			Expect(result.Requeue).To(BeFalse()) //nolint:staticcheck // Deprecated but require more changes
+
+			// Check that immutable annotation failure condition exists
+			finalASC := &aiv1beta1.AgentServiceConfig{}
+			Expect(reconciler.Client.Get(ctx, req.NamespacedName, finalASC)).To(Succeed())
+
+			condition := conditionsv1.FindStatusCondition(finalASC.Status.Conditions, aiv1beta1.ConditionReconcileCompleted)
+			Expect(condition).ToNot(BeNil())
+			Expect(condition.Status).To(Equal(corev1.ConditionFalse))
+			Expect(condition.Reason).To(Equal(aiv1beta1.ReasonImmutableAnnotationFailure))
+			Expect(condition.Message).To(ContainSubstring("cannot be removed once set"))
+		})
+	})
+})
+
+var _ = Describe("operator node selector and tolerations", func() {
+	var (
+		ascr *AgentServiceConfigReconciler
+		ascc ASC
+		ctx  = context.Background()
+		log  = logrus.New()
+
+		infraNodeSelector = map[string]string{
+			"node-role.kubernetes.io/infra": "",
+		}
+		infraTolerations = []corev1.Toleration{{
+			Key:      "node-role.kubernetes.io/infra",
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoSchedule,
+		}}
+		workerNodeSelector = map[string]string{
+			"node-role.kubernetes.io/worker": "",
+		}
+		workerTolerations = []corev1.Toleration{{
+			Key:      "dedicated",
+			Operator: corev1.TolerationOpEqual,
+			Value:    "assisted",
+			Effect:   corev1.TaintEffectNoExecute,
+		}}
+	)
+
+	BeforeEach(func() {
+		asc := newASCDefault()
+		route := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: testHost,
+			},
+		}
+		imageRoute := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      imageServiceName,
+				Namespace: testNamespace,
+			},
+			Spec: routev1.RouteSpec{
+				Host: fmt.Sprintf("%s.images", testHost),
+			},
+		}
+		assistedCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      serviceName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{
+				"foo": "bar",
+			},
+		}
+		assistedTrustedCM := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      assistedCAConfigMapName,
+				Namespace: testNamespace,
+			},
+			Data: map[string]string{caBundleKey: "example-trusted-bundle"},
+		}
+
+		ascr = newTestReconciler(asc, route, imageRoute, assistedCM, assistedTrustedCM)
+		ascc = initASC(ascr, asc)
+	})
+
+	reconcileWorkloads := func() {
+		AssertReconcileSuccess(ctx, log, ascc, newAssistedServiceDeployment)
+		AssertReconcileSuccess(ctx, log, ascc, newWebHookDeployment)
+
+		obj, mutateFn := newImageServiceStatefulSet(ctx, log, ascc)
+		_, err := controllerutil.CreateOrUpdate(ctx, ascc.Client, obj, mutateFn)
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	expectScheduling := func(nodeSelector map[string]string, tolerations []corev1.Toleration) {
+		assisted := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: testNamespace}, assisted)).To(Succeed())
+
+		webhook := &appsv1.Deployment{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: webhookServiceName, Namespace: testNamespace}, webhook)).To(Succeed())
+
+		imageService := &appsv1.StatefulSet{}
+		Expect(ascr.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: testNamespace}, imageService)).To(Succeed())
+
+		workloads := []struct {
+			name string
+			spec corev1.PodSpec
+		}{
+			{name: serviceName, spec: assisted.Spec.Template.Spec},
+			{name: webhookServiceName, spec: webhook.Spec.Template.Spec},
+			{name: imageServiceName, spec: imageService.Spec.Template.Spec},
+		}
+		for _, workload := range workloads {
+			// Empty maps and slices are omitted by the API and read back as nil.
+			if len(nodeSelector) == 0 {
+				Expect(workload.spec.NodeSelector).To(BeEmpty(), "node selector for %s", workload.name)
+			} else {
+				Expect(workload.spec.NodeSelector).To(Equal(nodeSelector), "node selector for %s", workload.name)
+			}
+			if len(tolerations) == 0 {
+				Expect(workload.spec.Tolerations).To(BeEmpty(), "tolerations for %s", workload.name)
+			} else {
+				Expect(workload.spec.Tolerations).To(Equal(tolerations), "tolerations for %s", workload.name)
+			}
+		}
+	}
+
+	Describe("when creating workloads", func() {
+		tests := []struct {
+			name         string
+			nodeSelector map[string]string
+			tolerations  []corev1.Toleration
+		}{
+			{
+				name:         "copies the operator node selector and tolerations",
+				nodeSelector: infraNodeSelector,
+				tolerations:  infraTolerations,
+			},
+			{
+				name:         "uses an empty node selector and tolerations when the operator has none",
+				nodeSelector: map[string]string{},
+				tolerations:  []corev1.Toleration{},
+			},
+			{
+				name:         "copies a node selector when tolerations are unset",
+				nodeSelector: infraNodeSelector,
+				tolerations:  []corev1.Toleration{},
+			},
+			{
+				name:         "copies tolerations when the node selector is unset",
+				nodeSelector: map[string]string{},
+				tolerations:  infraTolerations,
+			},
+		}
+
+		for _, tc := range tests {
+			It(tc.name, func() {
+				ascr.NodeSelector = tc.nodeSelector
+				ascr.Tolerations = tc.tolerations
+
+				reconcileWorkloads()
+
+				expectScheduling(tc.nodeSelector, tc.tolerations)
+			})
+		}
+	})
+
+	It("replaces node selector and tolerations when the operator scheduling changes", func() {
+		ascr.NodeSelector = infraNodeSelector
+		ascr.Tolerations = infraTolerations
+		reconcileWorkloads()
+		expectScheduling(infraNodeSelector, infraTolerations)
+
+		ascr.NodeSelector = workerNodeSelector
+		ascr.Tolerations = workerTolerations
+		reconcileWorkloads()
+		expectScheduling(workerNodeSelector, workerTolerations)
+	})
+
+	It("clears node selector and tolerations when the operator no longer has them", func() {
+		ascr.NodeSelector = infraNodeSelector
+		ascr.Tolerations = infraTolerations
+		reconcileWorkloads()
+		expectScheduling(infraNodeSelector, infraTolerations)
+
+		ascr.NodeSelector = nil
+		ascr.Tolerations = nil
+		reconcileWorkloads()
+		expectScheduling(map[string]string{}, []corev1.Toleration{})
+	})
+})

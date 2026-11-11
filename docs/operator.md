@@ -41,6 +41,36 @@ EOF
 Having the ClusterDeployment CRD installed is a prerequisite.
 Install Hive, if it has not already been installed.
 
+When installing hive-operator via OLM (`deploy/operator/setup_hive.sh with_olm`), the
+catalog source is selected automatically based on the hub cluster OpenShift version:
+
+- OpenShift **< 5.0** (e.g. 4.22): `community-operators` (shipped with the cluster)
+- OpenShift **>= 5.0**: `upstream-community-operators` (hive-operator was removed from
+  `community-operators` starting with OCP 5.0)
+
+Override with `HIVE_CATALOG_SOURCE` if needed. On OCP 5.0+ clusters that do not ship
+`upstream-community-operators` by default, the setup script creates it:
+
+``` bash
+cat <<EOF | kubectl create -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: CatalogSource
+metadata:
+  name: upstream-community-operators
+  namespace: openshift-marketplace
+spec:
+  displayName: Upstream Community Operators
+  image: quay.io/operatorhubio/catalog:latest
+  publisher: OperatorHub.io
+  sourceType: grpc
+  updateStrategy:
+    registryPoll:
+      interval: 10m0s
+EOF
+```
+
+On OpenShift < 5.0, subscribe directly to the built-in community catalog:
+
 ``` bash
 cat <<EOF | kubectl create -f -
 apiVersion: operators.coreos.com/v1alpha1
@@ -53,6 +83,24 @@ spec:
   installPlanApproval: Automatic
   name: hive-operator
   source: community-operators
+  sourceNamespace: openshift-marketplace
+EOF
+```
+
+On OpenShift >= 5.0, use `upstream-community-operators` instead:
+
+``` bash
+cat <<EOF | kubectl create -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: hive-operator
+  namespace: openshift-operators
+spec:
+  channel: alpha
+  installPlanApproval: Automatic
+  name: hive-operator
+  source: upstream-community-operators
   sourceNamespace: openshift-marketplace
 EOF
 ```
@@ -133,6 +181,12 @@ spec:
         value: ${SERVICE_IMAGE}
       - name: DATABASE_IMAGE
         value: ${DATABASE_IMAGE}
+      - name: DATABASE_IMAGE_VERSION
+        value: ${DATABASE_IMAGE_VERSION}
+      - name: DATABASE_IMAGE_PG13
+        value: ${DATABASE_IMAGE_PG13}
+      - name: DATABASE_IMAGE_PG15
+        value: ${DATABASE_IMAGE_PG15}
       - name: AGENT_IMAGE
         value: ${AGENT_IMAGE}
       - name: CONTROLLER_IMAGE
@@ -242,22 +296,153 @@ Add the annotation to the AgentServiceConfig:
 oc annotate --overwrite AgentServiceConfig agent unsupported.agent-install.openshift.io/assisted-image-service-skip-verify-tls=true
 ```
 
+### Custom headers and query parameters for Assisted Image Service OS Image Download
+
+It is possible to specify custom headers and query parameters to be used when downloading OS images.
+
+A Secret to contain the headers and query parameters to be used should be created.
+The easiest approach is to create up to two files as required, one file to hold any headers, the other to hold query parameters.
+Use these files to create a secret. The files may be discarded after creation of the secret.
+
+```
+       cat <<EOF >> headers
+         {
+         	"header1": "header1value",
+         	"header2": "header2value",
+         }
+       EOF
+       cat <<EOF >> query_params
+         {
+         	"param1": "value1",
+         	"param2": "value2",
+         }
+       EOF
+       
+       oc create secret generic -n multicluster-engine os-images-http-auth --from-file=./query_params --from-file=./headers
+```
+
+Then in the `AgentServiceConfig`, this Secret should be referenced, in `OSImageAdditionalParamsRef` 
+The headers and query params contained within the Secret referenced by `OSImageAdditionalParamsRef` will then be used when pulling osImages.
+
+```
+cat <<EOF | kubectl apply -f -
+apiVersion: agent-install.openshift.io/v1beta1
+kind: AgentServiceConfig
+metadata:
+  name: agent
+spec:
+  OSImageAdditionalParamsRef:
+    name: os-images-http-auth
+  osImages:
+    - openshiftVersion: "4.14"
+      version: "414.92.202310170514-0"
+      url: "https://some-os-image-server.io/rhcos-4.14.0-rc.0-x86_64-live.x86_64.iso"
+      cpuArchitecture: "x86_64"
+    - openshiftVersion: "4.15"
+      version: "414.92.202310170514-0"
+      url: "https://some-os-image-server.io/rhcos-4.15.0-rc.0-x86_64-live.x86_64.iso"
+      cpuArchitecture: "x86_64"
+  databaseStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  filesystemStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 20Gi
+  imageStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  mirrorRegistryRef:
+    name: mirror-registry-config-map
+EOF
+```
+
+### Custom CA for Assisted Image Service OS Image Download
+
+It is possible to specify a CA to be used when downloading OS images. This should be used when OS images are being served from HTTPS servers where the CA would not typically be known to assisted-image-service.
+
+Start by creating a ConfigMap containing the CA bundle for downloading OS images and store this under the key "tls.crt".
+The ConfigMap should be installed in the same namespace as the infrastructure-operator (ie. `multicluster-engine` or `assisted-installer` depending on how the infrastucture operator was deployed).
+
+```
+oc create configmap image-service-additional-ca --from-file=/root/tls.crt
+```
+
+Then in the `AgentServiceConfig`, this ConfigMap should be referenced, in `OSImageCACertRef` 
+The CA bundle defined in the ConfigMap referred to by `OSImageCACertRef` will then be used when pulling osImages.
+
+``` bash
+cat <<EOF | kubectl apply -f -
+apiVersion: agent-install.openshift.io/v1beta1
+kind: AgentServiceConfig
+metadata:
+  name: agent
+spec:
+  OSImageCACertRef:
+    name: image-service-additional-ca
+  osImages:
+    - openshiftVersion: "4.14"
+      version: "414.92.202310170514-0"
+      url: "https://some-os-image-server.io/rhcos-4.14.0-rc.0-x86_64-live.x86_64.iso"
+      cpuArchitecture: "x86_64"
+    - openshiftVersion: "4.15"
+      version: "414.92.202310170514-0"
+      url: "https://some-os-image-server.io/rhcos-4.15.0-rc.0-x86_64-live.x86_64.iso"
+      cpuArchitecture: "x86_64"
+  databaseStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  filesystemStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 20Gi
+  imageStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  mirrorRegistryRef:
+    name: mirror-registry-config-map
+EOF
+```
+
 ### Mirror Registry Configuration
 
 A ConfigMap can be used to configure assisted service to create installations using mirrored content. The ConfigMap contains two keys:
 
-- *ca-bundle.crt* - This key contains the contents of the certificate for accessing the mirror registry, if necessary. It may be a certificate bundle and is defined as a single string.
-- *registries.conf* - This key contains the contents of the registries.conf file that configures mappings to the mirror registry.
+- `ca-bundle.crt` - This key contains the contents of the certificate for accessing the mirror registry, if necessary. It may be a certificate bundle and is defined as a single string.
+- `registries.conf` - This key contains the contents of the registries.conf file that configures mappings to the mirror registry.
 
-The mirror registry configuration changes the discovery image's ignition config, with *ca-bundle.crt* written out to */etc/pki/ca-trust/source/anchors/domain.crt* and with *registries.conf* written out to */etc/containers/registries.conf*. 
+Supplying this ConfigMap makes several changes to the installation flow and assisted-service deployment:
+- Changes the discovery image's ignition config such that `ca-bundle.crt` is written out to `/etc/pki/ca-trust/source/anchors/domain.crt` and `registries.conf` is written out to `/etc/containers/registries.conf`.
+- Changes the `install-config.yaml` file used to install a new cluster, with the contents of `ca-bundle.crt` added to `additionalTrustBundle` and with the registries defined `registries.conf` added to `imageDigestSources`[^icsp_deprecated] as mirrors.
+- The assisted-service pod converts the registries.conf into an `ImageDigestMirrorSet` file, and use it with the `--idms-file`[^icsp_deprecated_2] flag in a few `oc adm` commands run against the release image (executed from within the assisted-service pod itself).
+- The certificate bundle is added to the list of trusted certs provided by the cluster. A combined ConfigMap is created which includes the provided bundle. This is mounted into the assisted-service pod at path `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`
 
-The configuration also changes the *install-config.yaml* file used to install a new cluster, with the contents of *ca-bundle.crt* added to *additionalTrustBundle* and with the registries defined *registries.conf* added to *imageContentSources* as mirrors.
-The assisted service pod also converts the registries.conf into an imageContentSourcesPolicy file, and use it with the --icsp flag in a few oc adm commands run against the release image (executed from within the assisted service pod itself).
+[^icsp_deprecated]: For older versions of OpenShift, before 4.14, the name of the field for the mirror registry is
+    _imageContentSources_ instead of _imageDigestSources_,
+
+[^icsp_deprecated_2]: For older versions of OpenShift, before 4.14, assisted service generates an
+    `ImageContentSourcePolicy` instead of an `ImageDigestMirrorSet`, and the flag is `--icsp-file` instead of
+    `--idms-file`.
 
 The ca-bundle.crt and registries.conf keys can be added individually or together.
 
-
-1. To configure the mirror registry, first create and upload the ConfigMap containing the *ca-bundle.crt* and *registries.conf* keys.
+1. To configure the mirror registry, first create and upload the ConfigMap containing the `ca-bundle.crt` and `registries.conf` keys.
 
 ``` bash
 cat <<EOF | kubectl create -f -
@@ -363,3 +548,46 @@ spec:
 [Mirror registries](#mirror-registry-configuration) will automatically be added to the ignore list and does need not to be added under `spec.unauthenticatedRegistries`.
 
 Specifying the `PUBLIC_CONTAINER_REGISTRIES` environment variable in the [ConfigMap override](#specifying-environmental-variables-via-configmap) is still supported and will completely overwrite the list to whatever is in the override.
+
+### Use HTTP for iPXE routes
+
+All iPXE artifacts can be hosted using HTTP or HTTPS.
+
+The field `.spec.iPXEHTTPRoute` in the `AgentServiceConfig` CR allows toggling the TLS of the iPXE artifact routes. By default, this field is set to `disabled`, which means the iPXE artifacts are hosted via HTTPS.
+
+To use plain HTTP for the iPXE artifacts, set `iPXEHTTPRoute` to `enabled` like so:
+
+``` bash
+cat <<EOF | kubectl create -f -
+apiVersion: agent-install.openshift.io/v1beta1
+kind: AgentServiceConfig
+metadata:
+  name: agent
+spec:
+  databaseStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10Gi
+  filesystemStorage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 20Gi
+  iPXEHTTPRoute: enabled
+```
+
+The following endpoints would be exposed via HTTP:
+* `api/assisted-installer/v2/infra-envs/<id>/downloads/files?file_name=ipxe-script` in assisted-service
+* `boot-artifacts/` and `images/<infra-enf id>/pxe-initrd` in assisted-image-service
+
+### Running on FIPS mode clusters
+
+**NOTE**: This only applies when the cluster on which assisted-service is running is FIPS-enabled.
+
+The assisted-service container runs the `openshift-baremetal-install` binary as a part of installing a cluster.
+When the cluster on which assisted-service is running is FIPS-enabled, the assisted-service image base must contain the crypto libraries expected by the `openshift-baremetal-install` binary being run.
+
+Because of this restriction, installing FIPS-enabled clusters is only available for OpenShift versions 4.16 and newer.

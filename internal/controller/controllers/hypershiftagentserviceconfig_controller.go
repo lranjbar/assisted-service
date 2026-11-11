@@ -149,8 +149,8 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 			"hypershift_service_namespace": req.Namespace,
 		})
 
-	log.Info("HypershiftAgentServiceConfig Reconcile started")
-	defer log.Info("HypershiftAgentServiceConfig Reconcile ended")
+	log.Debug("HypershiftAgentServiceConfig Reconcile started")
+	defer log.Debug("HypershiftAgentServiceConfig Reconcile ended")
 
 	// read the resource from k8s
 	instance := &aiv1beta1.HypershiftAgentServiceConfig{}
@@ -189,8 +189,18 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 		return ctrl.Result{}, nil
 	}
 
+	supportsCertManager := false
+	if !asc.rec.IsOpenShift {
+		var certErr error
+		supportsCertManager, certErr = serverSupportsCertManager(ctx, asc.Client)
+		if certErr != nil {
+			log.WithError(certErr).Error("failed to check if server supports cert-manager")
+			return ctrl.Result{}, certErr
+		}
+	}
+
 	// Invoke validation funcs
-	valid, err = validate(ctx, log, asc)
+	valid, err = validate(ctx, log, asc, supportsCertManager)
 	if err != nil {
 		return ctrl.Result{Requeue: true}, err
 	}
@@ -210,9 +220,11 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 		return result, err
 	}
 
-	// Ensure image-service StatefulSet is reconciled
-	if err = ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
+	// Ensure image-service StatefulSet is reconciled (only if image service is not disabled)
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		if err = ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
 	}
 
 	log.Info("read certificate from hub")
@@ -234,17 +246,13 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 		return result, err
 	}
 
-	if err = updateConditions(ctx, log, asc); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{}, nil
+	return updateConditions(ctx, log, asc)
 }
 
 func (hr *HypershiftAgentServiceConfigReconciler) reconcileHubComponents(ctx context.Context, log *logrus.Entry, asc ASC) (ctrl.Result, error) {
 	hubComponents := []component{}
 	hubComponents = append(hubComponents, assistedServiceRBAC_hub...)
-	hubComponents = append(hubComponents, getComponents(asc.spec)...)
+	hubComponents = append(hubComponents, getComponents(asc.spec, asc.rec.IsOpenShift, asc.Object.GetAnnotations())...)
 	hubComponents = append(hubComponents, hr.getWebhookComponents_hub()...)
 
 	// Reconcile hub components
@@ -254,7 +262,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) reconcileHubComponents(ctx con
 			component.fn = newHypershiftAssistedServiceDeployment
 		}
 
-		log.Infof(fmt.Sprintf("Reconcile hub component: %s", component.name))
+		log.Infof("Reconcile hub component: %s", component.name)
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			log.WithError(err).Errorf("Failed to reconcile hub component %s", component.name)
 			return result, err
@@ -312,7 +320,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) reconcileSpokeComponents(ctx c
 
 	// Reconcile spoke components
 	for _, component := range spokeComponents {
-		log.Infof(fmt.Sprintf("Reconcile spoke component: %s", component.name))
+		log.Infof("Reconcile spoke component: %s", component.name)
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			log.WithError(err).Errorf("Failed to reconcile spoke component %s", component.name)
 			return result, err
@@ -333,7 +341,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) createSpokeClient(ctx context.
 	}
 
 	// Create spoke cluster client using kubeconfig secret
-	spokeClient, err := hr.SpokeClients.Get(kubeconfigSecret)
+	spokeClient, err := hr.SpokeClients.Get(nil, kubeconfigSecret)
 	if err != nil {
 		reason := aiv1beta1.ReasonSpokeClientCreationFailure
 		msg := fmt.Sprintf("Failed to create kubeconfig client: %s", err.Error())
@@ -366,7 +374,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) getKubeconfigSecret(ctx contex
 	if err != nil {
 		msg := fmt.Sprintf("Failed to get '%s' secret in '%s' namespace (check `kubeconfigSecretRef` property)", secretRef.Name, secretRef.Namespace)
 		log.WithError(err).Error(msg)
-		return nil, pkgerror.Errorf(msg)
+		return nil, pkgerror.New(msg)
 	}
 	_, ok := secret.Data["kubeconfig"]
 	if !ok {
@@ -494,22 +502,25 @@ func (hr *HypershiftAgentServiceConfigReconciler) ensureSpokeNamespace(ctx conte
 
 // SetupWithManager sets up the controller with the Manager.
 func (hr *HypershiftAgentServiceConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1beta1.HypershiftAgentServiceConfig{}).
 		Owns(&rbacv1.ClusterRoleBinding{}).
 		Owns(&rbacv1.ClusterRole{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
-		Owns(&monitoringv1.ServiceMonitor{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Secret{}).
-		Owns(&routev1.Route{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&apiregv1.APIService{}).
-		Complete(hr)
+		Owns(&apiregv1.APIService{})
+
+	if hr.IsOpenShift {
+		b = b.Owns(&monitoringv1.ServiceMonitor{}).Owns(&routev1.Route{})
+	}
+
+	return b.Complete(hr)
 }
 
 func parseFile(fileName string, dest interface{}) error {
@@ -690,6 +701,7 @@ func newHeadlessWebHookService(ctx context.Context, log logrus.FieldLogger, asc 
 	return svc, mutateFn, nil
 }
 
+// nolint:staticcheck // Deprecated but require more changes
 func newWebHookEndpoint(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 
 	//retrieve the admission service IP from the ASC context
@@ -745,21 +757,21 @@ func newHypershiftWebHookAPIService(ctx context.Context, log logrus.FieldLogger,
 	data, ok := asc.properties["ca"]
 	if !ok {
 		err := pkgerror.Errorf("no ca data on context %v on namespace %s", asc.properties, asc.namespace)
-		log.WithError(err)
+		log.WithError(err).Error("Failed to create webhook API service")
 		return nil, nil, err
 	}
 
 	cmdata, ok := data.(map[string]string)
 	if !ok {
 		err := pkgerror.Errorf("bad format of ca context %v on namespace %s", asc.properties, asc.namespace)
-		log.WithError(err)
+		log.WithError(err).Error("Failed to create webhook API service")
 		return nil, nil, err
 	}
 
 	ca, ok := cmdata["service-ca.crt"]
 	if !ok {
 		err := pkgerror.Errorf("Missing ca certificate for API service on namespace %s", asc.namespace)
-		log.WithError(err)
+		log.WithError(err).Error("Failed to create webhook API service")
 		return nil, nil, err
 	}
 
@@ -776,7 +788,7 @@ func newKonnectivityAgentDeployment(ctx context.Context, log logrus.FieldLogger,
 	ka := &appsv1.Deployment{}
 	if e := asc.Client.Get(ctx, types.NamespacedName{Name: "konnectivity-agent", Namespace: asc.namespace}, ka); e != nil {
 		err := pkgerror.Wrap(e, fmt.Sprintf("Failed to retrieve konnectivity-agent Deployment from namespace %s", asc.namespace))
-		log.WithError(err)
+		log.WithError(err).Error("Failed to create konnectivity agent deployment")
 		return nil, nil, err
 	}
 	ka.ObjectMeta = metav1.ObjectMeta{

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 
 	"github.com/go-openapi/strfmt"
@@ -12,27 +13,31 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
-	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/oc"
+	"github.com/openshift/assisted-service/internal/provider/external"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
 
 const (
-	ZVM_VENDOR_ID = "IBM/S390"
-	VM_CTRL_PRG   = "KVM/Linux"
-	ZVM_LUN_SCAN  = "zfcp.allow_lun_scan"
-	ZVM_ZNET      = "rd.znet"
-	ZVM_DASD      = "rd.dasd"
-	ZVM_NEEDNET   = "rd.neednet"
-	ZVM_FCP       = "rd.zfcp"
+	ZVM_VENDOR_ID   = "IBM/S390"
+	VM_CTRL_PRG     = "KVM/Linux"
+	ZVM_LUN_SCAN    = "zfcp.allow_lun_scan"
+	ZVM_ZNET        = "rd.znet"
+	ZVM_DASD        = "rd.dasd"
+	ZVM_NEEDNET     = "rd.neednet"
+	ZVM_FCP         = "rd.zfcp"
+	ZVM_IP_CFG_OVER = "ai.ip_cfg_override=1"
+	ZVM_IP          = "ip"
+	ZVM_NAMESERVER  = "nameserver"
 )
 
 type installCmd struct {
@@ -44,10 +49,12 @@ type installCmd struct {
 	eventsHandler       eventsapi.Handler
 	versionsHandler     versions.Handler
 	enableSkipMcoReboot bool
+	notifyNumReboots    bool
 }
 
 func NewInstallCmd(log logrus.FieldLogger, db *gorm.DB, hwValidator hardware.Validator, ocRelease oc.Release,
-	instructionConfig InstructionConfig, eventsHandler eventsapi.Handler, versionsHandler versions.Handler, enableSkipMcoReboot bool) *installCmd {
+	instructionConfig InstructionConfig, eventsHandler eventsapi.Handler, versionsHandler versions.Handler,
+	enableSkipMcoReboot, notifyNumReboots bool) *installCmd {
 	return &installCmd{
 		baseCmd:             baseCmd{log: log},
 		db:                  db,
@@ -57,6 +64,7 @@ func NewInstallCmd(log logrus.FieldLogger, db *gorm.DB, hwValidator hardware.Val
 		eventsHandler:       eventsHandler,
 		versionsHandler:     versionsHandler,
 		enableSkipMcoReboot: enableSkipMcoReboot,
+		notifyNumReboots:    notifyNumReboots,
 	}
 }
 
@@ -110,47 +118,88 @@ func (i *installCmd) getFullInstallerCommand(ctx context.Context, cluster *commo
 		role = models.HostRoleBootstrap
 	}
 
-	haMode := models.ClusterHighAvailabilityModeFull
-	if cluster.HighAvailabilityMode != nil {
-		haMode = *cluster.HighAvailabilityMode
+	request := models.InstallCmdRequest{
+		Role:              &role,
+		ClusterID:         host.ClusterID,
+		HostID:            host.ID,
+		InfraEnvID:        &host.InfraEnvID,
+		ControlPlaneCount: cluster.ControlPlaneCount,
+		ControllerImage:   swag.String(i.instructionConfig.ControllerImage),
+		CheckCvo:          swag.Bool(i.instructionConfig.CheckClusterVersion),
+		InstallerImage:    swag.String(i.instructionConfig.InstallerImage),
+		BootDevice:        swag.String(bootdevice),
 	}
 
-	request := models.InstallCmdRequest{
-		Role:                 &role,
-		ClusterID:            host.ClusterID,
-		HostID:               host.ID,
-		InfraEnvID:           &host.InfraEnvID,
-		HighAvailabilityMode: &haMode,
-		ControllerImage:      swag.String(i.instructionConfig.ControllerImage),
-		CheckCvo:             swag.Bool(i.instructionConfig.CheckClusterVersion),
-		InstallerImage:       swag.String(i.instructionConfig.InstallerImage),
-		BootDevice:           swag.String(bootdevice),
+	deviceMapperDevice, err := isHostInstallationDiskDeviceMapperDevice(host)
+	if err != nil {
+		return "", errors.Wrap(err, "failed checking if the host's installation disk is a device mapper device")
 	}
-	if i.enableSkipMcoReboot {
-		request.EnableSkipMcoReboot = featuresupport.IsFeatureAvailable(models.FeatureSupportLevelIDSKIPMCOREBOOT,
-			cluster.OpenshiftVersion, swag.String(cluster.CPUArchitecture))
+
+	skipMCORebootVersionSupported, err := common.BaseVersionGreaterOrEqual(common.MinimalVersionForSKipMCOReboot, cluster.OpenshiftVersion)
+	if err != nil {
+		skipMCORebootVersionSupported = false
+	}
+
+	request.EnableSkipMcoReboot = i.enableSkipMcoReboot &&
+		cluster.CPUArchitecture != models.ClusterCPUArchitectureS390x &&
+		skipMCORebootVersionSupported &&
+		!lo.FromPtr(deviceMapperDevice)
+	request.NotifyNumReboots = i.notifyNumReboots
+
+	cpuArch := cluster.CPUArchitecture
+	// cluster cpu arch is not set for imported clusters so use infraenv for this case
+	if cpuArch == "" {
+		cpuArch = infraEnv.CPUArchitecture
+	}
+
+	installToDisk := inventory != nil && inventory.Boot != nil && inventory.Boot.DeviceType == models.BootDeviceTypePersistent
+	isDay2 := swag.StringValue(cluster.Kind) == models.ClusterKindAddHostsCluster
+
+	// Get release image for host only if it's either not a day-2 host or it's installing to disk
+	var releaseImage *models.ReleaseImage
+	if installToDisk || !isDay2 {
+		releaseImage, err = i.versionsHandler.GetReleaseImageForCluster(ctx, cluster, cpuArch)
+		if err != nil && !isDay2 {
+			return "", err
+		}
+	}
+
+	if installToDisk {
+		if releaseImage != nil {
+			request.CoreosImage, err = i.ocRelease.GetCoreOSImage(i.log, *releaseImage.URL, i.instructionConfig.ReleaseImageMirror, cluster.PullSecret)
+			if err != nil {
+				return "", err
+			}
+		} else {
+			// Day-2 persistent-boot: release image unavailable (e.g. imported cluster
+			// with no ImageSetRef). Use the CoreOS image from the worker ignition's
+			// encapsulated MachineConfig instead (MGMT-24903).
+			request.CoreosImage = hostutil.GetCoreOSImageFromIgnition(host)
+			if request.CoreosImage == "" {
+				return "", errors.Errorf("cannot determine CoreOS image for persistent-boot day-2 host %s: release image not available and worker ignition does not contain a CoreOS image reference", host.ID)
+			}
+		}
+		i.log.Infof("installing to disk with CoreOS image %s", request.CoreosImage)
 	}
 
 	// those flags are not used on day2 installation
 	if swag.StringValue(cluster.Kind) != models.ClusterKindAddHostsCluster {
-		releaseImage, err := i.versionsHandler.GetReleaseImage(ctx, cluster.OpenshiftVersion, cluster.CPUArchitecture, cluster.PullSecret)
-		if err != nil {
-			return "", err
-		}
-
 		request.McoImage, err = i.ocRelease.GetMCOImage(i.log, *releaseImage.URL, i.instructionConfig.ReleaseImageMirror, cluster.PullSecret)
 		if err != nil {
 			return "", err
 		}
+
 		i.log.Infof("Install command releaseImage: %s, mcoImage: %s", *releaseImage.URL, request.McoImage)
 
-		mustGatherMap, err := i.versionsHandler.GetMustGatherImages(cluster.OpenshiftVersion, cluster.CPUArchitecture, cluster.PullSecret)
+		var mustGatherMap versions.MustGatherVersion
+		mustGatherMap, err = i.versionsHandler.GetMustGatherImages(cluster.OpenshiftVersion, cluster.CPUArchitecture, cluster.PullSecret)
 		if err != nil {
-			return "", err
-		}
-		request.MustGatherImage, err = i.getMustGatherArgument(mustGatherMap)
-		if err != nil {
-			return "", err
+			i.log.Warn("Could not determine must-gather image. Installation will proceed without a pre-configured must-gather image.")
+		} else {
+			request.MustGatherImage, err = i.getMustGatherArgument(mustGatherMap)
+			if err != nil {
+				i.log.Warn("Could not build must-gather argument. Installation will proceed without it.")
+			}
 		}
 
 		request.OpenshiftVersion = cluster.OpenshiftVersion
@@ -177,10 +226,6 @@ func (i *installCmd) getFullInstallerCommand(ctx context.Context, cluster *commo
 	request.DisksToFormat = i.getDisksToFormat(ctx, host, inventory)
 
 	request.Proxy = i.getProxyArguments(cluster.Name, cluster.BaseDNSDomain, cluster.HTTPProxy, cluster.HTTPSProxy, cluster.NoProxy)
-
-	if i.instructionConfig.ServiceIPs != "" {
-		request.ServiceIps = strings.Split(i.instructionConfig.ServiceIPs, ",")
-	}
 
 	b, err := json.Marshal(&request)
 	if err != nil {
@@ -211,7 +256,7 @@ func (i *installCmd) getProxyArguments(clusterName, baseDNSDomain, httpProxy, ht
 	} else {
 		noProxyUpdated := []string{}
 		if noProxyTrim != "" {
-			noProxyUpdated = append(noProxyUpdated, noProxyTrim)
+			noProxyUpdated = strings.Split(noProxyTrim, ",")
 		}
 		// if we set proxy we need to update assisted installer no proxy with no proxy params as installer.
 		// it must be able to connect to api int. Added this way for not to pass name and base domain
@@ -221,7 +266,7 @@ func (i *installCmd) getProxyArguments(clusterName, baseDNSDomain, httpProxy, ht
 			".svc",
 			".cluster.local",
 			fmt.Sprintf("api-int.%s.%s", clusterName, baseDNSDomain))
-		proxy.NoProxy = swag.String(strings.Join(noProxyUpdated, ","))
+		proxy.NoProxy = swag.String(strings.Join(funk.UniqString(noProxyUpdated), ","))
 	}
 
 	return &proxy
@@ -254,7 +299,7 @@ func (i *installCmd) getDisksToFormat(ctx context.Context, host *models.Host, in
 
 	for _, disk := range allFormattingCandidateDisks {
 		identifier := common.GetDeviceIdentifier(disk)
-		if !funk.Contains(skippedDisksIdentifiers, identifier) {
+		if !lo.Contains(skippedDisksIdentifiers, identifier) {
 			eventgen.SendQuickDiskFormatPerformedEvent(ctx, i.eventsHandler, *host.ID, host.InfraEnvID, host.ClusterID,
 				hostutil.GetHostnameForMsg(host), disk.Name, identifier)
 
@@ -275,10 +320,21 @@ set --copy-network, function will set only one such argument. It also append an 
 controls DHCP depending on the IP stack being used.
 */
 func constructHostInstallerArgs(cluster *common.Cluster, host *models.Host, inventory *models.Inventory, infraEnv *common.InfraEnv, log logrus.FieldLogger) (string, error) {
-
 	var installerArgs []string
 	var err error
-	hasStaticNetwork := (infraEnv != nil && infraEnv.StaticNetworkConfig != "") || cluster.StaticNetworkConfigured
+	var hasIPConfigOverride bool
+
+	if inventory == nil {
+		return "", fmt.Errorf("Missing inventory")
+	}
+
+	if cluster == nil {
+		return "", fmt.Errorf("cluster is nil")
+	}
+
+	if host == nil {
+		return "", fmt.Errorf("host is nil")
+	}
 
 	if host.InstallerArgs != "" {
 		err = json.Unmarshal([]byte(host.InstallerArgs), &installerArgs)
@@ -287,46 +343,191 @@ func constructHostInstallerArgs(cluster *common.Cluster, host *models.Host, inve
 		}
 	}
 
-	if !hasStaticNetwork {
-		// The set of ip=<nic>:dhcp kernel arguments should be added only if there is no static
-		// network configured by the user. This is because this parameter will configure RHCOS to
-		// try to obtain IP address from the DHCP server even if we provide a static addressing.
-		// As in majority of cases it's not an issue because of the priorities set in the config
-		// of NetworkManager, in some specific scenarios (e.g. BZ-2106110) this causes machines to
-		// lose their connectivity because priorities get mixed.
-		installerArgs, err = appendDHCPArgs(cluster, host, inventory, installerArgs, log)
+	isOciCluster, err := isOciCluster(*cluster, *host)
+	if err != nil {
+		return "", fmt.Errorf("failed to check if cluster is OCI: %w", err)
+	}
+
+	hasUserConfiguredIP := hasUserConfiguredIP(installerArgs)
+	hasDay2UnknownMachineNetwork := hasDay2UnknownMachineNetwork(cluster, host, isOciCluster, log)
+	installerArgs, hasIPConfigOverride = appends390xArgs(inventory, installerArgs, log)
+	hasIPConfigOverride = hasIPConfigOverride || hasUserConfiguredIP || hasDay2UnknownMachineNetwork
+	staticNetwork := hasStaticNetwork(cluster, infraEnv)
+
+	// append kargs depending on installation drive type
+	installationDisk := hostutil.GetDiskByInstallationPath(inventory.Disks, hostutil.GetHostInstallationPath(host))
+	if installationDisk != nil {
+		installerArgs, err = appendMultipathArgs(installerArgs, installationDisk, inventory, hasIPConfigOverride, staticNetwork)
 		if err != nil {
 			return "", err
 		}
+		installerArgs, err = appendISCSIArgs(installerArgs, installationDisk, inventory, hasIPConfigOverride, staticNetwork)
+		if err != nil {
+			return "", err
+		}
+		installerArgs, err = appendRaidArgs(installerArgs, installationDisk)
+		if err != nil {
+			return "", err
+		}
+
+		// When using ISCSI along OCI, we expect the user (via a
+		// script) to configure the network statically on the nodes as
+		// DHCP is not available in this case.
+		//
+		// Even if the user configured the network during discovery, we
+		// cannot propagate the configuration with --copy-network
+		// because it won't work along iSCSI:
+		// https://github.com/coreos/coreos-installer/issues/1389
+		// Static networks are not supported on OCI clusters, preventing the copy-network argument from being set.
+		hasIPConfigOverride = hasIPConfigOverride ||
+			(installationDisk.DriveType == models.DriveTypeISCSI && isOciCluster)
+	} else {
+		log.Warnf("No installation disk found for host ID %s", host.ID)
 	}
 
-	for _, disk := range inventory.Disks {
-		if disk.ID == host.InstallationDiskID {
-			if disk.DriveType == models.DriveTypeMultipath {
-				installerArgs = append(installerArgs, "--append-karg", "root=/dev/disk/by-label/dm-mpath-root", "--append-karg", "rw", "--append-karg", "rd.multipath=default")
-			} else if disk.DriveType == models.DriveTypeISCSI {
-				// Currently only allowed on the OCI platform
-				installerArgs = append(installerArgs, "--append-karg", "rd.iscsi.firmware=1", "--append-karg", "ip=ibft")
+	installerArgs, err = appendNetworkArgs(installerArgs, cluster, host, inventory, infraEnv, hasIPConfigOverride, log)
+	if err != nil {
+		return "", err
+	}
+
+	return toJSONString(installerArgs)
+}
+
+// isOciCluster reports whether install logic should treat the cluster as OCI.
+// It uses cluster.Platform when relevant.
+// Day2 clusters platform is not properly set, we need to check the hosts manufacturer
+func isOciCluster(clusterWithoutHosts common.Cluster, clusterHost models.Host) (bool, error) {
+	if common.IsOciExternalIntegrationEnabled(clusterWithoutHosts.Platform) {
+		return true, nil
+	}
+
+	if !common.IsDay2Cluster(&clusterWithoutHosts) {
+		return false, nil
+	}
+
+	return external.IsOciHost(&clusterHost)
+}
+
+func appendNetworkArgs(installerArgs []string, cluster *common.Cluster, host *models.Host, inventory *models.Inventory, infraEnv *common.InfraEnv, hasIPConfigOverride bool, log logrus.FieldLogger) ([]string, error) {
+	if hasStaticNetwork(cluster, infraEnv) {
+		// network configured statically
+		return appendCopyNetwork(installerArgs), nil
+	}
+
+	if hasIPConfigOverride {
+		return installerArgs, nil
+	}
+
+	// set DHCP args only if no IP config override was specified (user
+	// override, LPAR and zVM nodes on s390x, iSCSI boot drive on OCI)
+	//
+	// The set of ip=<nic>:dhcp kernel arguments should be added only if
+	// there is no static network configured by the user. This is because
+	// this parameter will configure RHCOS to try to obtain IP address from
+	// the DHCP server even if we provide a static addressing. As in
+	// majority of cases it's not an issue because of the priorities set in
+	// the config of NetworkManager, in some specific scenarios (e.g.
+	// BZ-2106110) this causes machines to lose their connectivity because
+	// priorities get mixed.
+	installerArgs, err := appendDHCPArgs(cluster, host, inventory, installerArgs, log)
+	if err != nil {
+		return nil, err
+	}
+
+	return installerArgs, nil
+}
+
+func appendCopyNetwork(installerArgs []string) []string {
+	if !lo.Contains(installerArgs, "--copy-network") {
+		installerArgs = append(installerArgs, "--copy-network")
+	}
+	return installerArgs
+}
+
+func appendISCSIArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasIPConfigOverride bool, staticNetwork bool) ([]string, error) {
+	if installationDisk.DriveType != models.DriveTypeISCSI {
+		return installerArgs, nil
+	}
+
+	// enable iSCSI on boot
+	if !lo.Contains(installerArgs, "rd.iscsi.firmware=1") {
+		installerArgs = append(installerArgs, "--append-karg", "rd.iscsi.firmware=1")
+	}
+
+	if hasIPConfigOverride {
+		return installerArgs, nil
+	}
+
+	// configure the interface used by the iSCSI boot volume
+	iSCSIHostIP, err := netip.ParseAddr(installationDisk.Iscsi.HostIPAddress)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot parse iSCSI host IP %s: %w", installationDisk.Iscsi.HostIPAddress, err)
+	}
+
+	nic, err := network.FindInterfaceByIP(iSCSIHostIP, inventory.Interfaces)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot find the interface belonging to iSCSI host IP: %w", err)
+	}
+
+	ipConfig := "dhcp"
+	switch {
+	case staticNetwork:
+		ipConfig = "ibft"
+	case iSCSIHostIP.Is6():
+		ipConfig = "dhcp6"
+	}
+
+	netArg := formatNetKarg(nic, ipConfig)
+	if !lo.Contains(installerArgs, netArg) {
+		installerArgs = append(installerArgs, "--append-karg", netArg)
+	}
+
+	return installerArgs, nil
+}
+
+func appendRaidArgs(installerArgs []string, installationDisk *models.Disk) ([]string, error) {
+	// Add kernel args for Intel VROC
+	if installationDisk.DriveType != models.DriveTypeRAID {
+		return installerArgs, nil
+	}
+	args := []string{"rd.md=1", "rd.auto=1"}
+	for _, arg := range args {
+		if !lo.Contains(installerArgs, arg) {
+			installerArgs = append(installerArgs, "--append-karg", arg)
+		}
+	}
+	return installerArgs, nil
+}
+
+func appendMultipathArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasIPConfigOverride bool, staticNetwork bool) ([]string, error) {
+	if installationDisk.DriveType != models.DriveTypeMultipath {
+		return installerArgs, nil
+	}
+
+	installerArgs = append(installerArgs, "--append-karg", "rw", "--append-karg", "rd.multipath=default")
+
+	iSCSIDisks := hostutil.GetDisksOfHolderByType(inventory.Disks, installationDisk, models.DriveTypeISCSI)
+
+	if len(iSCSIDisks) != 0 {
+		var err error
+		for _, iscsiDisk := range iSCSIDisks {
+			installerArgs, err = appendISCSIArgs(installerArgs, iscsiDisk, inventory, hasIPConfigOverride, staticNetwork)
+			if err != nil {
+				return nil, err
 			}
 		}
 	}
+	return installerArgs, nil
+}
 
-	if hasStaticNetwork && !funk.Contains(installerArgs, "--copy-network") {
-		// network not configured statically or
-		// installer args already contain command for network configuration
-		installerArgs = append(installerArgs, "--copy-network")
-	}
+func appends390xArgs(inventory *models.Inventory, installerArgs []string, log logrus.FieldLogger) ([]string, bool) {
+	hasIPConfigOverride := false
 
 	// Check if Manufacturer is IBM/S390 and ProductName is not "KVM/Linux" (the case for z/VM and LPAR).
 	// If this is the case than we need to extract the necessary z/VM kargs and append them.
-	if inventory.SystemVendor != nil {
-		log.Debugf("Check for SystemVendor and ProductName: %s:%s\n", inventory.SystemVendor.Manufacturer, inventory.SystemVendor.ProductName)
-	} else {
-		log.Debug("Check for SystemVendor and ProductName: <nil>:<nil>\n")
-	}
-
-	if inventory.SystemVendor != nil && strings.EqualFold(inventory.SystemVendor.Manufacturer, ZVM_VENDOR_ID) &&
-		!strings.HasSuffix(inventory.SystemVendor.ProductName, VM_CTRL_PRG) {
+	if inventory != nil && inventory.SystemVendor != nil && strings.EqualFold(inventory.SystemVendor.Manufacturer, ZVM_VENDOR_ID) &&
+		!strings.HasSuffix(inventory.SystemVendor.ProductName, VM_CTRL_PRG) && (inventory.Boot != nil) {
+		log.Debugf("Current heck for SystemVendor and ProductName: %s:%s\n", inventory.SystemVendor.Manufacturer, inventory.SystemVendor.ProductName)
 		// Commandline for dasd and static IP w/o nmstate might look like:
 		// rd.neednet=1 console=ttysclp0 coreos.live.rootfs_url=http://172.23.236.156:8080/assisted-installer/rootfs.img
 		// ip=10.14.6.3::10.14.6.1:255.255.255.0:master-0.boea3e06.lnxero1.boe:encbdd0:none nameserver=10.14.6.1
@@ -337,26 +538,28 @@ func constructHostInstallerArgs(cluster *common.Cluster, host *models.Host, inve
 		// rd.znet=qeth,0.0.bdd0,0.0.bdd1,0.0.bdd2,layer2=1 rd.zfcp=0.0.8004,0x500507630400d1e3,0x4000404800000000
 		// random.trust_cpu=on rd.luks.options=discard ignition.firstboot ignition.platform.id=metal coreos.inst.persistent-kargs="console=tty1 console=ttyS1,115200n8"
 		log.Debugf("Check current boot cmdline: %s\n", strings.TrimSpace(inventory.Boot.CommandLine))
+		// check if config override exists
+		hasIPConfigOverride = strings.Contains(strings.ToLower(strings.TrimSpace(inventory.Boot.CommandLine)), ZVM_IP_CFG_OVER)
+
 		for _, part := range strings.Split(strings.TrimSpace(inventory.Boot.CommandLine), " ") {
 			if strings.HasPrefix(strings.ToLower(part), ZVM_NEEDNET) ||
 				strings.HasPrefix(strings.ToLower(part), ZVM_LUN_SCAN) ||
 				strings.HasPrefix(strings.ToLower(part), ZVM_ZNET) ||
 				strings.HasPrefix(strings.ToLower(part), ZVM_DASD) ||
-				strings.HasPrefix(strings.ToLower(part), ZVM_FCP) {
+				strings.HasPrefix(strings.ToLower(part), ZVM_FCP) ||
+				// For s390x network devices having highly dynamic assigned mac addresses it's necessary to assign a static ip
+				// and nameserver
+				(hasIPConfigOverride && (strings.HasPrefix(strings.ToLower(part), ZVM_IP) ||
+					strings.HasPrefix(strings.ToLower(part), ZVM_NAMESERVER))) {
 				installerArgs = append(installerArgs, "--append-karg", part)
 			}
 		}
 	}
 
-	return toJSONString(installerArgs)
+	return installerArgs, hasIPConfigOverride
 }
 
 func appendDHCPArgs(cluster *common.Cluster, host *models.Host, inventory *models.Inventory, installerArgs []string, log logrus.FieldLogger) ([]string, error) {
-
-	if hasUserConfiguredIP(installerArgs) {
-		return installerArgs, nil
-	}
-
 	machineNetworkCIDR := network.GetPrimaryMachineCidrForUserManagedNetwork(cluster, log)
 	if machineNetworkCIDR != "" {
 		ipv6 := network.IsIPv6CIDR(machineNetworkCIDR)
@@ -406,10 +609,16 @@ func getDHCPArgPerNIC(network *net.IPNet, nic *models.Interface, ipv6 bool, dual
 		if dualStack {
 			dhcp = "dhcp,dhcp6"
 		}
-		log.Debugf("Host %s: Added kernel argument ip=%s:%s", hostID, nic.Name, dhcp)
-		return append(args, "--append-karg", fmt.Sprintf("ip=%s:%s", nic.Name, dhcp)), nil
+		netArg := formatNetKarg(nic, dhcp)
+		log.Debugf("Host %s: Added kernel argument %s", hostID, netArg)
+		return append(args, "--append-karg", netArg), nil
 	}
 	return args, nil
+}
+
+func formatNetKarg(nic *models.Interface, arg string) string {
+	macWithDashes := strings.ReplaceAll(nic.MacAddress, ":", "-")
+	return fmt.Sprintf("ip=%s:%s", macWithDashes, arg)
 }
 
 func findAnyInCIDR(network *net.IPNet, addresses []string) (bool, error) {
@@ -428,10 +637,36 @@ func findAnyInCIDR(network *net.IPNet, addresses []string) (bool, error) {
 func hasUserConfiguredIP(args []string) bool {
 	// check if the user has configured any ip arguments manually
 	// https://man7.org/linux/man-pages/man7/dracut.cmdline.7.html
-	_, result := funk.FindString(args, func(s string) bool {
+	_, result := lo.Find(args, func(s string) bool {
 		return strings.HasPrefix(s, "ip=")
 	})
 	return result
+}
+
+// When true, iSCSI ip= kernel args should be skipped to allow RHCOS to auto-configure all
+// interfaces, preventing partial network configuration where only the iSCSI NIC comes up.
+func hasDay2UnknownMachineNetwork(cluster *common.Cluster, host *models.Host, isOciCluster bool, log logrus.FieldLogger) bool {
+	if swag.StringValue(cluster.Kind) != models.ClusterKindAddHostsCluster {
+		return false
+	}
+
+	// In case of OCI, we do want to configure the iSCSI NIC because it's the only NIC that is auto configured
+	if isOciCluster {
+		return false
+	}
+
+	machineNetworkCIDR := network.GetPrimaryMachineCidrForUserManagedNetwork(cluster, log)
+	if machineNetworkCIDR == "" {
+		log.Infof("Host %s in cluster %s: skipping iSCSI ip= kernel args (Day2 iSCSI/multipath with unknown machine network)", host.ID, *cluster.ID)
+
+		return true
+	}
+
+	return false
+}
+
+func hasStaticNetwork(cluster *common.Cluster, infraEnv *common.InfraEnv) bool {
+	return (infraEnv != nil && infraEnv.StaticNetworkConfig != "") || (cluster != nil && cluster.StaticNetworkConfigured)
 }
 
 func toJSONString(args []string) (string, error) {
@@ -443,4 +678,24 @@ func toJSONString(args []string) (string, error) {
 		return "", err
 	}
 	return string(argsBytes), nil
+}
+
+func isHostInstallationDiskDeviceMapperDevice(host *models.Host) (*bool, error) {
+	var hostInventory models.Inventory
+	if err := json.Unmarshal([]byte(host.Inventory), &hostInventory); err != nil {
+		return nil, errors.Wrapf(err, "failed unmarshaling host %s inventory", lo.FromPtr(host.ID))
+	}
+
+	installationDisk, ok := lo.Find(hostInventory.Disks, func(disk *models.Disk) bool {
+		return disk.ID == host.InstallationDiskID
+	})
+	if !ok {
+		return nil, fmt.Errorf(
+			"failed finding disk in host %s which matches installation disk %s", lo.FromPtr(host.ID), host.InstallationDiskID,
+		)
+	}
+
+	deviceName := strings.Replace(lo.FromPtr(installationDisk).Path, "/dev/", "", 1)
+
+	return lo.ToPtr(strings.HasPrefix(deviceName, "dm-")), nil
 }

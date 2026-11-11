@@ -1,6 +1,7 @@
 package hostutil
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -12,21 +13,26 @@ import (
 
 	"github.com/coreos/ignition/v2/config/v3_2"
 	ignition_types "github.com/coreos/ignition/v2/config/v3_2/types"
+	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	bmh_v1alpha1 "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/common/ignition"
 	"github.com/openshift/assisted-service/internal/constants"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
 
 const (
-	MaxHostnameLength = 64
+	MaxHostnameLength = 63
 	HostnamePattern   = "^[a-z0-9][a-z0-9-]{0,62}(?:[.][a-z0-9-]{1,63})*$"
+
+	StatusInfoMaxLength = 2040
 )
 
 var ForbiddenHostnames = []string{
@@ -76,7 +82,7 @@ func GetEventSeverityFromHostStatus(status string) string {
 
 func ValidateHostname(hostname string) error {
 	if len(hostname) > MaxHostnameLength {
-		return common.NewApiError(http.StatusBadRequest, errors.New("hostname is too long"))
+		return common.NewApiError(http.StatusBadRequest, errors.Errorf("hostname is too long, must be 63 characters or less. Hostname: %s has %d characters", hostname, len(hostname)))
 	}
 	b, err := regexp.MatchString(HostnamePattern, hostname)
 	if err != nil {
@@ -94,9 +100,9 @@ func ValidateHostname(hostname string) error {
 }
 
 func IsRoleValid(requestedRole models.HostRole, isDay2Host bool) bool {
-	roleSet := map[models.HostRole]struct{}{models.HostRoleAutoAssign: {}, models.HostRoleBootstrap: {}, models.HostRoleMaster: {}, models.HostRoleWorker: {}}
+	roleSet := map[models.HostRole]struct{}{models.HostRoleAutoAssign: {}, models.HostRoleBootstrap: {}, models.HostRoleMaster: {}, models.HostRoleArbiter: {}, models.HostRoleWorker: {}}
 	if isDay2Host {
-		roleSet = map[models.HostRole]struct{}{models.HostRoleAutoAssign: {}, models.HostRoleMaster: {}, models.HostRoleWorker: {}}
+		roleSet = map[models.HostRole]struct{}{models.HostRoleAutoAssign: {}, models.HostRoleMaster: {}, models.HostRoleArbiter: {}, models.HostRoleWorker: {}}
 	}
 
 	_, exists := roleSet[requestedRole]
@@ -140,7 +146,11 @@ func GetHostInstallationDisk(host *models.Host) (*models.Disk, error) {
 		return nil, err
 	}
 
-	return GetDiskByInstallationPath(inventory.Disks, GetHostInstallationPath(host)), nil
+	installationDisk := GetDiskByInstallationPath(inventory.Disks, GetHostInstallationPath(host))
+	if installationDisk == nil {
+		return nil, fmt.Errorf("installation disk not found for host %s", host.ID)
+	}
+	return installationDisk, nil
 }
 
 func GetDiskByInstallationPath(disks []*models.Disk, installationPath string) *models.Disk {
@@ -148,10 +158,12 @@ func GetDiskByInstallationPath(disks []*models.Disk, installationPath string) *m
 		return nil
 	}
 
-	// We changed the host.installationDiskPath to contain the disk id instead of the disk path.
-	// We will search for the installation path in the disk.Id and the disk.Path field for backward compatibility.
+	// Match installationPath against:
+	// - disk.ID (by-id identifier)
+	// - disk.ByPath (/dev/disk/by-path/...)
+	// - device full name (/dev/<node>) used historically by assisted-service
 	result := funk.Find(disks, func(disk *models.Disk) bool {
-		return disk.ID == installationPath || common.GetDeviceFullName(disk) == installationPath
+		return disk.ID == installationPath || disk.ByPath == installationPath || common.GetDeviceFullName(disk) == installationPath
 	})
 
 	if result == nil {
@@ -295,19 +307,6 @@ func SaveDiskPartitionsIsSet(installerArgs string) bool {
 	return false
 }
 
-func IsDiskEncryptionEnabledForRole(encryption models.DiskEncryption, role models.HostRole) bool {
-	switch swag.StringValue(encryption.EnableOn) {
-	case models.DiskEncryptionEnableOnAll:
-		return true
-	case models.DiskEncryptionEnableOnMasters:
-		return role == models.HostRoleMaster || role == models.HostRoleBootstrap
-	case models.DiskEncryptionEnableOnWorkers:
-		return role == models.HostRoleWorker
-	default:
-		return false
-	}
-}
-
 func GetDiskEncryptionForDay2(log logrus.FieldLogger, host *models.Host) (*ignition_types.Luks, error) {
 	var response models.APIVipConnectivityResponse
 	if err := json.Unmarshal([]byte(host.APIVipConnectivity), &response); err != nil {
@@ -323,7 +322,7 @@ func GetDiskEncryptionForDay2(log logrus.FieldLogger, host *models.Host) (*ignit
 	}
 
 	// Checks if LUKS (disk encryption) exists
-	if config.Storage.Luks == nil || len(config.Storage.Luks) == 0 {
+	if len(config.Storage.Luks) == 0 {
 		// Disk encryption is disabled
 		return nil, nil
 	}
@@ -332,7 +331,22 @@ func GetDiskEncryptionForDay2(log logrus.FieldLogger, host *models.Host) (*ignit
 	return &config.Storage.Luks[0], nil
 }
 
-func GetIgnitionEndpoint(cluster *common.Cluster, host *models.Host) (string, error) {
+// GetCoreOSImageFromIgnition extracts the CoreOS image (spec.osImageURL) from the
+// encapsulated MachineConfig in the host's API VIP connectivity response. Returns
+// empty string if the response is missing, the ignition doesn't contain the
+// encapsulated MachineConfig, or the MachineConfig has no osImageURL.
+func GetCoreOSImageFromIgnition(host *models.Host) string {
+	if host.APIVipConnectivity == "" {
+		return ""
+	}
+	var response models.APIVipConnectivityResponse
+	if err := json.Unmarshal([]byte(host.APIVipConnectivity), &response); err != nil {
+		return ""
+	}
+	return ignition.GetOSImageURL(response.Ignition)
+}
+
+func GetIgnitionEndpointAndCert(cluster *common.Cluster, host *models.Host, logger logrus.FieldLogger) (string, *string, error) {
 	poolName := string(common.GetEffectiveRole(host))
 
 	// At this moment the effective role should already be either master or worker. However, given that
@@ -346,17 +360,118 @@ func GetIgnitionEndpoint(cluster *common.Cluster, host *models.Host) (string, er
 		poolName = host.MachineConfigPoolName
 	}
 
-	ignitionEndpointUrl := fmt.Sprintf(
-		"http://%s/config/%s",
-		net.JoinHostPort(common.GetAPIHostname(cluster), fmt.Sprint(constants.InsecureMCSPort)),
-		poolName)
+	// Determine the certificate to use
+	// If both cluster-level and host-level certificates are present, combine them.
+	protocol := "http"
+	port := constants.InsecureMCSPort
+	clusterCert, err := getClusterCertificate(cluster, cluster.ID, host.ID)
+	if err != nil {
+		logger.WithError(err).Errorf("Failed to get cluster ignition certificate for cluster %s, host %s", cluster.ID, host.ID)
+		return "", nil, err
+	}
+	hostCert, err := getHostCertificate(host.IgnitionConfigOverrides)
+	if err != nil {
+		logger.WithError(err).Errorf("Failed to get host ignition certificate for cluster %s, host %s", cluster.ID, host.ID)
+		return "", nil, err
+	}
+
+	cert, err := combineCerts(clusterCert, hostCert, logger, cluster.ID, host.ID)
+	if err != nil {
+		logger.WithError(err).Errorf("Failed to select ignition certificate for cluster %s, host %s", cluster.ID, host.ID)
+		return "", nil, err
+	}
+	if cert != nil {
+		protocol = "https"
+		port = constants.SecureMCSPort
+	}
+
+	// Use custom ignition endpoint if provided
 	if cluster.IgnitionEndpoint != nil && cluster.IgnitionEndpoint.URL != nil {
 		url, err := url.Parse(*cluster.IgnitionEndpoint.URL)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		url.Path = path.Join(url.Path, poolName)
-		ignitionEndpointUrl = url.String()
+		logger.Infof("Using custom ignition endpoint for cluster %s, host %s: %s",
+			cluster.ID, host.ID, url.String())
+		return url.String(), cert, nil
 	}
-	return ignitionEndpointUrl, nil
+
+	// Determine the hostname
+	// MCS certificates only include "api-int.<cluster>.<domain>" in their SANs,
+	// not "api.<cluster>.<domain>", so for https, we must use api-int.
+	apiVipDNSName := common.GetAPIHostname(cluster)
+	apiHostname := apiVipDNSName
+
+	// When using HTTPS with a certificate, check if we need to use api-int
+	// Check if the API hostname looks like a DNS name (api.cluster.domain)
+	// and convert it to internal endpoint (api-int.cluster.domain)
+	// Replace "api." with "api-int." for internal MCS endpoint
+	if cert != nil && strings.HasPrefix(apiVipDNSName, "api.") {
+		apiHostname = strings.Replace(apiVipDNSName, "api.", fmt.Sprintf("%s.", constants.InternalAPIClusterSubdomain), 1)
+		logger.Infof("Using internal API endpoint for HTTPS MCS connection: %s", apiHostname)
+	}
+	ignitionEndpointUrl := fmt.Sprintf(
+		"%s://%s/config/%s",
+		protocol,
+		net.JoinHostPort(apiHostname, fmt.Sprint(port)),
+		poolName)
+
+	return ignitionEndpointUrl, cert, nil
+}
+
+func getClusterCertificate(cluster *common.Cluster, clusterID *strfmt.UUID, hostID *strfmt.UUID) (*string, error) {
+	if cluster.IgnitionEndpoint == nil || cluster.IgnitionEndpoint.CaCertificate == nil || strings.TrimSpace(*cluster.IgnitionEndpoint.CaCertificate) == "" {
+		return nil, nil
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(*cluster.IgnitionEndpoint.CaCertificate)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to decode cluster ignition certificate for cluster %s, host %s", clusterID, hostID)
+	}
+	cert := string(decoded)
+	return &cert, nil
+}
+
+func getHostCertificate(ignitionConfigOverrides string) (*string, error) {
+	cert, err := ignition.GetCACertInIgnition(ignitionConfigOverrides)
+	if err != nil {
+		return nil, err
+	}
+	if cert == nil || strings.TrimSpace(*cert) == "" {
+		return nil, nil
+	}
+	return cert, nil
+}
+
+func combineCerts(clusterCert, hostCert *string, logger logrus.FieldLogger, clusterID *strfmt.UUID, hostID *strfmt.UUID) (*string, error) {
+	clusterPem := swag.StringValue(clusterCert)
+	hostPem := swag.StringValue(hostCert)
+
+	deduped, _, err := common.RemoveDuplicatesFromCaBundle(strings.Join([]string{clusterPem, hostPem}, "\n"))
+	if err != nil {
+		logger.WithError(err).Errorf("Failed to remove duplicate ignition certificates for cluster %s, host %s", clusterID, hostID)
+		return nil, err
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte(deduped))
+	if encoded == "" {
+		logger.Infof("No ignition certificate found for cluster %s, host %s; using HTTP", clusterID, hostID)
+		return nil, nil
+	}
+	return swag.String(encoded), nil
+}
+
+func GetDisksOfHolderByType(allDisks []*models.Disk, holderDisk *models.Disk, driveTypeFilter models.DriveType) []*models.Disk {
+	disksOfHolder := GetAllDisksOfHolder(allDisks, holderDisk)
+	return lo.Filter(disksOfHolder, func(d *models.Disk, _ int) bool { return d.DriveType == driveTypeFilter })
+}
+
+func GetAllDisksOfHolder(allDisks []*models.Disk, holderDisk *models.Disk) []*models.Disk {
+	disksOfHolder := []*models.Disk{}
+	for _, disk := range allDisks {
+		if strings.Contains(disk.Holders, holderDisk.Name) {
+			disksOfHolder = append(disksOfHolder, disk)
+		}
+	}
+	return disksOfHolder
 }

@@ -7,12 +7,10 @@ import (
 	"strings"
 
 	"github.com/danielerez/go-dns-client/pkg/dnsproviders"
-	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/network"
-	"github.com/openshift/assisted-service/models"
+	modelvalidations "github.com/openshift/assisted-service/models/validations"
 	logutil "github.com/openshift/assisted-service/pkg/log"
-	"github.com/openshift/assisted-service/pkg/validations"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -199,7 +197,7 @@ func (h *handler) GetDNSDomain(clusterName, baseDNSDomainName string) (*DNSDomai
 // up to 63 bytes. A single char may occupy more than one byte in Internationalized Domain Names (IDNs).
 func (h *handler) ValidateDNSName(clusterName, baseDNSDomainName string) error {
 	appsDomainNameSuffix := fmt.Sprintf(appsDomainNameFormat, clusterName, baseDNSDomainName)
-	apiErrorCode, err := validations.ValidateDomainNameFormat(baseDNSDomainName)
+	apiErrorCode, err := modelvalidations.ValidateDomainNameFormat(baseDNSDomainName)
 	if err != nil {
 		return common.NewApiError(apiErrorCode, err)
 	}
@@ -235,7 +233,7 @@ func (h *handler) ValidateBaseDNS(domain *DNSDomain) error {
 
 func (h *handler) ValidateDNSRecords(cluster common.Cluster, domain *DNSDomain) error {
 	vipAddresses := []string{domain.APIDomainName, domain.IngressDomainName}
-	if swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+	if cluster.ControlPlaneCount == 1 {
 		vipAddresses = append(vipAddresses, domain.APIINTDomainName)
 	}
 	if err := h.checkDNSRecordsExists(vipAddresses, domain, "A"); err != nil {

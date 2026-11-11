@@ -4,7 +4,6 @@ import (
 	"context"
 
 	strfmt "github.com/go-openapi/strfmt"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -13,6 +12,7 @@ import (
 	"github.com/openshift/assisted-service/internal/host"
 	"github.com/openshift/assisted-service/models"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
+	"go.uber.org/mock/gomock"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -89,7 +89,9 @@ var _ = Describe("create agent CR", func() {
 				Namespace: infraEnvNamespace,
 				Name:      hostId,
 			}
-			Expect(c.Get(ctx, namespacedName, &v1beta1.Agent{})).ShouldNot(HaveOccurred())
+			agent := &v1beta1.Agent{}
+			Expect(c.Get(ctx, namespacedName, agent)).ShouldNot(HaveOccurred())
+			checkAgentOwnerReferences(agent, infraEnvImage)
 		})
 
 		It("create agent with labels", func() {
@@ -118,6 +120,7 @@ var _ = Describe("create agent CR", func() {
 			Expect(c.Get(ctx, namespacedName, agent)).ShouldNot(HaveOccurred())
 			labels[v1beta1.InfraEnvNameLabel] = infraEnvName
 			Expect(agent.ObjectMeta.Labels).Should(Equal(labels))
+			checkAgentOwnerReferences(agent, infraEnvImage)
 		})
 
 		It("Empty infraenv name space- no cluster", func() {
@@ -171,6 +174,81 @@ var _ = Describe("create agent CR", func() {
 
 			err := crdUtils.CreateAgentCR(ctx, log, hostId, infraEnv, cluster)
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("Already existing agent update succeeds despite concurrent modification", func() {
+			clusterDeployment := newClusterDeployment(clusterName, testNamespace, defaultClusterSpec)
+			Expect(c.Create(ctx, clusterDeployment)).ShouldNot(HaveOccurred())
+			infraEnvImage := newInfraEnvImage(infraEnvName, infraEnvNamespace, v1beta1.InfraEnvSpec{
+				ClusterRef: &v1beta1.ClusterReference{
+					Name:      clusterDeployment.Name,
+					Namespace: clusterDeployment.Namespace,
+				},
+			})
+			Expect(c.Create(ctx, infraEnvImage)).ShouldNot(HaveOccurred())
+
+			hostId := uuid.New().String()
+			agent := newAgent(hostId, infraEnvNamespace, v1beta1.AgentSpec{
+				Approved:                true,
+				Hostname:                "old-hostname",
+				Role:                    "master",
+				MachineConfigPool:       "worker-custom",
+				InstallationDiskID:      "/dev/sda",
+				InstallerArgs:           `["--save-partlabel","data"]`,
+				IgnitionConfigOverrides: `{"ignition":{"version":"3.1.0"}}`,
+				ClusterDeploymentName: &v1beta1.ClusterReference{
+					Name:      "old-cluster",
+					Namespace: "old-namespace",
+				},
+			})
+			Expect(c.Create(ctx, agent)).ShouldNot(HaveOccurred())
+
+			namespacedName := types.NamespacedName{Name: hostId, Namespace: infraEnvNamespace}
+			concurrentAgent := &v1beta1.Agent{}
+			Expect(c.Get(ctx, namespacedName, concurrentAgent)).ShouldNot(HaveOccurred())
+			concurrentAgent.SetAnnotations(map[string]string{"reconciler": "was-here"})
+			Expect(c.Update(ctx, concurrentAgent)).ShouldNot(HaveOccurred())
+
+			id := strfmt.UUID(hostId)
+			otherClusterId := strfmt.UUID(uuid.New().String())
+			infraEnvId2 := strfmt.UUID(uuid.New().String())
+			h := common.Host{
+				Host: models.Host{
+					ID:         &id,
+					ClusterID:  &otherClusterId,
+					InfraEnvID: infraEnvId,
+				},
+			}
+			infraEnv2 := &common.InfraEnv{
+				KubeKeyNamespace: infraEnvNamespace,
+				InfraEnv: models.InfraEnv{
+					ID:   &infraEnvId2,
+					Name: &infraEnvName,
+				},
+			}
+
+			mockHostApi.EXPECT().GetHostByKubeKey(gomock.Any()).Return(&h, nil).Times(1)
+			mockHostApi.EXPECT().UnRegisterHost(ctx, gomock.Any()).Return(nil).Times(1)
+			mockHostApi.EXPECT().UpdateKubeKeyNS(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+			err := crdUtils.CreateAgentCR(ctx, log, hostId, infraEnv2, cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &v1beta1.Agent{}
+			Expect(c.Get(ctx, namespacedName, updated)).ShouldNot(HaveOccurred())
+			Expect(updated.Annotations["reconciler"]).To(Equal("was-here"))
+			Expect(updated.Labels[v1beta1.InfraEnvNameLabel]).To(Equal(infraEnvName))
+			Expect(updated.Spec.Approved).To(BeFalse())
+			Expect(updated.Spec.Hostname).To(BeEmpty())
+			Expect(string(updated.Spec.Role)).To(BeEmpty())
+			Expect(updated.Spec.MachineConfigPool).To(BeEmpty())
+			Expect(updated.Spec.InstallationDiskID).To(BeEmpty())
+			Expect(updated.Spec.InstallerArgs).To(BeEmpty())
+			Expect(updated.Spec.IgnitionConfigOverrides).To(BeEmpty())
+			Expect(updated.Spec.ClusterDeploymentName).To(Equal(&v1beta1.ClusterReference{
+				Name:      cluster.KubeKeyName,
+				Namespace: cluster.KubeKeyNamespace,
+			}))
 		})
 
 		It("Already existing agent different infraenv same namespace", func() {
@@ -249,6 +327,7 @@ var _ = Describe("create agent CR", func() {
 			agent := &v1beta1.Agent{}
 			Expect(c.Get(ctx, namespacedName, agent)).ShouldNot(HaveOccurred())
 			Expect(agent.Spec.ClusterDeploymentName).To(BeNil())
+			checkAgentOwnerReferences(agent, infraEnvImage)
 		})
 
 		It("Already existing agent - no cluster, same infraenv", func() {
@@ -273,3 +352,10 @@ var _ = Describe("create agent CR", func() {
 		})
 	})
 })
+
+func checkAgentOwnerReferences(agent *v1beta1.Agent, infraEnv *v1beta1.InfraEnv) {
+	Expect(agent.OwnerReferences).To(HaveLen(1))
+	Expect(agent.OwnerReferences[0].Kind).To(Equal(infraEnv.Kind))
+	Expect(agent.OwnerReferences[0].Name).To(Equal(infraEnv.Name))
+	Expect(agent.OwnerReferences[0].UID).To(Equal(infraEnv.GetUID()))
+}

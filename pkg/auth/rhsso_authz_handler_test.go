@@ -16,7 +16,6 @@ import (
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -34,6 +33,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -85,7 +85,6 @@ var _ = Describe("Authz email domain", func() {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		It(fmt.Sprintf("test %s", tt.name), func() {
 			payload := &ocm.AuthPayload{}
 			payload.Email = tt.email
@@ -1012,7 +1011,6 @@ var _ = Describe("authz", func() {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		It(fmt.Sprintf("test %s", tt.name), func() {
 			userAuthSupport := len(tt.allowedRoles) > 0
 			By(fmt.Sprintf("%s: with user scope", tt.name), func() {

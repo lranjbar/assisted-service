@@ -10,7 +10,6 @@ import (
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/strfmt"
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -26,6 +25,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -128,7 +128,6 @@ var _ = Describe("auth handler test", func() {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		It(tt.name, func() {
 			ocmAuth := ocm.NewMockOCMAuthentication(ctrl)
 			if tt.mockOcmAuth != nil {

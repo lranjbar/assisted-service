@@ -63,6 +63,9 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		InstallerGetClusterSupportedPlatformsHandler: installer.GetClusterSupportedPlatformsHandlerFunc(func(params installer.GetClusterSupportedPlatformsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.GetClusterSupportedPlatforms has not yet been implemented")
 		}),
+		InstallerGetDetailedSupportedFeaturesHandler: installer.GetDetailedSupportedFeaturesHandlerFunc(func(params installer.GetDetailedSupportedFeaturesParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation installer.GetDetailedSupportedFeatures has not yet been implemented")
+		}),
 		InstallerGetInfraEnvHandler: installer.GetInfraEnvHandlerFunc(func(params installer.GetInfraEnvParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.GetInfraEnv has not yet been implemented")
 		}),
@@ -120,6 +123,9 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		InstallerV2DownloadClusterLogsHandler: installer.V2DownloadClusterLogsHandlerFunc(func(params installer.V2DownloadClusterLogsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2DownloadClusterLogs has not yet been implemented")
 		}),
+		OperatorsV2GetBundleHandler: operators.V2GetBundleHandlerFunc(func(params operators.V2GetBundleParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation operators.V2GetBundle has not yet been implemented")
+		}),
 		InstallerV2GetClusterDefaultConfigHandler: installer.V2GetClusterDefaultConfigHandlerFunc(func(params installer.V2GetClusterDefaultConfigParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2GetClusterDefaultConfig has not yet been implemented")
 		}),
@@ -134,6 +140,9 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		}),
 		InstallerV2GetPresignedForClusterFilesHandler: installer.V2GetPresignedForClusterFilesHandlerFunc(func(params installer.V2GetPresignedForClusterFilesParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2GetPresignedForClusterFiles has not yet been implemented")
+		}),
+		OperatorsV2ListBundlesHandler: operators.V2ListBundlesHandlerFunc(func(params operators.V2ListBundlesParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation operators.V2ListBundles has not yet been implemented")
 		}),
 		ManifestsV2ListClusterManifestsHandler: manifests.V2ListClusterManifestsHandlerFunc(func(params manifests.V2ListClusterManifestsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation manifests.V2ListClusterManifests has not yet been implemented")
@@ -222,6 +231,12 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		InstallerV2ListHostsHandler: installer.V2ListHostsHandlerFunc(func(params installer.V2ListHostsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2ListHosts has not yet been implemented")
 		}),
+		VersionsV2ListReleaseSourcesHandler: versions.V2ListReleaseSourcesHandlerFunc(func(params versions.V2ListReleaseSourcesParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation versions.V2ListReleaseSources has not yet been implemented")
+		}),
+		VersionsV2ListSupportedOfflineOpenshiftVersionsHandler: versions.V2ListSupportedOfflineOpenshiftVersionsHandlerFunc(func(params versions.V2ListSupportedOfflineOpenshiftVersionsParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation versions.V2ListSupportedOfflineOpenshiftVersions has not yet been implemented")
+		}),
 		VersionsV2ListSupportedOpenshiftVersionsHandler: versions.V2ListSupportedOpenshiftVersionsHandlerFunc(func(params versions.V2ListSupportedOpenshiftVersionsParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation versions.V2ListSupportedOpenshiftVersions has not yet been implemented")
 		}),
@@ -230,6 +245,9 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		}),
 		InstallerV2RegisterClusterHandler: installer.V2RegisterClusterHandlerFunc(func(params installer.V2RegisterClusterParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2RegisterCluster has not yet been implemented")
+		}),
+		InstallerV2RegisterDisconnectedClusterHandler: installer.V2RegisterDisconnectedClusterHandlerFunc(func(params installer.V2RegisterDisconnectedClusterParams, principal interface{}) middleware.Responder {
+			return middleware.NotImplemented("operation installer.V2RegisterDisconnectedCluster has not yet been implemented")
 		}),
 		InstallerV2RegisterHostHandler: installer.V2RegisterHostHandlerFunc(func(params installer.V2RegisterHostParams, principal interface{}) middleware.Responder {
 			return middleware.NotImplemented("operation installer.V2RegisterHost has not yet been implemented")
@@ -300,6 +318,10 @@ func NewAssistedInstallAPI(spec *loads.Document) *AssistedInstallAPI {
 		UserAuthAuth: func(token string) (interface{}, error) {
 			return nil, errors.NotImplemented("api key auth (userAuth) Authorization from header param [Authorization] has not yet been implemented")
 		},
+		// Applies when the "Watcher-Authorization" header is set
+		WatcherAuthAuth: func(token string) (interface{}, error) {
+			return nil, errors.NotImplemented("api key auth (watcherAuth) Watcher-Authorization from header param [Watcher-Authorization] has not yet been implemented")
+		},
 		// default authorizer is authorized meaning no requests are blocked
 		APIAuthorizer: security.Authorized(),
 	}
@@ -364,6 +386,10 @@ type AssistedInstallAPI struct {
 	// it performs authentication based on an api key Authorization provided in the header
 	UserAuthAuth func(string) (interface{}, error)
 
+	// WatcherAuthAuth registers a function that takes a token and returns a principal
+	// it performs authentication based on an api key Watcher-Authorization provided in the header
+	WatcherAuthAuth func(string) (interface{}, error)
+
 	// APIAuthorizer provides access control (ACL/RBAC/ABAC) by providing access to the request and authenticated principal
 	APIAuthorizer runtime.Authorizer
 
@@ -375,6 +401,8 @@ type AssistedInstallAPI struct {
 	InstallerDownloadMinimalInitrdHandler installer.DownloadMinimalInitrdHandler
 	// InstallerGetClusterSupportedPlatformsHandler sets the operation handler for the get cluster supported platforms operation
 	InstallerGetClusterSupportedPlatformsHandler installer.GetClusterSupportedPlatformsHandler
+	// InstallerGetDetailedSupportedFeaturesHandler sets the operation handler for the get detailed supported features operation
+	InstallerGetDetailedSupportedFeaturesHandler installer.GetDetailedSupportedFeaturesHandler
 	// InstallerGetInfraEnvHandler sets the operation handler for the get infra env operation
 	InstallerGetInfraEnvHandler installer.GetInfraEnvHandler
 	// InstallerGetInfraEnvDownloadURLHandler sets the operation handler for the get infra env download URL operation
@@ -413,6 +441,8 @@ type AssistedInstallAPI struct {
 	InstallerV2DownloadClusterFilesHandler installer.V2DownloadClusterFilesHandler
 	// InstallerV2DownloadClusterLogsHandler sets the operation handler for the v2 download cluster logs operation
 	InstallerV2DownloadClusterLogsHandler installer.V2DownloadClusterLogsHandler
+	// OperatorsV2GetBundleHandler sets the operation handler for the v2 get bundle operation
+	OperatorsV2GetBundleHandler operators.V2GetBundleHandler
 	// InstallerV2GetClusterDefaultConfigHandler sets the operation handler for the v2 get cluster default config operation
 	InstallerV2GetClusterDefaultConfigHandler installer.V2GetClusterDefaultConfigHandler
 	// InstallerV2GetClusterUISettingsHandler sets the operation handler for the v2 get cluster UI settings operation
@@ -423,6 +453,8 @@ type AssistedInstallAPI struct {
 	InstallerV2GetPresignedForClusterCredentialsHandler installer.V2GetPresignedForClusterCredentialsHandler
 	// InstallerV2GetPresignedForClusterFilesHandler sets the operation handler for the v2 get presigned for cluster files operation
 	InstallerV2GetPresignedForClusterFilesHandler installer.V2GetPresignedForClusterFilesHandler
+	// OperatorsV2ListBundlesHandler sets the operation handler for the v2 list bundles operation
+	OperatorsV2ListBundlesHandler operators.V2ListBundlesHandler
 	// ManifestsV2ListClusterManifestsHandler sets the operation handler for the v2 list cluster manifests operation
 	ManifestsV2ListClusterManifestsHandler manifests.V2ListClusterManifestsHandler
 	// ManagedDomainsV2ListManagedDomainsHandler sets the operation handler for the v2 list managed domains operation
@@ -481,12 +513,18 @@ type AssistedInstallAPI struct {
 	EventsV2ListEventsHandler events.V2ListEventsHandler
 	// InstallerV2ListHostsHandler sets the operation handler for the v2 list hosts operation
 	InstallerV2ListHostsHandler installer.V2ListHostsHandler
+	// VersionsV2ListReleaseSourcesHandler sets the operation handler for the v2 list release sources operation
+	VersionsV2ListReleaseSourcesHandler versions.V2ListReleaseSourcesHandler
+	// VersionsV2ListSupportedOfflineOpenshiftVersionsHandler sets the operation handler for the v2 list supported offline openshift versions operation
+	VersionsV2ListSupportedOfflineOpenshiftVersionsHandler versions.V2ListSupportedOfflineOpenshiftVersionsHandler
 	// VersionsV2ListSupportedOpenshiftVersionsHandler sets the operation handler for the v2 list supported openshift versions operation
 	VersionsV2ListSupportedOpenshiftVersionsHandler versions.V2ListSupportedOpenshiftVersionsHandler
 	// InstallerV2PostStepReplyHandler sets the operation handler for the v2 post step reply operation
 	InstallerV2PostStepReplyHandler installer.V2PostStepReplyHandler
 	// InstallerV2RegisterClusterHandler sets the operation handler for the v2 register cluster operation
 	InstallerV2RegisterClusterHandler installer.V2RegisterClusterHandler
+	// InstallerV2RegisterDisconnectedClusterHandler sets the operation handler for the v2 register disconnected cluster operation
+	InstallerV2RegisterDisconnectedClusterHandler installer.V2RegisterDisconnectedClusterHandler
 	// InstallerV2RegisterHostHandler sets the operation handler for the v2 register host operation
 	InstallerV2RegisterHostHandler installer.V2RegisterHostHandler
 	// OperatorsV2ReportMonitoredOperatorStatusHandler sets the operation handler for the v2 report monitored operator status operation
@@ -617,6 +655,9 @@ func (o *AssistedInstallAPI) Validate() error {
 	if o.UserAuthAuth == nil {
 		unregistered = append(unregistered, "AuthorizationAuth")
 	}
+	if o.WatcherAuthAuth == nil {
+		unregistered = append(unregistered, "WatcherAuthorizationAuth")
+	}
 
 	if o.InstallerBindHostHandler == nil {
 		unregistered = append(unregistered, "installer.BindHostHandler")
@@ -629,6 +670,9 @@ func (o *AssistedInstallAPI) Validate() error {
 	}
 	if o.InstallerGetClusterSupportedPlatformsHandler == nil {
 		unregistered = append(unregistered, "installer.GetClusterSupportedPlatformsHandler")
+	}
+	if o.InstallerGetDetailedSupportedFeaturesHandler == nil {
+		unregistered = append(unregistered, "installer.GetDetailedSupportedFeaturesHandler")
 	}
 	if o.InstallerGetInfraEnvHandler == nil {
 		unregistered = append(unregistered, "installer.GetInfraEnvHandler")
@@ -687,6 +731,9 @@ func (o *AssistedInstallAPI) Validate() error {
 	if o.InstallerV2DownloadClusterLogsHandler == nil {
 		unregistered = append(unregistered, "installer.V2DownloadClusterLogsHandler")
 	}
+	if o.OperatorsV2GetBundleHandler == nil {
+		unregistered = append(unregistered, "operators.V2GetBundleHandler")
+	}
 	if o.InstallerV2GetClusterDefaultConfigHandler == nil {
 		unregistered = append(unregistered, "installer.V2GetClusterDefaultConfigHandler")
 	}
@@ -701,6 +748,9 @@ func (o *AssistedInstallAPI) Validate() error {
 	}
 	if o.InstallerV2GetPresignedForClusterFilesHandler == nil {
 		unregistered = append(unregistered, "installer.V2GetPresignedForClusterFilesHandler")
+	}
+	if o.OperatorsV2ListBundlesHandler == nil {
+		unregistered = append(unregistered, "operators.V2ListBundlesHandler")
 	}
 	if o.ManifestsV2ListClusterManifestsHandler == nil {
 		unregistered = append(unregistered, "manifests.V2ListClusterManifestsHandler")
@@ -789,6 +839,12 @@ func (o *AssistedInstallAPI) Validate() error {
 	if o.InstallerV2ListHostsHandler == nil {
 		unregistered = append(unregistered, "installer.V2ListHostsHandler")
 	}
+	if o.VersionsV2ListReleaseSourcesHandler == nil {
+		unregistered = append(unregistered, "versions.V2ListReleaseSourcesHandler")
+	}
+	if o.VersionsV2ListSupportedOfflineOpenshiftVersionsHandler == nil {
+		unregistered = append(unregistered, "versions.V2ListSupportedOfflineOpenshiftVersionsHandler")
+	}
 	if o.VersionsV2ListSupportedOpenshiftVersionsHandler == nil {
 		unregistered = append(unregistered, "versions.V2ListSupportedOpenshiftVersionsHandler")
 	}
@@ -797,6 +853,9 @@ func (o *AssistedInstallAPI) Validate() error {
 	}
 	if o.InstallerV2RegisterClusterHandler == nil {
 		unregistered = append(unregistered, "installer.V2RegisterClusterHandler")
+	}
+	if o.InstallerV2RegisterDisconnectedClusterHandler == nil {
+		unregistered = append(unregistered, "installer.V2RegisterDisconnectedClusterHandler")
 	}
 	if o.InstallerV2RegisterHostHandler == nil {
 		unregistered = append(unregistered, "installer.V2RegisterHostHandler")
@@ -883,6 +942,10 @@ func (o *AssistedInstallAPI) AuthenticatorsFor(schemes map[string]spec.SecurityS
 		case "userAuth":
 			scheme := schemes[name]
 			result[name] = o.APIKeyAuthenticator(scheme.Name, scheme.In, o.UserAuthAuth)
+
+		case "watcherAuth":
+			scheme := schemes[name]
+			result[name] = o.APIKeyAuthenticator(scheme.Name, scheme.In, o.WatcherAuthAuth)
 
 		}
 	}
@@ -982,6 +1045,10 @@ func (o *AssistedInstallAPI) initHandlerCache() {
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
+	o.handlers["GET"]["/v2/support-levels/features/detailed"] = installer.NewGetDetailedSupportedFeatures(o.context, o.InstallerGetDetailedSupportedFeaturesHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
 	o.handlers["GET"]["/v2/infra-envs/{infra_env_id}"] = installer.NewGetInfraEnv(o.context, o.InstallerGetInfraEnvHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
@@ -1058,6 +1125,10 @@ func (o *AssistedInstallAPI) initHandlerCache() {
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
+	o.handlers["GET"]["/v2/operators/bundles/{id}"] = operators.NewV2GetBundle(o.context, o.OperatorsV2GetBundleHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
 	o.handlers["GET"]["/v2/clusters/default-config"] = installer.NewV2GetClusterDefaultConfig(o.context, o.InstallerV2GetClusterDefaultConfigHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
@@ -1075,6 +1146,10 @@ func (o *AssistedInstallAPI) initHandlerCache() {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
 	o.handlers["GET"]["/v2/clusters/{cluster_id}/downloads/files-presigned"] = installer.NewV2GetPresignedForClusterFiles(o.context, o.InstallerV2GetPresignedForClusterFilesHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
+	o.handlers["GET"]["/v2/operators/bundles"] = operators.NewV2ListBundles(o.context, o.OperatorsV2ListBundlesHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
@@ -1194,6 +1269,14 @@ func (o *AssistedInstallAPI) initHandlerCache() {
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
+	o.handlers["GET"]["/v2/release-sources"] = versions.NewV2ListReleaseSources(o.context, o.VersionsV2ListReleaseSourcesHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
+	o.handlers["GET"]["/v2/offline-openshift-versions"] = versions.NewV2ListSupportedOfflineOpenshiftVersions(o.context, o.VersionsV2ListSupportedOfflineOpenshiftVersionsHandler)
+	if o.handlers["GET"] == nil {
+		o.handlers["GET"] = make(map[string]http.Handler)
+	}
 	o.handlers["GET"]["/v2/openshift-versions"] = versions.NewV2ListSupportedOpenshiftVersions(o.context, o.VersionsV2ListSupportedOpenshiftVersionsHandler)
 	if o.handlers["POST"] == nil {
 		o.handlers["POST"] = make(map[string]http.Handler)
@@ -1203,6 +1286,10 @@ func (o *AssistedInstallAPI) initHandlerCache() {
 		o.handlers["POST"] = make(map[string]http.Handler)
 	}
 	o.handlers["POST"]["/v2/clusters"] = installer.NewV2RegisterCluster(o.context, o.InstallerV2RegisterClusterHandler)
+	if o.handlers["POST"] == nil {
+		o.handlers["POST"] = make(map[string]http.Handler)
+	}
+	o.handlers["POST"]["/v2/clusters/disconnected"] = installer.NewV2RegisterDisconnectedCluster(o.context, o.InstallerV2RegisterDisconnectedClusterHandler)
 	if o.handlers["POST"] == nil {
 		o.handlers["POST"] = make(map[string]http.Handler)
 	}

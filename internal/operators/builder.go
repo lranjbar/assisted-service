@@ -2,13 +2,35 @@ package operators
 
 import (
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
-	"github.com/openshift/assisted-service/internal/oc"
+	"github.com/openshift/assisted-service/internal/operators/amdgpu"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	"github.com/openshift/assisted-service/internal/operators/authorino"
+	"github.com/openshift/assisted-service/internal/operators/clusterobservability"
 	"github.com/openshift/assisted-service/internal/operators/cnv"
+	"github.com/openshift/assisted-service/internal/operators/fenceagentsremediation"
+	"github.com/openshift/assisted-service/internal/operators/kmm"
+	"github.com/openshift/assisted-service/internal/operators/kubedescheduler"
+	"github.com/openshift/assisted-service/internal/operators/loki"
 	"github.com/openshift/assisted-service/internal/operators/lso"
 	"github.com/openshift/assisted-service/internal/operators/lvm"
 	"github.com/openshift/assisted-service/internal/operators/mce"
+	"github.com/openshift/assisted-service/internal/operators/metallb"
+	"github.com/openshift/assisted-service/internal/operators/mtv"
+	"github.com/openshift/assisted-service/internal/operators/nmstate"
+	"github.com/openshift/assisted-service/internal/operators/nodefeaturediscovery"
+	"github.com/openshift/assisted-service/internal/operators/nodehealthcheck"
+	"github.com/openshift/assisted-service/internal/operators/nodemaintenance"
+	"github.com/openshift/assisted-service/internal/operators/numaresources"
+	"github.com/openshift/assisted-service/internal/operators/nvidiagpu"
+	"github.com/openshift/assisted-service/internal/operators/oadp"
 	"github.com/openshift/assisted-service/internal/operators/odf"
+	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/operators/openshiftlogging"
+	"github.com/openshift/assisted-service/internal/operators/osc"
+	"github.com/openshift/assisted-service/internal/operators/pipelines"
+	"github.com/openshift/assisted-service/internal/operators/selfnoderemediation"
+	"github.com/openshift/assisted-service/internal/operators/serverless"
+	"github.com/openshift/assisted-service/internal/operators/servicemesh"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	"github.com/sirupsen/logrus"
@@ -32,8 +54,39 @@ type Options struct {
 }
 
 // NewManager creates new instance of an Operator Manager
-func NewManager(log logrus.FieldLogger, manifestAPI manifestsapi.ManifestsAPI, options Options, objectHandler s3wrapper.API, extracter oc.Extracter) *Manager {
-	return NewManagerWithOperators(log, manifestAPI, options, objectHandler, lso.NewLSOperator(), odf.NewOcsOperator(log), odf.NewOdfOperator(log, extracter), cnv.NewCNVOperator(log, options.CNVConfig, extracter), lvm.NewLvmOperator(log, extracter), mce.NewMceOperator(log))
+func NewManager(log logrus.FieldLogger, manifestAPI manifestsapi.ManifestsAPI, options Options, objectHandler s3wrapper.API) *Manager {
+	return NewManagerWithOperators(
+		log, manifestAPI, options, objectHandler,
+		lso.NewLSOperator(),
+		odf.NewOcsOperator(log),
+		odf.NewOdfOperator(log),
+		cnv.NewCNVOperator(log, options.CNVConfig),
+		lvm.NewLvmOperator(log),
+		mce.NewMceOperator(log),
+		mtv.NewMTVOperator(log),
+		nodefeaturediscovery.NewNodeFeatureDiscoveryOperator(log),
+		nvidiagpu.NewNvidiaGPUOperator(log),
+		pipelines.NewPipelinesOperator(log),
+		servicemesh.NewServiceMeshOperator(log),
+		serverless.NewServerLessOperator(log),
+		openshiftai.NewOpenShiftAIOperator(log),
+		authorino.NewAuthorinoOperator(log),
+		osc.NewOscOperator(log),
+		nmstate.NewNmstateOperator(log),
+		amdgpu.NewAMDGPUOperator(log),
+		kmm.NewKMMOperator(log),
+		nodehealthcheck.NewNodeHealthcheckOperator(log),
+		selfnoderemediation.NewSelfNodeRemediationOperator(log),
+		fenceagentsremediation.NewFenceAgentsRemediationOperator(log),
+		nodemaintenance.NewNodeMaintenanceOperator(log),
+		kubedescheduler.NewKubeDeschedulerOperator(log),
+		loki.NewLokiOperator(log),
+		openshiftlogging.NewOpenShiftLoggingOperator(log),
+		clusterobservability.NewClusterObservabilityOperator(log),
+		numaresources.NewNumaResourcesOperator(log),
+		oadp.NewOadpOperator(log),
+		metallb.NewMetalLBOperator(log),
+	)
 }
 
 // NewManagerWithOperators creates new instance of an Operator Manager and configures it with given operators

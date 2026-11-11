@@ -55,10 +55,10 @@ func (r *AgentClusterInstallReconciler) Reconcile(origCtx context.Context, req c
 		})
 
 	defer func() {
-		log.Info("AgentClusterInstall Reconcile ended")
+		log.Debug("AgentClusterInstall Reconcile ended")
 	}()
 
-	log.Info("AgentClusterInstall Reconcile started")
+	log.Debug("AgentClusterInstall Reconcile started")
 
 	// Retrieve AgentClusterInstall
 	clusterInstall := &hiveext.AgentClusterInstall{}
@@ -93,11 +93,11 @@ func (r *AgentClusterInstallReconciler) Reconcile(origCtx context.Context, req c
 
 		if updateErr := r.Status().Update(ctx, clusterInstall); updateErr != nil {
 			log.WithError(updateErr).Error("failed to update AgentClusterInstall Status")
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{}, updateErr
 		}
 	}
 
-	log.Info("AgentClusterInstall Reconcile successfully retrieved the associated ClusterDeployment")
+	log.Debug("AgentClusterInstall Reconcile successfully retrieved the associated ClusterDeployment")
 	return ctrl.Result{}, nil
 }
 

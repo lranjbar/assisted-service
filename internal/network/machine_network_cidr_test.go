@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
@@ -43,6 +44,11 @@ func createCluster(apiVip string, machineCidr string, inventories ...string) *co
 		MachineNetworks: CreateMachineNetworksArray(machineCidr),
 		Hosts:           createHosts(inventories...),
 	}}
+}
+
+type FreeAddress struct {
+	Network       string   `json:"network"`
+	FreeAddresses []string `json:"free_addresses"`
 }
 
 var _ = Describe("inventory", func() {
@@ -132,90 +138,449 @@ var _ = Describe("inventory", func() {
 
 		})
 	})
-	Context("VerifyVips", func() {
+
+	Context("VerifyVipsForClusterManagedLoadBalancer", func() {
 		var (
-			log                logrus.FieldLogger
-			primaryMachineCidr = "1.2.4.0/23"
+			log logrus.FieldLogger
 		)
 
 		BeforeEach(func() {
 			log = logrus.New()
 		})
-		It("Same vips", func() {
-			cluster := createCluster("1.2.5.6", primaryMachineCidr,
-				createInventory(createInterface("1.2.5.7/23")))
-			cluster.Hosts = []*models.Host{
-				{
-					FreeAddresses: "[{\"network\":\"1.2.4.0/23\",\"free_addresses\":[\"1.2.5.6\",\"1.2.5.8\"]}]",
-				},
-			}
-			cluster.IngressVips = []*models.IngressVip{{IP: models.IP(GetApiVipById(cluster, 0))}}
-			err := VerifyVips(cluster.Hosts, primaryMachineCidr, GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).To(HaveOccurred())
+
+		Context("should fail verification", func() {
+			It("when IP is not in the machine network", func() {
+				machineNetworkCidr := "192.168.128.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("does not belong to machine-network-cidr"))
+			})
+
+			It("when IP is the broadcast address of the machine network", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.255"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("is the broadcast address of machine-network-cidr"))
+			})
+
+			It("when API VIP is not in the free addresses list", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("is already in use in cidr"))
+			})
+
+			It("when Ingress VIP is not in the free addresses list", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("is already in use in cidr"))
+			})
+
+			It("when using common VIP", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.1"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("appears both in apiVIPs and ingressVIPs"))
+			})
 		})
-		It("Different vips", func() {
-			cluster := createCluster("1.2.5.6", primaryMachineCidr,
-				createInventory(createInterface("1.2.5.7/23")))
-			cluster.IngressVips = []*models.IngressVip{{IP: "1.2.5.8"}}
-			cluster.Hosts = []*models.Host{
-				{
-					FreeAddresses: "[{\"network\":\"1.2.4.0/23\",\"free_addresses\":[\"1.2.5.6\",\"1.2.5.8\"]}]",
-				},
-			}
-			err := VerifyVips(cluster.Hosts, primaryMachineCidr, GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).ToNot(HaveOccurred())
+
+		Context("should pass verification", func() {
+			It("with empty machine network", func() {
+				machineNetworkCidr := ""
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("with no free addresses", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+				hosts := []*models.Host{{FreeAddresses: ""}}
+
+				err := VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("with standard configuration", func() {
+				machineNetworkCidr := "192.168.127.0/24"
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForClusterManagedLoadBalancer(
+					hosts,
+					machineNetworkCidr,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
 		})
-		It("Not free", func() {
-			cluster := createCluster("1.2.5.6", primaryMachineCidr,
-				createInventory(createInterface("1.2.5.7/23")))
-			cluster.IngressVips = []*models.IngressVip{{IP: "1.2.5.8"}}
-			cluster.Hosts = []*models.Host{
-				{
-					FreeAddresses: "[{\"network\":\"1.2.4.0/23\",\"free_addresses\":[\"1.2.5.9\"]}]",
-				},
-			}
-			err := VerifyVips(cluster.Hosts, primaryMachineCidr, GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).To(HaveOccurred())
+	})
+
+	Context("VerifyVipsForUserManangedLoadBalancer", func() {
+		var log logrus.FieldLogger
+
+		BeforeEach(func() {
+			log = logrus.New()
 		})
-		It("Empty", func() {
-			cluster := createCluster("1.2.5.6", primaryMachineCidr,
-				createInventory(createInterface("1.2.5.7/23")))
-			cluster.IngressVips = []*models.IngressVip{{IP: "1.2.5.8"}}
-			cluster.Hosts = []*models.Host{
-				{
-					FreeAddresses: "",
-				},
-			}
-			err := VerifyVips(cluster.Hosts, primaryMachineCidr, GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).ToNot(HaveOccurred())
+
+		Context("should fail verification", func() {
+			It("with no machine networks", func() {
+				machineNetworks := []*models.MachineNetwork{}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("no machine networks to verify VIP"))
+			})
+
+			It("with API VIP is not part of any machine network", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+					{Cidr: "192.168.128.0/24"},
+				}
+				apiVip := "192.168.126.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.126.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("does not belong to machine-network-cidr"))
+			})
+
+			It("with Ingress VIP is not part of any machine network", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+					{Cidr: "192.168.128.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.126.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.126.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("does not belong to machine-network-cidr"))
+			})
+
+			It("with API VIP that is broadcast address in all machine networks", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+				}
+				apiVip := "192.168.127.255"
+				ingressVIP := "192.168.127.1"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("is the broadcast address of machine-network-cidr"))
+			})
+
+			It("with Ingress VIP that is broadcast address in all machine networks", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.255"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1", "192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("is the broadcast address of machine-network-cidr"))
+			})
+
+			It("when no machine networks satisfies the requirments", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+					{Cidr: "192.168.128.0/24"},
+				}
+				apiVip := "192.168.129.1"
+				ingressVIP := "192.168.128.1"
+				hosts := []*models.Host{{}}
+
+				err := VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(Equal(
+					"api-vip '192.168.129.1' failed verification: " +
+						"none of the machine networks is satisfying the requirements, description: " +
+						"machine network CIDR <192.168.127.0/24> verification failed: " +
+						"api-vip <192.168.129.1> does not belong to machine-network-cidr <192.168.127.0/24>; " +
+						"machine network CIDR <192.168.128.0/24> verification failed: " +
+						"api-vip <192.168.129.1> does not belong to machine-network-cidr <192.168.128.0/24>",
+				))
+			})
 		})
-		It("Free", func() {
-			cluster := createCluster("1.2.5.6", primaryMachineCidr,
-				createInventory(createInterface("1.2.5.7/23")))
-			cluster.IngressVips = []*models.IngressVip{{IP: "1.2.5.8"}}
-			cluster.Hosts = []*models.Host{
-				{
-					FreeAddresses: "[{\"network\":\"1.2.4.0/23\",\"free_addresses\":[\"1.2.5.6\",\"1.2.5.8\",\"1.2.5.9\"]}]",
-				},
-			}
-			err := VerifyVips(cluster.Hosts, primaryMachineCidr, GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).ToNot(HaveOccurred())
-		})
-		It("machine cidr is too small", func() {
-			cluster := createCluster("1.2.5.2", "1.2.5.0/29", createInventory(
-				createInterface("1.2.5.2/29"),
-				createInterface("1.2.5.3/29"),
-				createInterface("1.2.5.4/29"),
-				createInterface("1.2.5.5/29"),
-				createInterface("1.2.5.6/29")))
-			h := &models.Host{
-				FreeAddresses: "[{\"network\":\"1.2.5.0/29\",\"free_addresses\":[\"1.2.5.7\"]}]",
-			}
-			cluster.Hosts = []*models.Host{h, h, h, h, h}
-			cluster.APIVips = []*models.APIVip{{IP: "1.2.5.2"}}
-			err := VerifyVips(cluster.Hosts, "1.2.5.0/29", GetApiVipById(cluster, 0), GetIngressVipById(cluster, 0), log)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("The machine network range is too small for the cluster"))
+
+		Context("should pass verification", func() {
+			It("when API VIP is not in the free addresses list", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.2"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("when Ingress VIP is not in the free addresses list", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.2"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("with common VIPs", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.127.1"
+
+				bytes, err := json.Marshal([]FreeAddress{{
+					Network:       "192.168.127.0/24",
+					FreeAddresses: []string{"192.168.127.1"},
+				}})
+				Expect(err).ToNot(HaveOccurred())
+				hosts := []*models.Host{{FreeAddresses: string(bytes)}}
+
+				err = VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("when at least one of the machine networks satisfies each VIP", func() {
+				machineNetworks := []*models.MachineNetwork{
+					{Cidr: "192.168.127.0/24"},
+					{Cidr: "192.168.128.0/24"},
+				}
+				apiVip := "192.168.127.1"
+				ingressVIP := "192.168.128.1"
+				hosts := []*models.Host{{}}
+
+				err := VerifyVipsForUserManangedLoadBalancer(
+					hosts,
+					machineNetworks,
+					apiVip,
+					ingressVIP,
+					log,
+				)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
 		})
 	})
 
@@ -333,6 +698,56 @@ var _ = Describe("inventory", func() {
 		})
 
 	})
+
+	Context("IsHostInAllMachineNetworksCidr", func() {
+		var log logrus.FieldLogger
+
+		BeforeEach(func() {
+			log = logrus.New()
+		})
+
+		DescribeTable(
+			"IsHostInAllMachineNetworksCidr",
+			func(nics []*models.Interface, machineNetworks []*models.MachineNetwork, expectedResult bool) {
+				cluster := createCluster("", "", createInventory(nics...))
+				cluster.MachineNetworks = machineNetworks
+				res := IsHostInAllMachineNetworksCidr(log, cluster, cluster.Hosts[0])
+				Expect(res).To(Equal(expectedResult))
+			},
+			Entry("MachineNetworks is empty", []*models.Interface{createInterface("1.2.3.4/24")}, []*models.MachineNetwork{}, false),
+			Entry("MachineNetworks is malformed", []*models.Interface{createInterface("1.2.3.4/24")}, []*models.MachineNetwork{{Cidr: "a.b.c.d"}}, false),
+			Entry("Interfaces is empty", []*models.Interface{}, []*models.MachineNetwork{{Cidr: "a.b.c.d"}}, false),
+			Entry("Interface IP is malformed", []*models.Interface{createInterface("a.b.c.d/24")}, []*models.MachineNetwork{{Cidr: "1.2.3.4/24"}}, false),
+			Entry("Host belongs to all machine network CIDRs", []*models.Interface{createInterface("1.2.3.4/24"), addIPv6Addresses(createInterface(), "2001:db8::1/48")}, []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}, {Cidr: "2001:db8::/48"}}, true),
+			Entry("Host doesn't belong to all machine network CIDRs", []*models.Interface{createInterface("1.2.3.4/24")}, []*models.MachineNetwork{{Cidr: "1.2.3.0/24"}, {Cidr: "2001:db8::a1/120"}}, false),
+		)
+	})
+
+	Context("IsInterfaceInPrimaryMachineNetCidr", func() {
+
+		var log logrus.FieldLogger
+
+		BeforeEach(func() {
+			log = logrus.New()
+		})
+
+		DescribeTable(
+			"IsInterfaceInPrimaryMachineNetCidr",
+			func(nic *models.Interface, machineNetworks []*models.MachineNetwork, expectedResult bool) {
+				cluster := createCluster("", "", createInventory(nic))
+				cluster.MachineNetworks = machineNetworks
+				res := IsInterfaceInPrimaryMachineNetCidr(log, cluster, nic)
+				Expect(res).To(Equal(expectedResult))
+			},
+			Entry("MachineNetworks is empty", createInterface("1.2.3.4/24"), []*models.MachineNetwork{}, false),
+			Entry("MachineNetworks is malformed", createInterface("1.2.3.4/24"), []*models.MachineNetwork{{Cidr: "a.b.c.d"}}, false),
+			Entry("Interface IP is malformed", createInterface("a.b.c.d/24"), []*models.MachineNetwork{{Cidr: "1.2.3.4/24"}}, false),
+			Entry("Interface belongs to a IPv4 machine network CIDR", addIPv6Addresses(createInterface("1.2.3.4/24"), "2001:db8::a1/48"), []*models.MachineNetwork{{Cidr: "1.2.3.4/24"}}, true),
+			Entry("Interface belongs to a IPv6 machine network CIDR", addIPv6Addresses(createInterface("1.2.3.4/24"), "2001:db8::a1/48"), []*models.MachineNetwork{{Cidr: "2001:db8::/48"}}, true),
+			Entry("Interface doesn't belong to any machine network CIDRs", createInterface("1.2.3.4/24", "2001:db8::a1/48"), []*models.MachineNetwork{{Cidr: "5.6.7.8/24"}, {Cidr: "2001:db9::/48"}}, false),
+		)
+	})
+
 })
 
 func TestMachineNetworkCidr(t *testing.T) {

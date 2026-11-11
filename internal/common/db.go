@@ -1,10 +1,13 @@
 package common
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
+	v1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/transaction"
@@ -34,6 +37,17 @@ type Notifiable interface {
 	NotificationType() string
 	Payload() any
 }
+
+// PrimaryIPStack defines which IP family is considered primary in a dual-stack configuration.
+type PrimaryIPStack int
+
+const (
+	// PrimaryIPStackV4 indicates the primary stack is IPv4.
+	PrimaryIPStackV4 PrimaryIPStack = 4
+
+	// PrimaryIPStackV6 indicates the primary stack is IPv6.
+	PrimaryIPStackV6 PrimaryIPStack = 6
+)
 
 type Cluster struct {
 	models.Cluster
@@ -81,6 +95,14 @@ type Cluster struct {
 
 	// A JSON blob in which cluster UI settings will be stored.
 	UISettings string `json:"ui_settings"`
+
+	// A JSON blob in which holds the cluster mirror registry if set
+	MirrorRegistryConfiguration string `json:"mirror_registry_configuration" gorm:"type:TEXT"`
+
+	// PrimaryIPStack will be 'nil' for single-stack clusters
+	// and populated only when the configuration is dual-stack.
+	// The `omitempty` tag ensures it's omitted from JSON when nil.
+	PrimaryIPStack *PrimaryIPStack `json:"primary_ip_stack,omitempty"`
 }
 
 func (c *Cluster) GetClusterID() *strfmt.UUID {
@@ -99,6 +121,29 @@ func (c *Cluster) NotificationType() string {
 
 func (c *Cluster) Payload() any {
 	return &c.Cluster
+}
+
+func (c *Cluster) GetMirrorRegistryConfiguration() (*MirrorRegistryConfiguration, error) {
+	if c.MirrorRegistryConfiguration == "" {
+		return nil, nil
+	}
+
+	config, err := convertStringToMirrorRegistryConfig(c.MirrorRegistryConfiguration)
+	if err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+func (c *Cluster) SetMirrorRegistryConfiguration(configuration *MirrorRegistryConfiguration) error {
+	data, err := ConvertMirrorRegistryConfigToString(configuration)
+	if err != nil {
+		return err
+	}
+
+	c.MirrorRegistryConfiguration = data
+	return nil
 }
 
 type Event struct {
@@ -191,6 +236,9 @@ type InfraEnv struct {
 	// Json formatted string containing internal overrides for the default ignition config.
 	// This is used for adding ironic ignition config to the assisted ignition config
 	InternalIgnitionConfigOverride string `json:"internal_ignition_config_override,omitempty"`
+
+	// A JSON blob in which holds a mirror registry configurations if set
+	MirrorRegistryConfiguration string `gorm:"type:TEXT"`
 }
 
 func (i *InfraEnv) GetClusterID() *strfmt.UUID {
@@ -209,6 +257,29 @@ func (i *InfraEnv) NotificationType() string {
 
 func (i *InfraEnv) Payload() any {
 	return &i.InfraEnv
+}
+
+func (i *InfraEnv) GetMirrorRegistryConfiguration() (*MirrorRegistryConfiguration, error) {
+	if i.MirrorRegistryConfiguration == "" {
+		return nil, nil
+	}
+
+	config, err := convertStringToMirrorRegistryConfig(i.MirrorRegistryConfiguration)
+	if err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+func (i *InfraEnv) SetMirrorRegistryConfiguration(configuration *MirrorRegistryConfiguration) error {
+	data, err := ConvertMirrorRegistryConfigToString(configuration)
+	if err != nil {
+		return err
+	}
+
+	i.MirrorRegistryConfiguration = data
+	return nil
 }
 
 type EagerLoadingState bool
@@ -251,6 +322,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&Cluster{},
 		&Event{},
 		&InfraEnv{},
+		&models.ReleaseImage{},
 		&models.ClusterNetwork{},
 		&models.ServiceNetwork{},
 		&models.MachineNetwork{},
@@ -260,7 +332,10 @@ func AutoMigrate(db *gorm.DB) error {
 }
 
 func LoadTableFromDB(db *gorm.DB, tableName string, conditions ...interface{}) *gorm.DB {
-	return db.Preload(tableName, conditions...)
+	// Anytime a cluster is loaded from the database, the network tables need to be ordered
+	// by IP family according to the cluster's primary_ip_stack.
+	tableConditions := addNetworkCondition(tableName, conditions...)
+	return db.Preload(tableName, tableConditions...)
 }
 
 func LoadClusterTablesFromDB(db *gorm.DB, excludeTables ...string) *gorm.DB {
@@ -304,6 +379,36 @@ func GetClusterFromDBWithVips(db *gorm.DB, clusterId strfmt.UUID) (*Cluster, err
 	return GetClusterFromDB(db, clusterId, SkipEagerLoading)
 }
 
+func GetHostCountByRole(db *gorm.DB, clusterID strfmt.UUID, role models.HostRole, suggested bool) (*int64, error) {
+	var count int64
+
+	field := "role"
+	errStr := " "
+	if suggested {
+		field = "suggested_role"
+		errStr = " suggested "
+	}
+	condition := fmt.Sprintf("hosts.%s = ?", field)
+
+	err := db.Model(&Host{}).
+		Joins("INNER JOIN clusters ON hosts.cluster_id = clusters.id").
+		Where("clusters.id = ?", clusterID.String()).
+		Where(condition, string(role)).
+		Count(&count).Error
+
+	if err != nil {
+		return nil, errors.Wrapf(
+			err,
+			"failed to count the number of hosts in cluster with ID '%s' and%srole '%s'",
+			clusterID.String(),
+			errStr,
+			string(role),
+		)
+	}
+
+	return &count, nil
+}
+
 func prepareClusterDB(db *gorm.DB, eagerLoading EagerLoadingState, includeDeleted DeleteRecordsState, conditions ...interface{}) *gorm.DB {
 	if includeDeleted {
 		db = db.Unscoped()
@@ -321,8 +426,71 @@ func prepareClusterDB(db *gorm.DB, eagerLoading EagerLoadingState, includeDelete
 			db = LoadTableFromDB(db, tableName, conditions...)
 		}
 	}
-
 	return db
+}
+
+// OrderByIPFamily returns a GORM callback that orders network items by IP family
+// according to the cluster's primary_ip_stack setting.
+// It joins with the clusters table to get primary_ip_stack and uses PostgreSQL's
+// family() function which returns 4 for IPv4 and 6 for IPv6.
+// Rows matching the cluster's primary_ip_stack are ordered first.
+func OrderByIPFamily(column, tableName string) func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		joinClause := fmt.Sprintf(
+			"INNER JOIN clusters ON clusters.id = %s.cluster_id",
+			tableName,
+		)
+		orderClause := fmt.Sprintf(
+			"CASE WHEN clusters.primary_ip_stack = family(%s) THEN 0 ELSE 1 END ASC",
+			column,
+		)
+		return db.Joins(joinClause).Order(orderClause)
+	}
+}
+
+// OrderByBootstrapNetwork orders machine networks so the one containing the
+// bootstrap host's IP comes first. cluster-etcd-operator relies on this ordering.
+// ref: https://github.com/openshift/cluster-etcd-operator/blob/cee7f9bbea0fce240a74872e3c3baf069bc5eaac/pkg/cmd/render/render.go#L490
+func OrderByBootstrapNetwork() func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		orderClause := `CASE WHEN EXISTS (
+			SELECT 1 FROM hosts h,
+				jsonb_array_elements(h.inventory::jsonb->'interfaces') AS iface,
+				jsonb_array_elements_text(
+					CASE WHEN family(machine_networks.cidr::inet) = 4
+						THEN COALESCE(NULLIF(iface->'ipv4_addresses', 'null'::jsonb), '[]'::jsonb)
+						ELSE COALESCE(NULLIF(iface->'ipv6_addresses', 'null'::jsonb), '[]'::jsonb)
+					END
+				) AS addr
+			WHERE h.cluster_id = machine_networks.cluster_id
+				AND h.bootstrap = true
+				AND h.deleted_at IS NULL
+				AND h.inventory IS NOT NULL
+				AND h.inventory != ''
+				AND host(addr::inet)::inet << machine_networks.cidr::cidr
+		) THEN 0 ELSE 1 END ASC`
+		return db.Order(orderClause)
+	}
+}
+
+// addNetworkCondition adds the order by clause for network tables based on the cluster's primary_ip_stack setting
+// to the conditions for a given table.
+func addNetworkCondition(tableName string, conditions ...interface{}) []interface{} {
+	allConditions := conditions
+	switch tableName {
+	case MachineNetworksTable:
+		allConditions = append(allConditions, OrderByIPFamily("cidr", "machine_networks"))
+		allConditions = append(allConditions, OrderByBootstrapNetwork())
+	case ClusterNetworksTable:
+		allConditions = append(allConditions, OrderByIPFamily("cidr", "cluster_networks"))
+	case ServiceNetworksTable:
+		allConditions = append(allConditions, OrderByIPFamily("cidr", "service_networks"))
+	case APIVIPsTable:
+		allConditions = append(allConditions, OrderByIPFamily("ip", "api_vips"))
+	case IngressVIPsTable:
+		allConditions = append(allConditions, OrderByIPFamily("ip", "ingress_vips"))
+	}
+	return allConditions
 }
 
 func GetClusterFromDBWhere(db *gorm.DB, eagerLoading EagerLoadingState, includeDeleted DeleteRecordsState, where ...interface{}) (*Cluster, error) {
@@ -389,6 +557,17 @@ func GetClusterHostFromDB(db *gorm.DB, clusterId, hostId string) (*Host, error) 
 		return nil, errors.Wrapf(err, "failed to get host %s in cluster %s", hostId, clusterId)
 	}
 	return &host, nil
+}
+
+// DeleteSoftDeletedHost hard-deletes any soft-deleted host with the given composite key (ID, InfraEnvID).
+// This is used before registering or creating a host to prevent primary key conflicts.
+// Returns nil if no soft-deleted host exists.
+func DeleteSoftDeletedHost(db *gorm.DB, hostId, infraEnvId string) error {
+	err := db.Unscoped().Where("deleted_at IS NOT NULL").Delete(&Host{}, "id = ? and infra_env_id = ?", hostId, infraEnvId).Error
+	if err != nil {
+		return errors.Wrapf(err, "error while trying to delete soft-deleted host %s in infra env %s from db", hostId, infraEnvId)
+	}
+	return nil
 }
 
 func GetHostFromDBWhere(db *gorm.DB, where ...interface{}) (*Host, error) {
@@ -535,4 +714,39 @@ func CloseDB(db *gorm.DB) {
 		return
 	}
 	_ = sqlDB.Close()
+}
+
+// convertStringToMirrorRegistryConfig converts a serialized JSON to a MirrorRegistryConfiguration struct
+func convertStringToMirrorRegistryConfig(data string) (*MirrorRegistryConfiguration, error) {
+	var config MirrorRegistryConfiguration
+
+	// Unmarshal the JSON byte slice into the struct
+	err := json.Unmarshal([]byte(data), &config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal MirrorRegistryConfiguration: %w", err)
+	}
+
+	return &config, nil
+}
+
+// ConvertMirrorRegistryConfigToString converts a MirrorRegistryConfiguration struct to a serialized JSON
+func ConvertMirrorRegistryConfigToString(configuration *MirrorRegistryConfiguration) (string, error) {
+	if configuration == nil {
+		return "", nil
+	}
+
+	data, err := json.Marshal(configuration)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal MirrorRegistryConfiguration: %w", err)
+	}
+	return string(data), nil
+}
+
+// MirrorRegistryConfiguration holds the given mirror registry configuration
+type MirrorRegistryConfiguration struct {
+	ImageDigestMirrors []v1.ImageDigestMirrors `json:"imageDigestMirrors,omitempty"`
+	ImageTagMirrors    []v1.ImageTagMirrors    `json:"imageTagMirrors,omitempty"`
+	Insecure           []string                `json:"insecure,omitempty"`
+	RegistriesConf     string                  `json:"registriesConf,omitempty"`
+	CaBundleCrt        string                  `json:"caBundleCrt,omitempty"`
 }

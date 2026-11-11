@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -16,6 +15,7 @@ import (
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -52,7 +52,7 @@ var _ = Describe("domainNameResolution", func() {
 	It("happy flow", func() {
 		cluster = common.Cluster{Cluster: models.Cluster{ID: &clusterID, Name: name, BaseDNSDomain: baseDNSDomain}}
 		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{URL: swag.String("quay.io/release")}, nil)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{URL: swag.String("quay.io/release")}, nil)
 		stepReply, stepErr = dCmd.GetSteps(ctx, &host)
 		Expect(stepReply).ToNot(BeNil())
 		Expect(stepReply[0].StepType).To(Equal(models.StepTypeDomainResolution))
@@ -81,7 +81,6 @@ var _ = Describe("domainNameResolution", func() {
 	It("Missing cluster name", func() {
 		cluster = common.Cluster{Cluster: models.Cluster{ID: &clusterID, BaseDNSDomain: baseDNSDomain}}
 		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{URL: swag.String("quay.io/release")}, nil)
 		stepReply, stepErr = dCmd.GetSteps(ctx, &host)
 		Expect(stepReply).To(BeNil())
 		Expect(stepErr).To(HaveOccurred())
@@ -90,7 +89,6 @@ var _ = Describe("domainNameResolution", func() {
 	It("Missing domain base name", func() {
 		cluster = common.Cluster{Cluster: models.Cluster{ID: &clusterID, Name: name}}
 		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.ReleaseImage{URL: swag.String("quay.io/release")}, nil)
 		stepReply, stepErr = dCmd.GetSteps(ctx, &host)
 		Expect(stepReply).To(BeNil())
 		Expect(stepErr).To(HaveOccurred())
@@ -100,5 +98,6 @@ var _ = Describe("domainNameResolution", func() {
 		common.DeleteTestDB(db, dbName)
 		stepReply = nil
 		stepErr = nil
+		ctrl.Finish()
 	})
 })

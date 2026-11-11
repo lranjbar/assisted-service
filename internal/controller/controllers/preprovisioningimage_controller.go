@@ -29,6 +29,7 @@ import (
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/internal/bminventory"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/controller/controllers/mirrorregistry"
 	"github.com/openshift/assisted-service/internal/ignition"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/oc"
@@ -47,13 +48,17 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 type imageConditionReason string
 
-const archMismatchReason = "InfraEnvArchMismatch"
+const (
+	archMismatchReason                = "InfraEnvArchMismatch"
+	PreprovisioningImageFinalizerName = "preprovisioningimage." + aiv1beta1.Group + "/ai-deprovision"
+)
 
 type PreprovisioningImageControllerConfig struct {
 	// The default ironic agent image was obtained by running "oc adm release info --image-for=ironic-agent  quay.io/openshift-release-dev/ocp-release:4.11.0-fc.0-x86_64"
@@ -93,49 +98,58 @@ func (r *PreprovisioningImageReconciler) Reconcile(origCtx context.Context, req 
 		})
 
 	defer func() {
-		log.Info("PreprovisioningImage Reconcile ended")
+		log.Debug("PreprovisioningImage Reconcile ended")
 	}()
 
-	log.Info("PreprovisioningImage Reconcile started")
+	log.Debug("PreprovisioningImage Reconcile started")
 
 	// Retrieve PreprovisioningImage
 	image := &metal3_v1alpha1.PreprovisioningImage{}
-	err := r.Get(ctx, req.NamespacedName, image)
-	if err != nil {
+	if err := r.Get(ctx, req.NamespacedName, image); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	if !image.ObjectMeta.DeletionTimestamp.IsZero() {
+		return r.handlePreprovisioningImageDeletion(ctx, log, image)
+	}
+
+	if !funk.ContainsString(image.GetFinalizers(), PreprovisioningImageFinalizerName) {
+		return r.ensurePreprovisioningImageFinalizer(ctx, log, image)
+	}
+
+	if err := ensureVeleroExcludeBackupLabel(ctx, log, r.Client, image); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if !funk.Some(image.Spec.AcceptFormats, metal3_v1alpha1.ImageFormatISO, metal3_v1alpha1.ImageFormatInitRD) {
 		// Currently, the PreprovisioningImageController only support ISO and InitRD image
 		log.Infof("Unsupported image format: %s", image.Spec.AcceptFormats)
-		setUnsupportedFormatCondition(image)
-		err = r.Status().Update(ctx, image)
-		if err != nil {
-			log.WithError(err).Error("failed to update status")
-		}
-		return ctrl.Result{}, err
+		return ctrl.Result{}, r.patchImageStatus(ctx, log, image, setUnsupportedFormatCondition)
 	}
-	// Consider adding finalizer in case we need to clean up resources
+
 	// Retrieve InfraEnv
 	infraEnv, err := r.findInfraEnvForPreprovisioningImage(ctx, log, image)
 	if err != nil {
 		log.WithError(err).Error("failed to get corresponding infraEnv")
 		return ctrl.Result{}, err
 	}
-	if infraEnv == nil {
-		log.Info("failed to find infraEnv for image")
-		return ctrl.Result{}, nil
+	if infraEnv == nil || !infraEnv.DeletionTimestamp.IsZero() {
+		log.Warn("infraEnv is not found or is being deleted")
+		return ctrl.Result{}, r.patchImageStatus(ctx, log, image, setInfraEnvNotAvailableCondition)
 	}
+
+	log = log.WithFields(logrus.Fields{
+		"infra_env":           infraEnv.Name,
+		"infra_env_namespace": infraEnv.Namespace,
+	})
 
 	imageArch := common.NormalizeCPUArchitecture(image.Spec.Architecture)
 	infraArch := common.NormalizeCPUArchitecture(infraEnv.Spec.CpuArchitecture)
 	if infraArch != imageArch {
 		log.Infof("Image arch %s does not match infraEnv arch %s", imageArch, infraArch)
-		setMismatchedArchCondition(image, imageArch, infraArch)
-		err = r.Status().Update(ctx, image)
-		if err != nil {
-			log.WithError(err).Error("failed to update status")
-		}
-		return ctrl.Result{}, err
+		return ctrl.Result{}, r.patchImageStatus(ctx, log, image, func(img *metal3_v1alpha1.PreprovisioningImage) {
+			setMismatchedArchCondition(img, imageArch, infraArch)
+		})
 	}
 
 	infraEnvUpdated, err := r.AddIronicAgentToInfraEnv(ctx, log, infraEnv)
@@ -143,62 +157,79 @@ func (r *PreprovisioningImageReconciler) Reconcile(origCtx context.Context, req 
 		return ctrl.Result{}, nil
 	}
 	if err != nil {
-		setIronicAgentIgnitionFailureCondition(image, err)
-		if updErr := r.Status().Update(ctx, image); updErr != nil {
-			log.WithError(err).Error("failed to update status")
+		patchErr := r.patchImageStatus(ctx, log, image, func(img *metal3_v1alpha1.PreprovisioningImage) {
+			setIronicAgentIgnitionFailureCondition(img, err)
+		})
+		if patchErr != nil {
+			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, err
 	}
 
 	if infraEnv.Status.CreatedTime == nil {
 		log.Info("InfraEnv image has not been created yet")
-		setNotCreatedCondition(image)
-		err = r.Status().Update(ctx, image)
-		if err != nil {
-			log.WithError(err).Error("failed to update status")
-			return ctrl.Result{}, err
-		}
-		// no need to requeue, the change in the infraenv should trigger a reconcile
-		return ctrl.Result{}, nil
+		// If the status updated successfully, no need to requeue, the change in the infraenv should trigger a reconcile
+		return ctrl.Result{}, r.patchImageStatus(ctx, log, image, setNotCreatedCondition)
 	}
 
 	// The image has been created sooner than the specified cooldown period
 	imageTimePlusCooldown := infraEnv.Status.CreatedTime.Time.Add(InfraEnvImageCooldownPeriod)
 	if imageTimePlusCooldown.After(time.Now()) {
-		log.Info("InfraEnv image is too recent. Requeuing and retrying again soon")
-		setCoolDownCondition(image)
-		err = r.Status().Update(ctx, image)
+		log.Debug("InfraEnv image is too recent. Requeuing and retrying again soon")
+		err = r.patchImageStatus(ctx, log, image, setCoolDownCondition)
 		if err != nil {
-			log.WithError(err).Error("failed to update status")
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Until(imageTimePlusCooldown)}, nil
 	}
 
-	if image.Status.ImageUrl == infraEnv.Status.ISODownloadURL {
-		log.Info("PreprovisioningImage and InfraEnv images are in sync. Nothing to update.")
-		return ctrl.Result{}, nil
-	}
-	imageUpdated := image.Status.ImageUrl != ""
-	err = r.setImage(image, *infraEnv)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	log.Info("updating status")
-	err = r.Status().Update(ctx, image)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	log.Info("PreprovisioningImage updated successfully")
+	return ctrl.Result{}, r.handleImageUpdate(ctx, log, image, infraEnv)
+}
 
-	if imageUpdated {
-		if err = r.setBMHRebootAnnotation(ctx, image); err != nil {
+func clearImageStatus(image *metal3_v1alpha1.PreprovisioningImage) {
+	image.Status.ImageUrl = ""
+	image.Status.KernelUrl = ""
+	image.Status.ExtraKernelParams = ""
+	image.Status.Format = ""
+	image.Status.Architecture = ""
+}
+
+func getExpectedImageURL(image *metal3_v1alpha1.PreprovisioningImage, infraEnv *aiv1beta1.InfraEnv) string {
+	if funk.Contains(image.Spec.AcceptFormats, metal3_v1alpha1.ImageFormatISO) {
+		return infraEnv.Status.ISODownloadURL
+	}
+	if funk.Contains(image.Spec.AcceptFormats, metal3_v1alpha1.ImageFormatInitRD) {
+		return infraEnv.Status.BootArtifacts.InitrdURL
+	}
+	return ""
+}
+
+func (r *PreprovisioningImageReconciler) handleImageUpdate(ctx context.Context, log logrus.FieldLogger, image *metal3_v1alpha1.PreprovisioningImage, infraEnv *aiv1beta1.InfraEnv) error {
+	bmh, err := r.getBMH(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	expectedURL := getExpectedImageURL(image, infraEnv)
+	imageUpdated := image.Status.ImageUrl != "" && image.Status.ImageUrl != expectedURL
+	log.Info("Setting images in PreprovisioningImage status")
+	err = r.patchImageStatus(ctx, log, image, func(img *metal3_v1alpha1.PreprovisioningImage) {
+		r.setImage(img, *infraEnv)
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("Images successfully set in PreprovisioningImage status")
+
+	if imageUpdated && bmh.Status.Provisioning.State != metal3_v1alpha1.StateProvisioned {
+		log.Info("Setting reboot annotation on BMH")
+		if err = r.setBMHRebootAnnotation(ctx, bmh); err != nil {
 			log.WithError(err).Error("failed to set BMH reboot annotation")
-			return ctrl.Result{}, err
+			return err
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 func initrdExtraKernelParams(infraEnv aiv1beta1.InfraEnv) string {
@@ -211,8 +242,7 @@ func initrdExtraKernelParams(infraEnv aiv1beta1.InfraEnv) string {
 	return strings.Join(params, " ")
 }
 
-func (r *PreprovisioningImageReconciler) setImage(image *metal3_v1alpha1.PreprovisioningImage, infraEnv aiv1beta1.InfraEnv) error {
-	r.Log.Infof("Updating PreprovisioningImage ImageUrl to: %s", infraEnv.Status.ISODownloadURL)
+func (r *PreprovisioningImageReconciler) setImage(image *metal3_v1alpha1.PreprovisioningImage, infraEnv aiv1beta1.InfraEnv) {
 	image.Status.Architecture = infraEnv.Spec.CpuArchitecture
 	if funk.Contains(image.Spec.AcceptFormats, metal3_v1alpha1.ImageFormatISO) {
 		r.Log.Infof("Updating PreprovisioningImage ImageUrl with ISO artifacts")
@@ -245,11 +275,10 @@ func (r *PreprovisioningImageReconciler) setImage(image *metal3_v1alpha1.Preprov
 	setImageCondition(generation, &image.Status,
 		metal3_v1alpha1.ConditionImageError, imageErrorStatus,
 		reason, message)
-
-	return nil
 }
 
 func setNotCreatedCondition(image *metal3_v1alpha1.PreprovisioningImage) {
+	clearImageStatus(image)
 	message := "Waiting for InfraEnv image to be created"
 	reason := imageConditionReason(strcase.ToCamel(message))
 	setImageCondition(image.GetGeneration(), &image.Status,
@@ -261,6 +290,7 @@ func setNotCreatedCondition(image *metal3_v1alpha1.PreprovisioningImage) {
 }
 
 func setCoolDownCondition(image *metal3_v1alpha1.PreprovisioningImage) {
+	clearImageStatus(image)
 	message := "Waiting for InfraEnv image to cool down"
 	reason := imageConditionReason(strcase.ToCamel(message))
 	setImageCondition(image.GetGeneration(), &image.Status,
@@ -273,6 +303,7 @@ func setCoolDownCondition(image *metal3_v1alpha1.PreprovisioningImage) {
 }
 
 func setUnsupportedFormatCondition(image *metal3_v1alpha1.PreprovisioningImage) {
+	clearImageStatus(image)
 	message := "Unsupported image format"
 	reason := imageConditionReason(strcase.ToCamel(message))
 	setImageCondition(image.GetGeneration(), &image.Status,
@@ -284,6 +315,7 @@ func setUnsupportedFormatCondition(image *metal3_v1alpha1.PreprovisioningImage) 
 }
 
 func setMismatchedArchCondition(image *metal3_v1alpha1.PreprovisioningImage, imageArch, infraArch string) {
+	clearImageStatus(image)
 	message := fmt.Sprintf("PreprovisioningImage CPU architecture (%s) does not match InfraEnv CPU architecture (%s)", imageArch, infraArch)
 	reason := imageConditionReason(archMismatchReason)
 	setImageCondition(image.GetGeneration(), &image.Status,
@@ -295,6 +327,7 @@ func setMismatchedArchCondition(image *metal3_v1alpha1.PreprovisioningImage, ima
 }
 
 func setIronicAgentIgnitionFailureCondition(image *metal3_v1alpha1.PreprovisioningImage, err error) {
+	clearImageStatus(image)
 	message := fmt.Sprintf("Could not add ironic agent to image: %s", err.Error())
 	reason := imageConditionReason("IronicAgentIgnitionUpdateFailure")
 	setImageCondition(image.GetGeneration(), &image.Status,
@@ -303,6 +336,14 @@ func setIronicAgentIgnitionFailureCondition(image *metal3_v1alpha1.Preprovisioni
 	setImageCondition(image.GetGeneration(), &image.Status,
 		metal3_v1alpha1.ConditionImageError, metav1.ConditionTrue,
 		reason, message)
+}
+
+func setInfraEnvNotAvailableCondition(image *metal3_v1alpha1.PreprovisioningImage) {
+	clearImageStatus(image)
+	message := fmt.Sprintf("InfraEnv %s/%s is not found or is being deleted", image.Labels[InfraEnvLabel], image.Namespace)
+	reason := imageConditionReason("InfraEnvNotAvailable")
+	setImageCondition(image.GetGeneration(), &image.Status, metal3_v1alpha1.ConditionImageReady, metav1.ConditionFalse, reason, message)
+	setImageCondition(image.GetGeneration(), &image.Status, metal3_v1alpha1.ConditionImageError, metav1.ConditionFalse, reason, message)
 }
 
 func setImageCondition(generation int64, status *metal3_v1alpha1.PreprovisioningImageStatus,
@@ -351,49 +392,223 @@ func (r *PreprovisioningImageReconciler) findInfraEnvForPreprovisioningImage(ctx
 }
 
 func (r *PreprovisioningImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	mapInfraEnvPPI := r.mapInfraEnvPPI()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&metal3_v1alpha1.PreprovisioningImage{}).
-		Watches(&metal3_v1alpha1.PreprovisioningImage{}, &handler.EnqueueRequestForObject{}).
-		Watches(&aiv1beta1.InfraEnv{}, handler.EnqueueRequestsFromMapFunc(mapInfraEnvPPI)).
+		Watches(&aiv1beta1.InfraEnv{}, handler.EnqueueRequestsFromMapFunc(r.mapInfraEnvPPI)).
+		Watches(&metal3_v1alpha1.BareMetalHost{}, handler.EnqueueRequestsFromMapFunc(mapBMHtoPPI)).
 		Complete(r)
 }
 
-func (r *PreprovisioningImageReconciler) mapInfraEnvPPI() func(ctx context.Context, a client.Object) []reconcile.Request {
-	mapInfraEnvPPI := func(ctx context.Context, a client.Object) []reconcile.Request {
-		log := logutil.FromContext(ctx, r.Log).WithFields(
-			logrus.Fields{
-				"infra_env":           a.GetName(),
-				"infra_env_namespace": a.GetNamespace(),
-			})
-		infraEnv := &aiv1beta1.InfraEnv{}
+func mapBMHtoPPI(ctx context.Context, a client.Object) []reconcile.Request {
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Namespace: a.GetNamespace(),
+			Name:      a.GetName(),
+		},
+	}}
+}
 
-		if err := r.Get(ctx, types.NamespacedName{Name: a.GetName(), Namespace: a.GetNamespace()}, infraEnv); err != nil {
-			return []reconcile.Request{}
-		}
+func (r *PreprovisioningImageReconciler) mapInfraEnvPPI(ctx context.Context, a client.Object) []reconcile.Request {
+	log := logutil.FromContext(ctx, r.Log).WithFields(
+		logrus.Fields{
+			"infra_env":           a.GetName(),
+			"infra_env_namespace": a.GetNamespace(),
+		})
+	infraEnv := &aiv1beta1.InfraEnv{}
 
-		images, err := r.findPreprovisioningImagesByInfraEnv(ctx, infraEnv)
-		if err != nil {
-			log.WithError(err).Infof("failed getting InfraEnv related preprovisioningImages %s/%s ", a.GetNamespace(), a.GetName())
-			return []reconcile.Request{}
-		}
-		if len(images) == 0 {
-			return []reconcile.Request{}
-		}
-
-		reconcileRequests := []reconcile.Request{}
-
-		for i := range images {
-			reconcileRequests = append(reconcileRequests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: images[i].Namespace,
-					Name:      images[i].Name,
-				},
-			})
-		}
-		return reconcileRequests
+	if err := r.Get(ctx, types.NamespacedName{Name: a.GetName(), Namespace: a.GetNamespace()}, infraEnv); err != nil {
+		return []reconcile.Request{}
 	}
-	return mapInfraEnvPPI
+
+	images, err := r.findPreprovisioningImagesByInfraEnv(ctx, infraEnv)
+	if err != nil {
+		log.WithError(err).Infof("failed getting InfraEnv related preprovisioningImages %s/%s ", a.GetNamespace(), a.GetName())
+		return []reconcile.Request{}
+	}
+	if len(images) == 0 {
+		return []reconcile.Request{}
+	}
+
+	reconcileRequests := []reconcile.Request{}
+
+	for i := range images {
+		reconcileRequests = append(reconcileRequests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: images[i].Namespace,
+				Name:      images[i].Name,
+			},
+		})
+	}
+	return reconcileRequests
+}
+
+func (r *PreprovisioningImageReconciler) getIronicAgentImageFromUserOverride(log logrus.FieldLogger, infraEnv *aiv1beta1.InfraEnv) string {
+	ironicAgentImage, ok := infraEnv.GetAnnotations()[ironicAgentImageOverrideAnnotation]
+	if ok && ironicAgentImage != "" {
+		log.Infof("Using override ironic agent image (%s) from infraEnv", ironicAgentImage)
+		return ironicAgentImage
+	}
+	return ""
+}
+
+func (r *PreprovisioningImageReconciler) imageMatchesInfraenvArch(log logrus.FieldLogger, infraEnvInternal *common.InfraEnv, ironicImage string) bool {
+	if ironicImage == "" {
+		return false
+	}
+
+	architectures, err := r.OcRelease.GetImageArchitecture(log, ironicImage, infraEnvInternal.PullSecret)
+	if err != nil {
+		log.WithError(err).Info("Failed to get image architecture for ironic agent image")
+		return false
+	}
+
+	matches := funk.Contains(architectures, infraEnvInternal.CPUArchitecture)
+	if !matches {
+		log.Infof("CPU architecture (%v) of Ironic agent image (%s) does not match infraEnv arch (%s)",
+			architectures,
+			ironicImage,
+			infraEnvInternal.CPUArchitecture)
+	}
+	return matches
+}
+
+func (r *PreprovisioningImageReconciler) getIronicAgentImageFromHUB(ctx context.Context, log logrus.FieldLogger, infraEnvInternal *common.InfraEnv) string {
+	image := r.hubIronicAgentImage
+	architectures := r.hubReleaseArchitectures
+	if image == "" {
+		cv := &configv1.ClusterVersion{}
+		err := r.Get(ctx, types.NamespacedName{Name: "version"}, cv)
+		if err != nil {
+			log.WithError(err).Warningf("Failed to get ClusterVersion")
+			return ""
+		}
+		architectures, err = r.OcRelease.GetReleaseArchitecture(log, cv.Status.Desired.Image, r.ReleaseImageMirror, infraEnvInternal.PullSecret)
+		if err != nil {
+			log.WithError(err).Warningf("Failed to get release architecture for (%s)", cv.Status.Desired.Image)
+			return ""
+		}
+		image, err = r.OcRelease.GetIronicAgentImage(log, cv.Status.Desired.Image, r.ReleaseImageMirror, infraEnvInternal.PullSecret)
+		if err != nil {
+			log.WithError(err).Warningf("Failed to get ironic agent image from release (%s)", cv.Status.Desired.Image)
+			return ""
+		}
+		r.hubIronicAgentImage = image
+		r.hubReleaseArchitectures = architectures
+		log.Infof("Caching hub ironic agent image %s for architectures %v", image, architectures)
+	}
+
+	if !funk.Contains(architectures, infraEnvInternal.CPUArchitecture) {
+		log.Warningf("Release image architectures %v do not match infraEnv architecture %s", architectures, infraEnvInternal.CPUArchitecture)
+		return ""
+	}
+
+	log.Infof("Setting ironic agent image (%s) from HUB cluster", image)
+	return image
+}
+
+func (r *PreprovisioningImageReconciler) getIronicAgentImageFromClusterImageSet(ctx context.Context, log logrus.FieldLogger, infraEnvInternal *common.InfraEnv) string {
+	cv := &configv1.ClusterVersion{}
+	err := r.Get(ctx, types.NamespacedName{Name: "version"}, cv)
+	if err != nil {
+		log.WithError(err).Warnf("Failed to get ClusterVersion for ClusterImageSet query")
+		return ""
+	}
+
+	hubVersion := cv.Status.Desired.Version
+	log.Infof("Querying ClusterImageSet for hub version %s and spoke architecture %s", hubVersion, infraEnvInternal.CPUArchitecture)
+
+	releaseImage, err := r.VersionsHandler.GetReleaseImage(ctx, hubVersion, infraEnvInternal.CPUArchitecture, infraEnvInternal.PullSecret)
+	if err != nil {
+		log.WithError(err).Warnf("Failed to get release image from ClusterImageSet for version %s and arch %s", hubVersion, infraEnvInternal.CPUArchitecture)
+		return ""
+	}
+
+	if releaseImage == nil || releaseImage.URL == nil || *releaseImage.URL == "" {
+		log.Warnf("No release image found in ClusterImageSet for version %s and arch %s", hubVersion, infraEnvInternal.CPUArchitecture)
+		return ""
+	}
+
+	ironicAgentImage, err := r.OcRelease.GetIronicAgentImage(log, *releaseImage.URL, r.ReleaseImageMirror, infraEnvInternal.PullSecret)
+	if err != nil {
+		log.WithError(err).Warnf("Failed to extract ironic agent image from release %s", *releaseImage.URL)
+		return ""
+	}
+
+	log.Infof("Found ironic agent image (%s) from ClusterImageSet for spoke arch %s", ironicAgentImage, infraEnvInternal.CPUArchitecture)
+	return ironicAgentImage
+}
+
+func (r *PreprovisioningImageReconciler) getIronicAgentDefaultImage(log logrus.FieldLogger, infraEnvInternal *common.InfraEnv) string {
+	var ironicAgentImage string
+	if infraEnvInternal.CPUArchitecture == common.ARM64CPUArchitecture {
+		ironicAgentImage = r.Config.BaremetalIronicAgentImageForArm
+	} else {
+		ironicAgentImage = r.Config.BaremetalIronicAgentImage
+	}
+
+	log.Infof("Setting default ironic agent image (%s)", ironicAgentImage)
+	return ironicAgentImage
+}
+
+// getIronicAgentImageByPriority returns the ironic agent image based on priority order
+// Priority 1: User override annotation
+// Priority 2: ICC config (if architecture matches)
+// Priority 3: Hub release image (if architectures matches OR using a multi release image)
+// Priority 4: ClusterImageSet query
+// Priority 5: Default image (lowest priority)
+func (r *PreprovisioningImageReconciler) getIronicAgentImageByPriority(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	infraEnv *aiv1beta1.InfraEnv,
+	infraEnvInternal *common.InfraEnv,
+	iccIronicAgentImage string,
+) string {
+	if image := r.getIronicAgentImageFromUserOverride(log, infraEnv); image != "" {
+		return image
+	}
+
+	if iccIronicAgentImage != "" && r.imageMatchesInfraenvArch(log, infraEnvInternal, iccIronicAgentImage) {
+		log.Debugf("Setting ironic agent image (%s) from ICC config", iccIronicAgentImage)
+		return iccIronicAgentImage
+	}
+
+	if image := r.getIronicAgentImageFromHUB(ctx, log, infraEnvInternal); image != "" {
+		return image
+	}
+
+	if image := r.getIronicAgentImageFromClusterImageSet(ctx, log, infraEnvInternal); image != "" {
+		return image
+	}
+
+	return r.getIronicAgentDefaultImage(log, infraEnvInternal)
+}
+
+func (r *PreprovisioningImageReconciler) getIronicConfig(ctx context.Context, log logrus.FieldLogger, infraEnv *aiv1beta1.InfraEnv, infraEnvInternal *common.InfraEnv) (*ICCConfig, error) {
+	iccConfig, err := r.BMOUtils.getICCConfig(ctx)
+	if err != nil {
+		log.WithError(err).Info("ICC configuration is not available")
+	}
+
+	if iccConfig != nil {
+		log.Debugf("Using ironic URLs from ICC config (Base: %s, Inspector: %s)", iccConfig.IronicBaseURL, iccConfig.IronicInspectorBaseUrl)
+	} else {
+		iccConfig = &ICCConfig{}
+		if err := r.fillIronicServiceURLs(ctx, infraEnv, infraEnvInternal, iccConfig); err != nil {
+			return nil, err
+		}
+	}
+
+	iccConfig.IronicAgentImage = r.getIronicAgentImageByPriority(ctx, log, infraEnv, infraEnvInternal, iccConfig.IronicAgentImage)
+
+	if iccConfig.IronicAgentImage == "" {
+		return nil, fmt.Errorf("Failed to determine ironic config")
+	}
+
+	log.Debugf("Ironic Agent Image is (%s) Ironic URL is (%s) Inspector URL is (%s)",
+		iccConfig.IronicAgentImage,
+		iccConfig.IronicBaseURL,
+		iccConfig.IronicInspectorBaseUrl)
+	return iccConfig, nil
 }
 
 // AddIronicAgentToInfraEnv updates the infra-env in the database with the ironic agent ignition config if required
@@ -409,35 +624,14 @@ func (r *PreprovisioningImageReconciler) AddIronicAgentToInfraEnv(ctx context.Co
 		log.WithError(err).Error("failed to get corresponding infraEnv")
 		return false, err
 	}
-	ironicAgentImage, ok := infraEnv.GetAnnotations()[ironicAgentImageOverrideAnnotation]
-	if !ok || ironicAgentImage == "" {
-		ironicAgentImage, err = r.getIronicAgentImageByRelease(ctx, log, infraEnvInternal)
-		if err != nil {
-			log.WithError(err).Warningf("Failed to get ironic agent image by release for infraEnv: %s", infraEnv.Name)
-		}
-	} else {
-		log.Infof("Using override ironic agent image (%s) for infraEnv %s", ironicAgentImage, infraEnv.Name)
-	}
 
-	// if ironicAgentImage can't be found by version use the default
-	if ironicAgentImage == "" {
-		if infraEnvInternal.CPUArchitecture == common.ARM64CPUArchitecture {
-			ironicAgentImage = r.Config.BaremetalIronicAgentImageForArm
-		} else {
-			ironicAgentImage = r.Config.BaremetalIronicAgentImage
-		}
-		log.Infof("Setting default ironic agent image (%s) for infraEnv %s", ironicAgentImage, infraEnv.Name)
-	}
-
-	ironicServiceURL, inspectorURL, err := r.getIronicServiceURLs(ctx, infraEnvInternal)
+	iccConfig, err := r.getIronicConfig(ctx, log, infraEnv, infraEnvInternal)
 	if err != nil {
-		log.WithError(err).Error("failed to get IronicServiceURLs")
+		log.WithError(err).Errorf("Failed to get Ironic configuration")
 		return false, err
 	}
-	r.Log.Infof("Ironic URL is: %s", ironicServiceURL)
-	r.Log.Infof("Inspector URL is: %s", inspectorURL)
 
-	conf, err := ignition.GenerateIronicConfig(ironicServiceURL, inspectorURL, *infraEnvInternal, ironicAgentImage)
+	conf, err := ignition.GenerateIronicConfig(iccConfig.IronicBaseURL, iccConfig.IronicInspectorBaseUrl, *infraEnvInternal, iccConfig.IronicAgentImage)
 	if err != nil {
 		log.WithError(err).Error("failed to generate Ironic ignition config")
 		return false, err
@@ -445,7 +639,21 @@ func (r *PreprovisioningImageReconciler) AddIronicAgentToInfraEnv(ctx context.Co
 
 	updated := false
 	if string(conf) != infraEnvInternal.InternalIgnitionConfigOverride {
-		_, err = r.Installer.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{InfraEnvID: *infraEnvInternal.ID, InfraEnvUpdateParams: &models.InfraEnvUpdateParams{}}, swag.String(string(conf)))
+		log.Infof("Updating Ironic config: Agent Image (%s) Ironic URL (%s) Inspector URL (%s)",
+			iccConfig.IronicAgentImage,
+			iccConfig.IronicBaseURL,
+			iccConfig.IronicInspectorBaseUrl)
+
+		var mirrorRegistryConfiguration *common.MirrorRegistryConfiguration
+		if infraEnvInternal.MirrorRegistryConfiguration != "" {
+			mirrorRegistryConfiguration, err = r.processMirrorRegistryConfig(ctx, log, infraEnv)
+			if err != nil {
+				log.WithError(err).Error("failed to process mirror registry config")
+				return false, err
+			}
+		}
+
+		_, err = r.Installer.UpdateInfraEnvInternal(ctx, installer.UpdateInfraEnvParams{InfraEnvID: *infraEnvInternal.ID, InfraEnvUpdateParams: &models.InfraEnvUpdateParams{}}, swag.String(string(conf)), mirrorRegistryConfiguration)
 		if err != nil {
 			return false, err
 		}
@@ -456,28 +664,33 @@ func (r *PreprovisioningImageReconciler) AddIronicAgentToInfraEnv(ctx context.Co
 		setAnnotation(&infraEnv.ObjectMeta, EnableIronicAgentAnnotation, "true")
 		if err := r.Client.Update(ctx, infraEnv); err != nil {
 			// Just warn here if the update fails as this annotation is just informational
-			log.WithError(err).Warnf("failed to set %s annotation on infraEnv %s", EnableIronicAgentAnnotation, infraEnv.Name)
+			log.WithError(err).Warnf("failed to set %s annotation on infraEnv", EnableIronicAgentAnnotation)
 		}
 	}
 
 	return updated, nil
 }
 
-func (r *PreprovisioningImageReconciler) getIPFamilyForInfraEnv(ctx context.Context, infraEnv *common.InfraEnv) (v4 bool, v6 bool, err error) {
-	if infraEnv.ClusterID == "" {
+func (r *PreprovisioningImageReconciler) getIPFamilyForInfraEnv(ctx context.Context, infraEnv *aiv1beta1.InfraEnv, internalInfraEnv *common.InfraEnv) (v4 bool, v6 bool, err error) {
+	ipFamilyAnnotation := infraEnv.GetAnnotations()[infraEnvIPFamilyAnnotation]
+	if ipFamilyAnnotation != "" {
+		families := strings.Split(ipFamilyAnnotation, ",")
+		return funk.Contains(families, ipv4Family), funk.Contains(families, ipv6Family), nil
+	}
+	if internalInfraEnv.ClusterID == "" {
 		return false, false, fmt.Errorf("cannot find address family for non-bound infraEnv")
 	}
-	cluster, err := r.Installer.GetClusterInternal(ctx, installer.V2GetClusterParams{ClusterID: infraEnv.ClusterID})
+	cluster, err := r.Installer.GetClusterInternal(ctx, installer.V2GetClusterParams{ClusterID: internalInfraEnv.ClusterID})
 	if err != nil {
 		return false, false, err
 	}
-	return network.GetAddressFamilies(cluster.MachineNetworks)
+	return network.GetConfiguredAddressFamilies(cluster)
 }
 
-func (r *PreprovisioningImageReconciler) getIronicServiceURLs(ctx context.Context, infraEnv *common.InfraEnv) (string, string, error) {
+func (r *PreprovisioningImageReconciler) fillIronicServiceURLs(ctx context.Context, infraEnv *aiv1beta1.InfraEnv, internalInfraEnv *common.InfraEnv, iccConfig *ICCConfig) error {
 	ironicIPs, inspectorIPs, err := r.BMOUtils.GetIronicIPs()
 	if err != nil {
-		return "", "", err
+		return err
 	}
 
 	// default to the first IP returned
@@ -486,48 +699,23 @@ func (r *PreprovisioningImageReconciler) getIronicServiceURLs(ctx context.Contex
 	inspectorURL := getUrlFromIP(inspectorIPs[0])
 
 	if len(ironicIPs) > 1 {
-		v4, v6, err := r.getIPFamilyForInfraEnv(ctx, infraEnv)
+		v4, v6, err := r.getIPFamilyForInfraEnv(ctx, infraEnv, internalInfraEnv)
+		r.Log.Debugf("infraEnv IP families: v4: %t, v6: %t", v4, v6)
 		if err != nil {
-			r.Log.WithError(err).Warnf("failed to determine IP family for infraEnv %s", infraEnv.ID)
+			r.Log.WithError(err).Warnf("failed to determine IP family for infraEnv %s", internalInfraEnv.ID)
 		} else if !v4 && v6 {
 			// spoke is single stack v6 so take v6 hub address
 			ironicURL = getUrlFromIP(ironicIPs[1])
 			inspectorURL = getUrlFromIP(inspectorIPs[1])
 		}
 	}
-	return ironicURL, inspectorURL, nil
+
+	iccConfig.IronicBaseURL = ironicURL
+	iccConfig.IronicInspectorBaseUrl = inspectorURL
+	return nil
 }
 
-func (r *PreprovisioningImageReconciler) getIronicAgentImageByRelease(ctx context.Context, log logrus.FieldLogger, infraEnv *common.InfraEnv) (string, error) {
-	image := r.hubIronicAgentImage
-	architectures := r.hubReleaseArchitectures
-	if image == "" {
-		cv := &configv1.ClusterVersion{}
-		if err := r.Get(ctx, types.NamespacedName{Name: "version"}, cv); err != nil {
-			return "", err
-		}
-		var err error
-		architectures, err = r.OcRelease.GetReleaseArchitecture(log, cv.Status.Desired.Image, r.ReleaseImageMirror, infraEnv.PullSecret)
-		if err != nil {
-			return "", err
-		}
-		image, err = r.OcRelease.GetIronicAgentImage(log, cv.Status.Desired.Image, r.ReleaseImageMirror, infraEnv.PullSecret)
-		if err != nil {
-			return "", err
-		}
-		r.hubIronicAgentImage = image
-		r.hubReleaseArchitectures = architectures
-		log.Infof("Caching hub ironic agent image %s for architectures %v", image, architectures)
-	}
-
-	if !funk.Contains(architectures, infraEnv.CPUArchitecture) {
-		return "", fmt.Errorf("release image architectures %v do not match infraEnv architecture %s", architectures, infraEnv.CPUArchitecture)
-	}
-
-	return image, nil
-}
-
-func (r *PreprovisioningImageReconciler) setBMHRebootAnnotation(ctx context.Context, image *metal3_v1alpha1.PreprovisioningImage) error {
+func (r *PreprovisioningImageReconciler) getBMH(ctx context.Context, image *metal3_v1alpha1.PreprovisioningImage) (*metal3_v1alpha1.BareMetalHost, error) {
 	bmhKey := types.NamespacedName{Namespace: image.Namespace}
 	for _, owner := range image.GetOwnerReferences() {
 		if owner.Kind == "BareMetalHost" {
@@ -536,19 +724,112 @@ func (r *PreprovisioningImageReconciler) setBMHRebootAnnotation(ctx context.Cont
 	}
 
 	if bmhKey.Name == "" {
-		return fmt.Errorf("failed to find BMH owner for preprovisioningimage")
+		return nil, fmt.Errorf("failed to find BMH owner for preprovisioningimage")
 	}
 
 	bmh := &metal3_v1alpha1.BareMetalHost{}
 	if err := r.Get(ctx, bmhKey, bmh); err != nil {
-		return errors.Wrapf(err, "failed to get owning bmh %s", bmhKey)
+		return nil, errors.Wrapf(err, "failed to get owning bmh %s", bmhKey)
 	}
+	return bmh, nil
+}
 
+func (r *PreprovisioningImageReconciler) setBMHRebootAnnotation(ctx context.Context, bmh *metal3_v1alpha1.BareMetalHost) error {
 	patch := client.MergeFrom(bmh.DeepCopy())
 	setAnnotation(&bmh.ObjectMeta, "reboot.metal3.io", "{\"force\": true}")
+	r.Log.Infof("Setting reboot annotation on BMH %s", bmh.Name)
 	if err := r.Patch(ctx, bmh, patch); err != nil {
-		return errors.Wrapf(err, "failed to add reboot annotation to BMH %s", bmhKey)
+		return errors.Wrapf(err, "failed to add reboot annotation to BMH %s/%s", bmh.Namespace, bmh.Name)
 	}
 
 	return nil
+}
+
+// ensurePreprovisioningImageFinalizer adds a finalizer to the PreprovisioningImage
+func (r *PreprovisioningImageReconciler) ensurePreprovisioningImageFinalizer(ctx context.Context, log logrus.FieldLogger, image *metal3_v1alpha1.PreprovisioningImage) (ctrl.Result, error) {
+	controllerutil.AddFinalizer(image, PreprovisioningImageFinalizerName)
+	if err := r.Update(ctx, image); err != nil {
+		log.WithError(err).Errorf("failed to add finalizer %s to PreprovisioningImage %s/%s", PreprovisioningImageFinalizerName, image.Namespace, image.Name)
+		return ctrl.Result{Requeue: true}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// handlePreprovisioningImageDeletion handles the deletion of a PreprovisioningImage by checking if any BMHs
+// with automated cleaning enabled still reference it.
+func (r *PreprovisioningImageReconciler) handlePreprovisioningImageDeletion(ctx context.Context, log logrus.FieldLogger, image *metal3_v1alpha1.PreprovisioningImage) (ctrl.Result, error) {
+	if !funk.ContainsString(image.GetFinalizers(), PreprovisioningImageFinalizerName) {
+		// Allow deletion of the PreprovisioningImage if the finalizer is not present
+		return ctrl.Result{}, nil
+	}
+
+	// Get the BMH that owns this PreprovisioningImage
+	bmh, err := r.getBMH(ctx, image)
+	if err != nil {
+		if client.IgnoreNotFound(err) == nil || strings.Contains(err.Error(), "failed to find BMH owner") {
+			// BMH not found or this preprovisioningimage is not owned by a BMH, allow deletion of the PreprovisioningImage
+			log.Info("BMH not found, removing PreprovisioningImage finalizer")
+			controllerutil.RemoveFinalizer(image, PreprovisioningImageFinalizerName)
+			if err = r.Update(ctx, image); err != nil {
+				log.WithError(err).Errorf("failed to remove finalizer %s from PreprovisioningImage %s/%s", PreprovisioningImageFinalizerName, image.Namespace, image.Name)
+				return ctrl.Result{Requeue: true}, err
+			}
+			return ctrl.Result{}, nil
+		}
+		log.WithError(err).Error("failed to get BMH for PreprovisioningImage")
+		return ctrl.Result{RequeueAfter: longerRequeueAfterOnError}, err
+	}
+
+	// PreprovisioningImage should wait for a BMH with automated cleaning enabled to be deleted or finish deprovisioning
+	if bmh.Spec.AutomatedCleaningMode != metal3_v1alpha1.CleaningModeDisabled {
+		if bmh.DeletionTimestamp.IsZero() {
+			log.Infof("Cannot delete PreprovisioningImage yet: BMH %s/%s with automatedCleaningMode=%s is not being deleted",
+				bmh.Namespace, bmh.Name, bmh.Spec.AutomatedCleaningMode)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		// already deprovisioned is true when the BMH is either in state powering off before delete or deleting
+		alreadyDeprovisioned := funk.Contains([]metal3_v1alpha1.ProvisioningState{metal3_v1alpha1.StatePoweringOffBeforeDelete, metal3_v1alpha1.StateDeleting}, bmh.Status.Provisioning.State)
+		if !alreadyDeprovisioned {
+			log.Infof("Cannot delete PreprovisioningImage yet: BMH %s/%s with automatedCleaningMode=%s has not finished deprovisioning yet. Current state: %s",
+				bmh.Namespace, bmh.Name, bmh.Spec.AutomatedCleaningMode, bmh.Status.Provisioning.State)
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
+	// Safe to delete, remove finalizer
+	log.Info("Removing finalizer from PreprovisioningImage")
+	controllerutil.RemoveFinalizer(image, PreprovisioningImageFinalizerName)
+	if err := r.Update(ctx, image); err != nil {
+		log.WithError(err).Errorf("failed to remove finalizer %s from PreprovisioningImage %s/%s", PreprovisioningImageFinalizerName, image.Namespace, image.Name)
+		return ctrl.Result{Requeue: true}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// processMirrorRegistryConfig retrieves the mirror registry configuration from the referenced ConfigMap
+func (r *PreprovisioningImageReconciler) processMirrorRegistryConfig(ctx context.Context, log logrus.FieldLogger, infraEnv *aiv1beta1.InfraEnv) (*common.MirrorRegistryConfiguration, error) {
+	mirrorRegistryConfiguration, userTomlConfigMap, err := mirrorregistry.ProcessMirrorRegistryConfig(ctx, log, r.Client, infraEnv.Spec.MirrorRegistryRef)
+	if err != nil {
+		return nil, err
+	}
+	if mirrorRegistryConfiguration != nil {
+		namespacedName := types.NamespacedName{Name: infraEnv.Spec.MirrorRegistryRef.Name, Namespace: infraEnv.Spec.MirrorRegistryRef.Namespace}
+		if err = ensureConfigMapIsLabelled(ctx, r.Client, userTomlConfigMap, namespacedName); err != nil {
+			return nil, errors.Wrapf(err, "Unable to mark infraenv mirror configmap for backup")
+		}
+	}
+
+	return mirrorRegistryConfiguration, nil
+}
+
+// patchImageStatus updates the PreprovisioningImage status using the given condition setter function
+func (r *PreprovisioningImageReconciler) patchImageStatus(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	image *metal3_v1alpha1.PreprovisioningImage,
+	conditionSetter func(*metal3_v1alpha1.PreprovisioningImage),
+) error {
+	patch := client.MergeFrom(image.DeepCopy())
+	conditionSetter(image)
+	return r.Status().Patch(ctx, image, patch)
 }

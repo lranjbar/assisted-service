@@ -23,11 +23,11 @@ const (
 
 // AgentValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
 type AgentValidatingAdmissionHook struct {
-	decoder *admission.Decoder
+	decoder admission.Decoder
 }
 
 // NewAgentValidatingAdmissionHook constructs a new NewAgentValidatingAdmissionHook
-func NewAgentValidatingAdmissionHook(decoder *admission.Decoder) *AgentValidatingAdmissionHook {
+func NewAgentValidatingAdmissionHook(decoder admission.Decoder) *AgentValidatingAdmissionHook {
 	return &AgentValidatingAdmissionHook{decoder: decoder}
 }
 
@@ -85,6 +85,10 @@ func (a *AgentValidatingAdmissionHook) Validate(admissionSpec *admissionv1.Admis
 
 	contextLogger.Info("Validating request")
 
+	if admissionSpec.Operation == admissionv1.Create {
+		return a.validateCreate(admissionSpec)
+	}
+
 	if admissionSpec.Operation == admissionv1.Update {
 		return a.validateUpdate(admissionSpec)
 	}
@@ -127,6 +131,50 @@ func (a *AgentValidatingAdmissionHook) shouldValidate(admissionSpec *admissionv1
 	return true
 }
 
+// validateCreate specifically validates create operations for Agent objects.
+func (a *AgentValidatingAdmissionHook) validateCreate(admissionSpec *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	contextLogger := log.WithFields(log.Fields{
+		"operation": admissionSpec.Operation,
+		"group":     admissionSpec.Resource.Group,
+		"version":   admissionSpec.Resource.Version,
+		"resource":  admissionSpec.Resource.Resource,
+		"method":    "validateCreate",
+	})
+
+	newObject := &v1beta1.Agent{}
+	if err := a.decoder.DecodeRaw(admissionSpec.Object, newObject); err != nil {
+		contextLogger.Errorf("Failed unmarshaling Object: %v", err.Error())
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: err.Error(),
+			},
+		}
+	}
+
+	contextLogger.Data["object.Name"] = newObject.Name
+
+	// Ensure that InstallationDiskID and InstallationDiskPath are not both set
+	if newObject.Spec.InstallationDiskID != "" && newObject.Spec.InstallationDiskPath != "" {
+		message := "Either InstallationDiskID or InstallationDiskPath can be set, not both."
+		contextLogger.Infof("Failed validation: %v", message)
+		contextLogger.Error(message)
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: message,
+			},
+		}
+	}
+
+	contextLogger.Info("Successful validation")
+	return &admissionv1.AdmissionResponse{
+		Allowed: true,
+	}
+}
+
 // validateUpdate specifically validates update operations for Agent objects.
 func (a *AgentValidatingAdmissionHook) validateUpdate(admissionSpec *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
 	contextLogger := log.WithFields(log.Fields{
@@ -164,16 +212,23 @@ func (a *AgentValidatingAdmissionHook) validateUpdate(admissionSpec *admissionv1
 		}
 	}
 
-	if !areClusterRefsEqual(oldObject.Spec.ClusterDeploymentName, newObject.Spec.ClusterDeploymentName) {
-		installingStatuses := []string{
-			models.HostStatusPreparingForInstallation,
-			models.HostStatusPreparingFailed,
-			models.HostStatusPreparingSuccessful,
-			models.HostStatusInstalling,
-			models.HostStatusInstallingInProgress,
-			models.HostStatusInstallingPendingUserAction,
+	// Ensure that InstallationDiskID and InstallationDiskPath are not both set
+	if newObject.Spec.InstallationDiskID != "" && newObject.Spec.InstallationDiskPath != "" {
+		message := "Either InstallationDiskID or InstallationDiskPath can be set, not both."
+		contextLogger.Infof("Failed validation: %v", message)
+		contextLogger.Error(message)
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: message,
+			},
 		}
-		if funk.ContainsString(installingStatuses, newObject.Status.DebugInfo.State) {
+	}
+
+	if !areClusterRefsEqual(oldObject.Spec.ClusterDeploymentName, newObject.Spec.ClusterDeploymentName) {
+		if !isClusterRefChangeAllowed(newObject.Spec.ClusterDeploymentName, newObject.Status.DebugInfo.State, newObject.Status.Kind) {
+			// Fail validation only if the Cluster Deployment is changed to a different cluster or if the host is not day-2
 			message := "Attempted to change Spec.ClusterDeploymentName which is immutable during Agent installation."
 			contextLogger.Infof("Failed validation: %v", message)
 			contextLogger.Error(message)
@@ -192,4 +247,23 @@ func (a *AgentValidatingAdmissionHook) validateUpdate(admissionSpec *admissionv1
 	return &admissionv1.AdmissionResponse{
 		Allowed: true,
 	}
+}
+
+// Cluster Reference change is only allowed when:
+// 1. The host is not installing
+// 2. The host is day-2 and the new cluster reference is nil (aka unset)
+func isClusterRefChangeAllowed(clusterRef *v1beta1.ClusterReference, currentState string, hostKind string) bool {
+	installingStatuses := []string{
+		models.HostStatusPreparingForInstallation,
+		models.HostStatusPreparingFailed,
+		models.HostStatusPreparingSuccessful,
+		models.HostStatusInstalling,
+		models.HostStatusInstallingInProgress,
+		models.HostStatusInstallingPendingUserAction,
+	}
+	if !funk.ContainsString(installingStatuses, currentState) {
+		return true
+	}
+
+	return hostKind == models.HostKindAddToExistingClusterHost && clusterRef == nil
 }

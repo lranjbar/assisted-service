@@ -68,11 +68,13 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *validationConte
 	validationsOutput := make(ValidationsStatus)
 	var err error
 	var ignoredValidations []string
+	hasPerClusterOverride := false
 	if c.cluster != nil {
 		ignoredValidations, err = common.DeserializeJSONList(c.cluster.IgnoredHostValidations)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, fmt.Sprintf("Unable to deserialize ignored host validations for cluster %s", string(*c.cluster.ID)))
 		}
+		hasPerClusterOverride = c.cluster.IgnoredHostValidations != ""
 	}
 	for _, v := range r.validations {
 
@@ -88,7 +90,7 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *validationConte
 
 		var st ValidationStatus
 		var message string
-		if r.disabledHostValidations.IsDisabled(v.id) {
+		if !hasPerClusterOverride && r.disabledHostValidations.IsDisabled(v.id) {
 			st = ValidationDisabled
 			message = validationDisabledByConfiguration
 			conditions[v.id.String()] = true
@@ -118,7 +120,7 @@ func (r *refreshPreprocessor) preprocess(ctx context.Context, c *validationConte
 
 	if c.infraEnv == nil {
 		// Validate operators
-		results, err := r.operatorsApi.ValidateHost(context.TODO(), c.cluster, c.host)
+		results, err := r.operatorsApi.ValidateHost(ctx, c.cluster, c.host)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -176,6 +178,14 @@ func newValidations(v *validator) []validation {
 			condition: v.hasInventory,
 		},
 		{
+			id:        InventoryNotPartiallyTruncated,
+			condition: v.inventoryNotPartiallyTruncated,
+		},
+		{
+			id:        InventoryNotFullyTruncated,
+			condition: v.inventoryNotFullyTruncated,
+		},
+		{
 			id:        HasMinCPUCores,
 			condition: v.hasMinCpuCores,
 		},
@@ -218,6 +228,10 @@ func newValidations(v *validator) []validation {
 		{
 			id:        BelongsToMajorityGroup,
 			condition: v.belongsToMajorityGroup,
+		},
+		{
+			id:        IsMtuValid,
+			condition: v.isMtuValid,
 		},
 		{
 			id:        IsPlatformNetworkSettingsValid,
@@ -309,6 +323,10 @@ func newValidations(v *validator) []validation {
 		{
 			id:        NoIPCollisionsInNetwork,
 			condition: v.noIPCollisionsInNetwork,
+		},
+		{
+			id:        NoIscsiNicBelongsToMachineCidr,
+			condition: v.noIscsiNicBelongsToMachineCidr,
 		},
 	}
 }

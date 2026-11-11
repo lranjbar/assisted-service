@@ -31,9 +31,13 @@ import (
 
 var resetLogsField = []interface{}{"logs_info", "", "controller_logs_started_at", strfmt.DateTime(time.Time{}), "controller_logs_collected_at", strfmt.DateTime(time.Time{})}
 var resetProgressFields = []interface{}{"progress_finalizing_stage_percentage", 0, "progress_installing_stage_percentage", 0,
-	"progress_preparing_for_installation_stage_percentage", 0, "progress_total_percentage", 0}
+	"progress_preparing_for_installation_stage_percentage", 0, "progress_total_percentage", 0,
+	"progress_finalizing_stage_timed_out", false,
+	"progress_finalizing_stage", "", "progress_finalizing_stage_started_at", strfmt.DateTime(time.Time{})}
 
 var resetFields = append(append(resetProgressFields, resetLogsField...), "openshift_cluster_id", "")
+
+var resetInstallationPreparationStatusFields = []interface{}{"last_installation_preparation_status", models.LastInstallationPreparationStatusNotStarted, "last_installation_preparation_reason", constants.InstallationPreparationReasonNotPerformed}
 
 type transitionHandler struct {
 	log                 logrus.FieldLogger
@@ -72,6 +76,46 @@ type TransitionHandler interface {
 	PostRefreshFinalizingStageSoftTimedOut(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error
 	SoftTimeoutsEnabled(_ stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error)
 	FinalizingStageTimeoutMinutes(sCluster *stateCluster) interface{}
+	InstallationTimeoutMinutes(_ *stateCluster) interface{}
+
+	EventHandler
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Event Handler
+////////////////////////////////////////////////////////////////////////////
+
+type EventHandler interface {
+	SendClusterInstallationFailedEvent(template string, formatFuncs ...formatFunction) stateswitch.PostTransition
+}
+
+type ErrorEventArgs interface {
+	GetContext() context.Context
+}
+
+func (th *transitionHandler) SendClusterInstallationFailedEvent(template string, formatFuncs ...formatFunction) stateswitch.PostTransition {
+	return func(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
+		if sw.State() != stateswitch.State(models.ClusterStatusError) {
+			return nil
+		}
+
+		sCluster, ok := sw.(*stateCluster)
+		if !ok {
+			return errors.New("SendErrorEvent incompatible type of StateSwitch")
+		}
+
+		errorEventArgs, ok := args.(ErrorEventArgs)
+		if !ok {
+			return errors.New("SendErrorEvent incompatible type of args")
+		}
+
+		ctx := errorEventArgs.GetContext()
+		reason := computeReason(sCluster, template, formatFuncs...)
+
+		eventgen.SendClusterInstallationFailedEvent(ctx, th.eventsHandler, *sCluster.cluster.ID, reason)
+
+		return nil
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -133,7 +177,7 @@ func (th *transitionHandler) PostResetCluster(sw stateswitch.StateSwitch, args s
 			return err
 		}
 	}
-
+	extra = append(extra, resetInstallationPreparationStatusFields...)
 	return th.updateTransitionCluster(params.ctx, logutil.FromContext(params.ctx, th.log), params.db, sCluster, params.reason, extra...)
 }
 
@@ -159,6 +203,7 @@ func (th *transitionHandler) PostPrepareForInstallation(sw stateswitch.StateSwit
 		return errors.New("PostPrepareForInstallation invalid argument")
 	}
 	extra := append(append(make([]interface{}, 0), "install_started_at", strfmt.DateTime(time.Now())), resetLogsField...)
+	extra = append(extra, resetInstallationPreparationStatusFields...)
 	err = th.updateTransitionCluster(params.ctx, logutil.FromContext(params.ctx, th.log), th.db, sCluster,
 		statusInfoPreparingForInstallation, extra...)
 	if err != nil {
@@ -212,8 +257,8 @@ func (th *transitionHandler) createClusterCompletionStatusInfo(ctx context.Conte
 		statusInfo = StatusInfoDegraded
 		statusInfo += ". Failed OLM operators: " + strings.Join(statuses[models.OperatorTypeOlm][models.OperatorStatusFailed], ", ")
 	} else {
-		_, installedWorkers := HostsInStatus(cluster, []string{models.HostStatusInstalled})
-		if installedWorkers < NumberOfWorkers(cluster) {
+		_, _, installedWorkers := common.HostsInStatus(cluster, []string{models.HostStatusInstalled})
+		if installedWorkers < common.NumberOfWorkers(cluster) {
 			statusInfo = StatusInfoNotAllWorkersInstalled
 		}
 	}
@@ -349,6 +394,10 @@ type TransitionArgsRefreshCluster struct {
 	updatedCluster    *common.Cluster
 }
 
+func (t *TransitionArgsRefreshCluster) GetContext() context.Context {
+	return t.ctx
+}
+
 func If(id stringer) stateswitch.Condition {
 	ret := func(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) (bool, error) {
 		params, ok := args.(*TransitionArgsRefreshCluster)
@@ -369,8 +418,7 @@ func (th *transitionHandler) IsFinalizing(sw stateswitch.StateSwitch, args state
 	sCluster, ok := sw.(*stateCluster)
 	installedStatus := []string{models.HostStatusInstalled}
 
-	// Move to finalizing state when 3 masters and 0 or 2 worker (if workers are given) moved to installed state
-	if ok && th.enoughMastersAndWorkers(sCluster, installedStatus) {
+	if ok && common.HasEnoughMastersAndWorkers(sCluster.cluster, installedStatus) {
 		th.log.Infof("Cluster %s has at least required number of installed hosts, "+
 			"cluster is finalizing.", sCluster.cluster.ID)
 		return true, nil
@@ -383,7 +431,7 @@ func (th *transitionHandler) IsInstalling(sw stateswitch.StateSwitch, args state
 	sCluster, _ := sw.(*stateCluster)
 	installingStatuses := []string{models.HostStatusInstalling, models.HostStatusInstallingInProgress,
 		models.HostStatusInstalled, models.HostStatusInstallingPendingUserAction, models.HostStatusPreparingSuccessful}
-	return th.enoughMastersAndWorkers(sCluster, installingStatuses), nil
+	return common.HasEnoughMastersAndWorkers(sCluster.cluster, installingStatuses), nil
 }
 
 // check if we should stay in installing state
@@ -457,33 +505,6 @@ func (th *transitionHandler) PostUpdateFinalizingAMSConsoleUrl(sw stateswitch.St
 	params.updatedCluster = updatedCluster
 	log.Infof("Updated console-url in AMS subscription with id %s", subscriptionID)
 	return nil
-}
-
-func (th *transitionHandler) enoughMastersAndWorkers(sCluster *stateCluster, statuses []string) bool {
-	mastersInSomeInstallingStatus, workersInSomeInstallingStatus := HostsInStatus(sCluster.cluster, statuses)
-
-	minRequiredMasterNodes := MinMastersNeededForInstallation
-	if swag.StringValue(sCluster.cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
-		minRequiredMasterNodes = 1
-	}
-
-	numberOfExpectedWorkers := NumberOfWorkers(sCluster.cluster)
-	minWorkersNeededForInstallation := 0
-	if numberOfExpectedWorkers > 1 {
-		minWorkersNeededForInstallation = 2
-	}
-
-	// to be installed cluster need 3 master
-	// As for the workers, we need at least 2 workers when a cluster with 5 or more hosts is created
-	// otherwise no minimum workers are required. This is because in the case of 4 or less hosts the
-	// masters are set as schedulable and the workload can be shared across the available hosts. In the
-	// case of a 5 nodes cluster, masters are not schedulable so we depend on the workers to run the
-	// workload.
-	if mastersInSomeInstallingStatus >= minRequiredMasterNodes &&
-		(numberOfExpectedWorkers == 0 || workersInSomeInstallingStatus >= minWorkersNeededForInstallation) {
-		return true
-	}
-	return false
 }
 
 // check if installation reach to timeout
@@ -573,6 +594,15 @@ func (th *transitionHandler) PostPreparingTimedOut(sw stateswitch.StateSwitch, a
 
 type formatFunction func(sCluster *stateCluster) interface{}
 
+func computeReason(sCluster *stateCluster, template string, formatFuncs ...formatFunction) string {
+	var values []interface{}
+	for _, formatFunc := range formatFuncs {
+		values = append(values, formatFunc(sCluster))
+	}
+
+	return fmt.Sprintf(template, values...)
+}
+
 // Return a post transition function with a constant reason
 func (th *transitionHandler) PostRefreshCluster(template string, formatFuncs ...formatFunction) stateswitch.PostTransition {
 	ret := func(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
@@ -584,11 +614,8 @@ func (th *transitionHandler) PostRefreshCluster(template string, formatFuncs ...
 		if !ok {
 			return errors.New("PostRefreshCluster invalid argument")
 		}
-		var values []interface{}
-		for _, formatFunc := range formatFuncs {
-			values = append(values, formatFunc(sCluster))
-		}
-		reason := fmt.Sprintf(template, values...)
+
+		reason := computeReason(sCluster, template, formatFuncs...)
 
 		var (
 			err            error
@@ -647,11 +674,15 @@ func FinalizingStage(sCluster *stateCluster) interface{} {
 }
 
 func (th *transitionHandler) finalizingStageTimeoutMinutes(sCluster *stateCluster) int64 {
-	return int64(finalizingStageTimeout(sCluster.cluster.Progress.FinalizingStage, sCluster.cluster.MonitoredOperators, th.log).Minutes())
+	return int64(finalizingStageTimeout(sCluster.cluster.Progress.FinalizingStage, sCluster.cluster.MonitoredOperators, th.isSoftTimeoutsEnabled(sCluster.cluster), th.log).Minutes())
 }
 
 func (th *transitionHandler) FinalizingStageTimeoutMinutes(sCluster *stateCluster) interface{} {
 	return th.finalizingStageTimeoutMinutes(sCluster)
+}
+
+func (th *transitionHandler) InstallationTimeoutMinutes(_ *stateCluster) interface{} {
+	return int64(th.installationTimeout.Minutes())
 }
 
 func (th *transitionHandler) PostRefreshFinalizingStageSoftTimedOut(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
@@ -686,7 +717,7 @@ func (th *transitionHandler) IsFinalizingStageTimedOut(sw stateswitch.StateSwitc
 	if sCluster.cluster.Progress == nil || sCluster.cluster.Progress.FinalizingStage == "" {
 		return false, nil
 	}
-	timeout := finalizingStageTimeout(sCluster.cluster.Progress.FinalizingStage, sCluster.cluster.MonitoredOperators, th.log)
+	timeout := finalizingStageTimeout(sCluster.cluster.Progress.FinalizingStage, sCluster.cluster.MonitoredOperators, th.isSoftTimeoutsEnabled(sCluster.cluster), th.log)
 	return time.Since(time.Time(sCluster.cluster.Progress.FinalizingStageStartedAt)) > timeout, nil
 }
 
@@ -698,12 +729,16 @@ func finalizingStageTimeoutTriggered(sw stateswitch.StateSwitch, _ stateswitch.T
 	return sCluster.cluster.Progress != nil && sCluster.cluster.Progress.FinalizingStageTimedOut, nil
 }
 
+func (tr *transitionHandler) isSoftTimeoutsEnabled(cluster *common.Cluster) bool {
+	return tr.softTimeoutsEnabled && cluster.OrgSoftTimeoutsEnabled
+}
+
 func (tr *transitionHandler) SoftTimeoutsEnabled(sw stateswitch.StateSwitch, _ stateswitch.TransitionArgs) (bool, error) {
 	sCluster, ok := sw.(*stateCluster)
 	if !ok {
 		return false, errors.New("SoftTimeoutsEnabled incompatible type of StateSwitch")
 	}
-	return tr.softTimeoutsEnabled && (sCluster.cluster != nil && sCluster.cluster.OrgSoftTimeoutsEnabled), nil
+	return sCluster.cluster != nil && tr.isSoftTimeoutsEnabled(sCluster.cluster), nil
 }
 
 func (th *transitionHandler) InstallCluster(sw stateswitch.StateSwitch, args stateswitch.TransitionArgs) error {
@@ -848,6 +883,13 @@ func addExtraParams(cluster *common.Cluster, srcState string) ([]interface{}, er
 	case models.ClusterStatusInstalling:
 		if srcState == models.ClusterStatusPreparingForInstallation {
 			extra = append(extra, initProgressParamsInstallingStage()...)
+		}
+	case models.ClusterStatusFinalizing:
+		// Reset the finalizing stage timeout when returning from pending-user-action
+		// to give the cluster a fresh timeout window
+		if srcState == models.ClusterStatusInstallingPendingUserAction {
+			extra = append(extra, "progress_finalizing_stage_started_at", strfmt.DateTime(time.Now()))
+			extra = append(extra, "progress_finalizing_stage_timed_out", false)
 		}
 	}
 	return extra, nil

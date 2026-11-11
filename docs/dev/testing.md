@@ -4,7 +4,7 @@ The assisted-installer tests are divided into 3 categories:
 
 * **Unit tests** - Focused on a module/function level while other modules are mocked.
 Unit tests are located in the package, where the code they are testing resides, using the pattern `<module_name>_test.go`.
-Unit tests needs a postgresql db container. The image for db container `quay.io/centos7/postgresql-12-centos7:latest` is built from `https://github.com/sclorg/postgresql-container`
+Unit tests needs a postgresql db container. The image for db container `quay.io/sclorg/postgresql-15-c9s:latest` is built from `https://github.com/sclorg/postgresql-container`
 
 * **Subsystem tests** - Focused on the component while mocking other component.
 For example, assisted-service subsystem tests mock the agent responses.
@@ -80,6 +80,12 @@ Depends on the job.
 * Jobs that require a cluster (e.g. subsystem) run on a claimed OCP cluster from an hibernated pool of clusters.
 [Read more](https://docs.ci.openshift.org/docs/architecture/ci-operator/#testing-with-a-cluster-from-a-cluster-pool)
 * Baremetal jobs (i.e. e2e) run on a provisioned baremetal machine by [Equnix](https://www.equinix.nl/).
+
+## Writing Tests with OCP Versions
+
+**Subsystem tests** must use `common.TestVersion()` for all OCP version references. Subsystem tests run against the real service, so versions are resolved from the data files and hardcoded strings break when versions are pruned (e.g., during ACM feature freeze). See [Test Versions](test-versions.md) for the full API and migration patterns.
+
+**Unit tests** may use hardcoded version strings since versions are not pulled from real sources. The one exception is `TestDefaultConfig` in `internal/common/test_configuration.go`, which uses `TestVersion().Latest()` to conveniently track the latest available version.
 
 ## How to run Assisted-service subsystem tests
 

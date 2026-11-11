@@ -133,7 +133,14 @@ func parseOCMPayload(userToken *jwt.Token) (*ocm.AuthPayload, error) {
 	payload.LastName, _ = claims["last_name"].(string)
 	payload.Organization, _ = claims["org_id"].(string)
 	payload.Email, _ = claims["email"].(string)
-	payload.ClientID, _ = claims["clientId"].(string)
+
+	// The `clientId` claim was replaced by `client_id` in order to be compliant with the OAuth2
+	// specification. We will still try to use the old `clientId` claim to support older
+	// environments where the change hasn't been made yet.
+	payload.ClientID, _ = claims["client_id"].(string)
+	if payload.ClientID == "" {
+		payload.ClientID, _ = claims["clientId"].(string)
+	}
 
 	// Check values, if empty, use alternative claims from RHD
 	if payload.Username == "" {
@@ -296,6 +303,10 @@ func (a *RHSSOAuthenticator) AuthImageAuth(token string) (interface{}, error) {
 	}
 
 	return parsedToken.Claims, nil
+}
+
+func (a *RHSSOAuthenticator) AuthWatcherAuth(token string) (interface{}, error) {
+	return nil, common.NewInfraError(http.StatusUnauthorized, errors.Errorf("Watcher Authentication not allowed for RHSSO auth"))
 }
 
 func (a *RHSSOAuthenticator) CreateAuthenticator() func(_, _ string, _ security.TokenAuthentication) runtime.Authenticator {

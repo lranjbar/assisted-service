@@ -9,7 +9,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -26,6 +25,7 @@ import (
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -67,6 +67,7 @@ var _ = Describe("instruction_manager", func() {
 		host = hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, "unknown invalid state")
 		host.Role = models.HostRoleMaster
 		host.Inventory = hostutil.GenerateMasterInventory()
+		host.InstallationDiskID = common.TestDiskId
 		Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
 		anotherHost := hostutil.GenerateTestHost(strfmt.UUID(uuid.New().String()), infraEnvId, clusterId, "insufficient")
 		Expect(db.Create(&anotherHost).Error).ShouldNot(HaveOccurred())
@@ -284,6 +285,7 @@ var _ = Describe("instruction_manager", func() {
 					AdditionalNtpSources: UNBOUND_SOURCE,
 				},
 			}).Error).ToNot(HaveOccurred())
+			mockOSImages.EXPECT().GetOpenshiftVersions().Return([]string{"4.8"}).AnyTimes()
 		})
 
 		It("discovering-unbound", func() {
@@ -318,7 +320,7 @@ var _ = Describe("instruction_manager", func() {
 			checkStep(models.HostStatusUnbindingPendingUserAction, nil)
 		})
 		It("reclaiming", func() {
-			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
+			mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.OsImage, nil).Times(1)
 			checkStep(models.HostStatusReclaiming, []models.StepType{
 				models.StepTypeDownloadBootArtifacts,
 			})
@@ -469,7 +471,6 @@ var _ = Describe("agent_upgrade", func() {
 			models.HostStatusPendingForInput,
 			models.HostStatusKnownUnbound}
 		for _, hostStatus := range upgradeAllowdStatuses {
-			hostStatus := hostStatus
 			It(fmt.Sprintf("Creates a single upgrade agent step, hosts stauts: %s", hostStatus), func() {
 				Expect(db.Model(&host).Update("Status", hostStatus).Error).ShouldNot(HaveOccurred())
 				mockEvents.EXPECT().SendHostEvent(gomock.Any(), eventstest.NewEventMatcher(
@@ -497,7 +498,6 @@ var _ = Describe("agent_upgrade", func() {
 			models.HostStatusResetting,
 			models.HostStatusReclaiming}
 		for _, hostStatus := range upgradeAllowdStatuses {
-			hostStatus := hostStatus
 			It(fmt.Sprintf("Don't creates upgrade agent step, hosts stauts: %s", hostStatus), func() {
 				Expect(db.Model(&host).Update("Status", hostStatus).Error).ShouldNot(HaveOccurred())
 				stepsReply, stepsErr = instMng.GetNextSteps(ctx, &host)
@@ -536,7 +536,7 @@ func checkStepsByState(state string, host *models.Host, db *gorm.DB, mockEvents 
 	ExpectWithOffset(1, swag.StringValue(h.Status)).Should(Equal(state))
 	if funk.Contains(expectedStepTypes, models.StepTypeInstall) {
 		mockValidator.EXPECT().GetHostInstallationPath(gomock.Any()).Return("/dev/disk/by-id/wwn-sda").Times(1)
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
 		mockRelease.EXPECT().GetMCOImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMCOImage, nil).Times(1)
 		mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMustGatherVersion, nil).Times(1)
 	}
@@ -553,7 +553,7 @@ func checkStepsByState(state string, host *models.Host, db *gorm.DB, mockEvents 
 	}
 
 	if !funk.IsEmpty(funk.Join(expectedStepTypes, []models.StepType{models.StepTypeContainerImageAvailability, models.StepTypeDomainResolution}, funk.InnerJoin)) {
-		mockVersions.EXPECT().GetReleaseImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
+		mockVersions.EXPECT().GetReleaseImageForCluster(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.TestDefaultConfig.ReleaseImage, nil).Times(1)
 		if funk.Contains(expectedStepTypes, models.StepTypeContainerImageAvailability) {
 			mockVersions.EXPECT().GetMustGatherImages(gomock.Any(), gomock.Any(), gomock.Any()).Return(defaultMustGatherVersion, nil).Times(1)
 		}
@@ -587,7 +587,13 @@ func checkStepsByState(state string, host *models.Host, db *gorm.DB, mockEvents 
 
 func TestHostCommands(t *testing.T) {
 	RegisterFailHandler(Fail)
-	common.InitializeDBTest()
-	defer common.TerminateDBTest()
 	RunSpecs(t, "Host commands test Suite")
 }
+
+var _ = BeforeSuite(func() {
+	common.InitializeDBTest()
+})
+
+var _ = AfterSuite(func() {
+	common.TerminateDBTest()
+})

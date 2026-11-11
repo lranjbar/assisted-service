@@ -5,7 +5,6 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -19,6 +18,7 @@ import (
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 )
 
@@ -45,7 +45,7 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
 	)
 
 	BeforeEach(func() {
-		ctx = context.Background()
+		ctx = context.TODO()
 		ctrl = gomock.NewController(GinkgoT())
 		inventoryCache = make(InventoryCache)
 		mockHardwareValidator = hardware.NewMockValidator(ctrl)
@@ -61,11 +61,9 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
 			},
 		}, nil)
 		mockOperatorManager = operators.NewMockAPI(ctrl)
-		mockOperatorManager.EXPECT().ValidateHost(gomock.Any(), gomock.Any(), gomock.Any())
 		mockProviderRegistry = registry.NewMockProviderRegistry(ctrl)
 		mockS3WrapperAPI = s3wrapper.NewMockAPI(ctrl)
 		mockVersions = versions.NewMockHandler(ctrl)
-		mockOperatorManager.EXPECT().ValidateCluster(ctx, gomock.Any())
 		db, dbName = common.PrepareTestDB()
 		validatorConfig := &hardware.ValidatorCfg{}
 		disabledHostValidations := make(map[string]struct{})
@@ -82,6 +80,7 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
 
 	AfterEach(func() {
 		common.DeleteTestDB(db, dbName)
+		ctrl.Finish()
 	})
 
 	createHost := func() models.Host {
@@ -112,10 +111,6 @@ var _ = Describe("Cluster Refresh Status Preprocessor", func() {
 		cluster.Status = &clusterStatus
 		hostToAdd := createHost()
 		cluster.Hosts = []*models.Host{&hostToAdd}
-		cluster.LastInstallationPreparation = models.LastInstallationPreparation{
-			Status: models.LastInstallationPreparationStatusFailed,
-			Reason: "",
-		}
 		Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 	}
 

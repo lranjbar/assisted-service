@@ -16,6 +16,7 @@ spec:
       containers:
         - name: wiremock
           image: quay.io/ocpmetal/wiremock
+          args: ["--verbose"]
           imagePullPolicy: "IfNotPresent"
           ports:
             - containerPort: 8080
@@ -30,7 +31,10 @@ spec:
   spec:
     type: LoadBalancer
     ports:
-      - port: 8080
+      - name: wiremock
+        port: 8070
+        protocol: TCP
+        targetPort: 8080
     selector:
       app: wiremock
   status:

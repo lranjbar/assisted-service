@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
@@ -16,9 +15,6 @@ import (
 )
 
 const (
-	baseDomainRegex          = `^[a-z\d]([\-]*[a-z\d]+)+$`
-	dnsNameRegex             = `^([a-z\d]([\-]*[a-z\d]+)*\.)+[a-z\d]+([\-]*[a-z\d]+)+$`
-	wildCardDomainRegex      = `^(validateNoWildcardDNS\.).+\.?$`
 	hostnameRegex            = `^[a-z0-9][a-z0-9\-\.]{0,61}[a-z0-9]$`
 	installerArgsValuesRegex = `^[A-Za-z0-9@!#$%*()_+-=//.,";':{}\[\]]+$`
 )
@@ -45,32 +41,8 @@ func ValidateInstallerArgs(args []string) error {
 	return nil
 }
 
-func ValidateDomainNameFormat(dnsDomainName string) (int32, error) {
-	domainName := dnsDomainName
-	wildCardMatched, wildCardMatchErr := regexp.MatchString(wildCardDomainRegex, dnsDomainName)
-	if wildCardMatchErr == nil && wildCardMatched {
-		trimmedDomain := strings.TrimPrefix(dnsDomainName, "validateNoWildcardDNS.")
-		domainName = strings.TrimSuffix(trimmedDomain, ".")
-	}
-	matched, err := regexp.MatchString(baseDomainRegex, domainName)
-	if err != nil {
-		return http.StatusInternalServerError, errors.Wrapf(err, "Single DNS base domain validation for %s", dnsDomainName)
-	}
-	if matched && len(domainName) > 1 && len(domainName) < 63 {
-		return 0, nil
-	}
-	matched, err = regexp.MatchString(dnsNameRegex, domainName)
-	if err != nil {
-		return http.StatusInternalServerError, errors.Wrapf(err, "DNS name validation for %s", dnsDomainName)
-	}
-
-	if !matched || isDottedDecimalDomain(domainName) || len(domainName) > 255 {
-		return http.StatusBadRequest, errors.Errorf(
-			"DNS format mismatch: %s domain name is not valid. Must match regex [%s], be no more than 255 characters, and not be in dotted decimal format (##.##.##.##)",
-			dnsDomainName, dnsNameRegex)
-	}
-	return 0, nil
-}
+// ValidateDomainNameFormat has moved to models/dnsvalidation. This stub is intentionally removed
+// to avoid cross-package dependencies from models to pkg. Use dnsvalidation.ValidateDomainNameFormat instead.
 
 func ValidateHostname(name string) error {
 	matched, err := regexp.MatchString(hostnameRegex, name)
@@ -111,8 +83,38 @@ func ValidateNTPSource(ntpSource string) bool {
 	return false
 }
 
+// NormalizeHTTPURL rewrites HTTP(S) URLs that contain an unbracketed IPv6 literal host
+// so they can be parsed by net/url (Go 1.26+).
+func NormalizeHTTPURL(rawURL string) string {
+	if !strings.Contains(rawURL, "://") {
+		return rawURL
+	}
+	parts := strings.SplitN(rawURL, "://", 2)
+	scheme, rest := parts[0], parts[1]
+
+	pathParts := strings.SplitN(rest, "/", 2)
+	hostport := pathParts[0]
+	path := ""
+	if len(pathParts) > 1 {
+		path = "/" + pathParts[1]
+	}
+
+	if strings.HasPrefix(hostport, "[") || strings.Count(hostport, ":") < 2 {
+		return rawURL
+	}
+
+	lastColon := strings.LastIndex(hostport, ":")
+	host, port := hostport[:lastColon], hostport[lastColon+1:]
+
+	if net.ParseIP(host) != nil {
+		return scheme + "://" + net.JoinHostPort(host, port) + path
+	}
+	return rawURL
+}
+
 // ValidateHTTPFormat validates the HTTP and HTTPS format
 func ValidateHTTPFormat(theurl string) error {
+	theurl = NormalizeHTTPURL(theurl)
 	u, err := url.Parse(theurl)
 	if err != nil {
 		return fmt.Errorf("URL '%s' format is not valid: %w", theurl, err)
@@ -123,8 +125,7 @@ func ValidateHTTPFormat(theurl string) error {
 	return nil
 }
 
-// ValidateHTTPProxyFormat validates the HTTP Proxy and HTTPS Proxy format
-func ValidateHTTPProxyFormat(proxyURL string) error {
+func validateProxyURLFormat(proxyURL string, allowedSchemes ...string) error {
 	if !govalidator.IsURL(proxyURL) {
 		return errors.Errorf("Proxy URL format is not valid: '%s'", proxyURL)
 	}
@@ -132,13 +133,40 @@ func ValidateHTTPProxyFormat(proxyURL string) error {
 	if err != nil {
 		return errors.Errorf("Proxy URL format is not valid: '%s'", proxyURL)
 	}
-	if u.Scheme == "https" {
-		return errors.Errorf("The URL scheme must be http; https is currently not supported: '%s'", proxyURL)
+	for _, scheme := range allowedSchemes {
+		if u.Scheme == scheme {
+			return nil
+		}
 	}
-	if u.Scheme != "http" {
-		return errors.Errorf("The URL scheme must be http and specified in the URL: '%s'", proxyURL)
+	return errors.Errorf("The URL scheme must be %s and specified in the URL: '%s'",
+		strings.Join(allowedSchemes, " or "), proxyURL)
+}
+
+// ValidateHTTPProxyFormat validates the HTTP Proxy format (http scheme only)
+func ValidateHTTPProxyFormat(proxyURL string) error {
+	return validateProxyURLFormat(proxyURL, "http")
+}
+
+// ValidateHTTPSProxyFormat validates the HTTPS Proxy URL format (http or https schemes are valid)
+func ValidateHTTPSProxyFormat(proxyURL string) error {
+	return validateProxyURLFormat(proxyURL, "http", "https")
+}
+
+func validateNoProxyEntry(entry string) error {
+	s := strings.TrimPrefix(entry, ".")
+	if govalidator.IsIP(s) {
+		return nil
 	}
-	return nil
+
+	if govalidator.IsCIDR(s) {
+		return nil
+	}
+
+	if govalidator.IsDNSName(s) {
+		return nil
+	}
+
+	return errors.Errorf("%s is not a valid no_proxy entry", entry)
 }
 
 // ValidateNoProxyFormat validates the no-proxy format which should be a comma-separated list
@@ -149,22 +177,19 @@ func ValidateNoProxyFormat(noProxy string) error {
 		return nil
 	}
 	domains := strings.Split(noProxy, ",")
+	dupTracker := map[string]string{}
 	for _, s := range domains {
-		s = strings.TrimPrefix(s, ".")
-		if govalidator.IsIP(s) {
-			continue
+		if _, present := dupTracker[s]; present {
+			return errors.Errorf("duplicate no_proxy entry defined: %s", s)
 		}
 
-		if govalidator.IsCIDR(s) {
-			continue
+		if err := validateNoProxyEntry(s); err != nil {
+			return errors.Wrap(err,
+				"NO Proxy is a comma-separated list of destination domain names, domains, IP addresses or other network CIDRs. "+
+					"A domain can be prefaced with '.' to include all subdomains of that domain. Use '*' to bypass proxy for all destinations with OpenShift 4.8 or later.")
 		}
 
-		if govalidator.IsDNSName(s) {
-			continue
-		}
-		return errors.Errorf("NO Proxy format is not valid: '%s'. "+
-			"NO Proxy is a comma-separated list of destination domain names, domains, IP addresses or other network CIDRs. "+
-			"A domain can be prefaced with '.' to include all subdomains of that domain. Use '*' to bypass proxy for all destinations with OpenShift 4.8 or later.", noProxy)
+		dupTracker[s] = ""
 	}
 	return nil
 }
@@ -199,11 +224,4 @@ func ValidateCaCertificate(certificate string) error {
 	}
 
 	return nil
-}
-
-// RFC 1123 (https://datatracker.ietf.org/doc/html/rfc1123#page-13)
-// states that domains cannot resemble the format ##.##.##.##
-func isDottedDecimalDomain(domain string) bool {
-	regex := `([\d]+\.){3}[\d]+`
-	return regexp.MustCompile(regex).MatchString(domain)
 }

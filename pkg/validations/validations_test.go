@@ -15,7 +15,9 @@ import (
 	"time"
 
 	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	modelvalidations "github.com/openshift/assisted-service/models/validations"
 )
 
 var _ = Describe("URL validations", func() {
@@ -35,7 +37,7 @@ var _ = Describe("URL validations", func() {
 			},
 			{
 				"https://proxy.com:3128",
-				"The URL scheme must be http; https is currently not supported: 'https://proxy.com:3128'",
+				"The URL scheme must be http and specified in the URL: 'https://proxy.com:3128'",
 			},
 			{
 				"ftp://proxy.com:3128",
@@ -80,6 +82,50 @@ var _ = Describe("URL validations", func() {
 		})
 	})
 
+	Context("test HTTPS proxy URL", func() {
+		var parameters = []struct {
+			input, err string
+		}{
+			{"http://proxy.com:3128", ""},
+			{"http://username:pswd@proxy.com", ""},
+			{"http://10.9.8.7:123", ""},
+			{"http://username:pswd@10.9.8.7:123", ""},
+			{"https://proxy.com:3128", ""},
+			{"https://username:pswd@proxy.com", ""},
+			{"https://10.9.8.7:123", ""},
+			{"https://username:pswd@10.9.8.7:443", ""},
+			{"https://[1080:0:0:0:8:800:200C:417A]:8888", ""},
+			{
+				"ftp://proxy.com:3128",
+				"The URL scheme must be http or https and specified in the URL: 'ftp://proxy.com:3128'",
+			},
+			{
+				"proxy.com:3128",
+				"The URL scheme must be http or https and specified in the URL: 'proxy.com:3128'",
+			},
+			{
+				"xyz",
+				"Proxy URL format is not valid: 'xyz'",
+			},
+			{
+				"",
+				"Proxy URL format is not valid: ''",
+			},
+		}
+
+		It("validates HTTPS proxy URL input", func() {
+			for _, param := range parameters {
+				err := ValidateHTTPSProxyFormat(param.input)
+				if param.err == "" {
+					Expect(err).Should(BeNil())
+				} else {
+					Expect(err).ShouldNot(BeNil())
+					Expect(err.Error()).To(Equal(param.err))
+				}
+			}
+		})
+	})
+
 	Context("test URL", func() {
 		var parameters = []struct {
 			input, err string
@@ -92,6 +138,8 @@ var _ = Describe("URL validations", func() {
 			{"http://10.9.8.7:123/config", ""},
 			{"http://[1080::8:800:200c:417a]:123", ""},
 			{"http://[1080::8:800:200c:417a]:123/config", ""},
+			{"https://fd2e:6f44:5dd8:c956::14:31187", ""},
+			{"https://fd2e:6f44:5dd8:c956::14:31187/ignition", ""},
 			{
 				"http://[1080:0:0:0:8:800:200C:417A]:8888 ",
 				"URL 'http://[1080:0:0:0:8:800:200C:417A]:8888 ' format is not valid: parse \"http://[1080:0:0:0:8:800:200C:417A]:8888 \": invalid port \":8888 \" after host",
@@ -128,45 +176,41 @@ var _ = Describe("URL validations", func() {
 		})
 	})
 
-	Context("test no-proxy", func() {
-		It("domain name", func() {
-			err := ValidateNoProxyFormat("domain.com")
-			Expect(err).Should(BeNil())
-		})
-		It("domain starts with . for all sub-domains", func() {
-			err := ValidateNoProxyFormat(".domain.com")
-			Expect(err).Should(BeNil())
-		})
-		It("CIDR", func() {
-			err := ValidateNoProxyFormat("10.9.0.0/16")
-			Expect(err).Should(BeNil())
-		})
-		It("IP Address", func() {
-			err := ValidateNoProxyFormat("10.9.8.7")
-			Expect(err).Should(BeNil())
-		})
-		It("multiple entries", func() {
-			err := ValidateNoProxyFormat("domain.com,10.9.0.0/16,.otherdomain.com,10.9.8.7")
-			Expect(err).Should(BeNil())
-		})
-		It("'*' bypass proxy for all destinations release version", func() {
-			err := ValidateNoProxyFormat("*")
-			Expect(err).Should(BeNil())
+	Context("NormalizeHTTPURL", func() {
+		It("brackets unbracketed IPv6 ignition URLs", func() {
+			Expect(NormalizeHTTPURL("https://fd2e:6f44:5dd8:c956::14:31187")).
+				To(Equal("https://[fd2e:6f44:5dd8:c956::14]:31187"))
+			Expect(NormalizeHTTPURL("https://fd2e:6f44:5dd8:c956::14:31187/ignition")).
+				To(Equal("https://[fd2e:6f44:5dd8:c956::14]:31187/ignition"))
 		})
 
-		It("invalid format", func() {
-			err := ValidateNoProxyFormat("...")
-			Expect(err).ShouldNot(BeNil())
-		})
-		It("invalid format of a single value", func() {
-			err := ValidateNoProxyFormat("domain.com,...")
-			Expect(err).ShouldNot(BeNil())
-		})
-		It("invalid use of asterisk", func() {
-			err := ValidateNoProxyFormat("*,domain.com")
-			Expect(err).ShouldNot(BeNil())
+		It("leaves IPv4 and already bracketed IPv6 URLs unchanged", func() {
+			Expect(NormalizeHTTPURL("https://1.2.3.4:555/ignition")).To(Equal("https://1.2.3.4:555/ignition"))
+			Expect(NormalizeHTTPURL("http://[1080::8:800:200c:417a]:123/config")).
+				To(Equal("http://[1080::8:800:200c:417a]:123/config"))
 		})
 	})
+
+	DescribeTable("ValidateNoProxyFormat",
+		func(noProxy string, expectSuccess bool) {
+			err := ValidateNoProxyFormat(noProxy)
+			if expectSuccess {
+				Expect(err).To(BeNil())
+			} else {
+				Expect(err).ToNot(BeNil())
+			}
+		},
+		Entry("domain name", "domain.com", true),
+		Entry("domain starts with . for all sub-domains", ".domain.com", true),
+		Entry("CIDR", "10.9.0.0/16", true),
+		Entry("IP Address", "10.9.8.7", true),
+		Entry("multiple entries", "domain.com,10.9.0.0/16,.otherdomain.com,10.9.8.7", true),
+		Entry("'*' bypass proxy for all destinations release version", "*", true),
+		Entry("invalid format", "...", false),
+		Entry("invalid format of a single value", "domain.com,...", false),
+		Entry("invalid use of asterisk", "*,domain.com", false),
+		Entry("fails for duplicate entries", "192.0.2.1,192.0.2.2,192.0.2.1", false),
+	)
 })
 
 var _ = Describe("dns name", func() {
@@ -304,9 +348,8 @@ var _ = Describe("dns name", func() {
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("Domain name \"%s\" - testing: \"%s\"", t.domainName, t.reason), func() {
-			_, err := ValidateDomainNameFormat(t.domainName)
+			_, err := modelvalidations.ValidateDomainNameFormat(t.domainName)
 			if t.valid {
 				Expect(err).ToNot(HaveOccurred())
 			} else {
@@ -343,7 +386,6 @@ var _ = Describe("NTP source", func() {
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("NTP source \"%s\"", t.ntpSource), func() {
 			if t.valid {
 				Expect(ValidateAdditionalNTPSource(t.ntpSource)).To(BeTrue())
@@ -428,7 +470,6 @@ var _ = Describe("ValidateHostname", func() {
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(t.description, func() {
 			err := ValidateHostname(t.hostname)
 			if t.valid {
@@ -495,7 +536,6 @@ var _ = Describe("ValidateTags", func() {
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("Cluster Tags: \"%s\"", t.tags), func() {
 			err := ValidateTags(t.tags)
 			if t.valid {

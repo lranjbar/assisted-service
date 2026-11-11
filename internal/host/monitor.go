@@ -2,24 +2,21 @@ package host
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
+	"time"
 
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/commonutils"
 	"github.com/openshift/assisted-service/pkg/conversions"
+	"github.com/openshift/assisted-service/pkg/db/slowquery"
 	"github.com/openshift/assisted-service/pkg/requestid"
 	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
-
-func (m *Manager) SkipMonitoring(h *models.Host) bool {
-	skipMonitoringStates := []string{string(models.LogsStateCompleted), string(models.LogsStateTimeout), ""}
-	result := ((swag.StringValue(h.Status) == models.HostStatusError || swag.StringValue(h.Status) == models.HostStatusCancelled) &&
-		funk.Contains(skipMonitoringStates, h.LogsInfo))
-	return result
-}
 
 func (m *Manager) initMonitoringQueryGenerator() {
 	if m.monitorClusterQueryGenerator == nil {
@@ -35,16 +32,34 @@ func (m *Manager) initMonitoringQueryGenerator() {
 				models.HostStatusPreparingSuccessful,
 				models.HostStatusInstalling,
 				models.HostStatusInstallingInProgress,
-				models.HostStatusInstalled,
 				models.HostStatusInstallingPendingUserAction,
 				models.HostStatusResettingPendingUserAction,
-				models.HostStatusCancelled, // for limited time, until log collection finished or timed-out
-				models.HostStatusError,     // for limited time, until log collection finished or timed-out
 			}
 
-			dbWithCondition := common.LoadTableFromDB(db, common.HostsTable, "status in (?)", monitorStates)
-			dbWithCondition = common.LoadClusterTablesFromDB(dbWithCondition, common.HostsTable)
-			dbWithCondition = dbWithCondition.Where("exists (select 1 from hosts where clusters.id = hosts.cluster_id)")
+			// monitor following states for limited time, until log collection finished or timed-out
+			monitorStatesUntilLogCollection := []string{
+				models.HostStatusCancelled,
+				models.HostStatusError,
+			}
+			logCollectionEndStates := []string{
+				string(models.LogsStateCompleted),
+				string(models.LogsStateTimeout),
+				string(models.LogsStateEmpty),
+			}
+
+			dbWithCondition := common.LoadClusterTablesFromDB(db)
+			dbWithCondition = dbWithCondition.Where(
+				`id IN (
+                         SELECT clusters.id FROM
+                           clusters INNER JOIN hosts ON clusters.id = hosts.cluster_id WHERE
+                           clusters.deleted_at IS NULL AND
+                           hosts.deleted_at IS NULL AND
+                           (
+                             (hosts.status in (?) OR (hosts.status in (?) AND hosts.logs_info not in (?))) OR
+                             (hosts.status = ? AND clusters.status <> ?)
+                           )
+                       )`,
+				monitorStates, monitorStatesUntilLogCollection, logCollectionEndStates, models.HostStatusInstalled, models.ClusterStatusInstalled)
 			return dbWithCondition
 		}
 		m.monitorClusterQueryGenerator = common.NewMonitorQueryGenerator(m.db, buildInitialQuery, m.Config.MonitorBatchSize)
@@ -81,32 +96,62 @@ func SortHosts(hosts []*models.Host) ([]*models.Host, bool) {
 		}
 	}
 
+	// Separate hosts into GPU and non-GPU lists
+	var hostsWithoutGPU []*models.Host
+	var hostsWithGPU []*models.Host
 	allHostsHasInventory := true
-	sort.SliceStable(hosts, func(i, j int) bool {
-		inventory_i, _ := common.UnmarshalInventory(hosts[i].Inventory)
-		if inventory_i == nil {
+
+	for _, host := range hosts {
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		if inventory == nil {
 			allHostsHasInventory = false
-			return false
+			// Hosts without inventory go to non-GPU list (safer default)
+			hostsWithoutGPU = append(hostsWithoutGPU, host)
+			continue
 		}
 
-		inventory_j, _ := common.UnmarshalInventory(hosts[j].Inventory)
-		if inventory_j == nil {
-			allHostsHasInventory = false
-			return true
+		if int64(len(inventory.Gpus)) > 0 {
+			hostsWithGPU = append(hostsWithGPU, host)
+		} else {
+			hostsWithoutGPU = append(hostsWithoutGPU, host)
 		}
+	}
 
-		//(host_cores - 4) + ((host_ram_gb - 16) * 0.1) + ((host_disk_capacity_gb - 100) * 0.004)
-		wi := 1.0*(float64(cpuCount(inventory_i))-HostWeightMinimumCpuCores) +
-			HostWeightMemWeight*(float64(memInGib(inventory_i))-HostWeightMinimumMemGib) +
-			HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_i.Disks))-HostWeightMinimumDiskCapacityGib)
+	sortByWeight := func(hostList []*models.Host) {
+		sort.SliceStable(hostList, func(i, j int) bool {
+			inventory_i, _ := common.UnmarshalInventory(hostList[i].Inventory)
+			inventory_j, _ := common.UnmarshalInventory(hostList[j].Inventory)
 
-		wj := 1.0*(float64(cpuCount(inventory_j))-HostWeightMinimumCpuCores) +
-			HostWeightMemWeight*(float64(memInGib(inventory_j))-HostWeightMinimumMemGib) +
-			HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_j.Disks))-HostWeightMinimumDiskCapacityGib)
+			if inventory_i == nil {
+				return false
+			}
+			if inventory_j == nil {
+				return true
+			}
 
-		return wi < wj
-	})
-	return hosts, allHostsHasInventory
+			//(host_cores - 4) + ((host_ram_gb - 16) * 0.1) + ((host_disk_capacity_gb - 100) * 0.004)
+			wi := 1.0*(float64(cpuCount(inventory_i))-HostWeightMinimumCpuCores) +
+				HostWeightMemWeight*(float64(memInGib(inventory_i))-HostWeightMinimumMemGib) +
+				HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_i.Disks))-HostWeightMinimumDiskCapacityGib)
+
+			wj := 1.0*(float64(cpuCount(inventory_j))-HostWeightMinimumCpuCores) +
+				HostWeightMemWeight*(float64(memInGib(inventory_j))-HostWeightMinimumMemGib) +
+				HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_j.Disks))-HostWeightMinimumDiskCapacityGib)
+
+			return wi < wj
+		})
+	}
+
+	// Sort each list separately
+	sortByWeight(hostsWithoutGPU)
+	sortByWeight(hostsWithGPU)
+
+	// Concatenate: non-GPU hosts first, then GPU hosts
+	result := make([]*models.Host, 0, len(hosts))
+	result = append(result, hostsWithoutGPU...)
+	result = append(result, hostsWithGPU...)
+
+	return result, allHostsHasInventory
 }
 
 func (m *Manager) resetRoleAssignmentIfNotAllRolesAreSet() {
@@ -129,18 +174,21 @@ func (m *Manager) resetRoleAssignmentIfNotAllRolesAreSet() {
 	}
 }
 
-func (m *Manager) clusterHostMonitoring() int64 {
+func (m *Manager) clusterHostMonitoring() {
 	var (
-		monitored int64
 		requestID = requestid.NewID()
-		ctx       = requestid.ToContext(context.Background(), requestID)
+		ctx       = slowquery.WithScope(requestid.ToContext(context.Background(), requestID), slowquery.ScopeHostMonitor)
 		log       = requestid.RequestIDLogger(m.log, requestID)
 		clusters  []*common.Cluster
 		err       error
 	)
-
 	m.resetRoleAssignmentIfNotAllRolesAreSet()
 	query := m.monitorClusterQueryGenerator.NewClusterQuery()
+	cycleStartTime := time.Now()
+	isFullScan := query.IsFullScan()
+	defer func() {
+		m.metricApi.MonitoredHostsCycleDurationMs(ctx, time.Since(cycleStartTime), isFullScan)
+	}()
 	for {
 		if clusters, err = query.Next(); err != nil {
 			m.log.WithError(err).Error("Getting clusters")
@@ -151,43 +199,64 @@ func (m *Manager) clusterHostMonitoring() int64 {
 			break
 		}
 
+		log.Debug("Started cluster host monitoring cycle")
+
 		for _, c := range clusters {
 			inventoryCache := make(InventoryCache)
 			sortedHosts, canRefreshRoles := SortHosts(c.Hosts)
 
+			log = log.WithField("cluster", c.ID.String())
+
 			for _, host := range sortedHosts {
+				log = log.WithField("host", host.ID.String())
 				if !m.leaderElector.IsLeader() {
-					m.log.Debugf("Not a leader, exiting cluster HostMonitoring")
-					return monitored
+					log.Debug("Not a leader, exiting cluster HostMonitoring")
+					return
 				}
-				if !m.SkipMonitoring(host) {
-					monitored += 1
-					err = m.refreshStatusInternal(ctx, host, c, nil, inventoryCache, m.db)
+				startTime := time.Now()
+
+				log.Debug("Started refreshing host status")
+				// Deadline per host refresh to avoid long-running host monitoring
+				hCtx, cancel := context.WithTimeout(ctx, m.Config.MaxHostDisconnectionTime)
+				dbc := m.db.WithContext(hCtx)
+				err = m.refreshStatusInternal(hCtx, host, c, nil, inventoryCache, dbc)
+				if errors.Is(hCtx.Err(), context.DeadlineExceeded) {
+					log.WithField("cluster", c.ID.String()).WithField("host", host.ID.String()).Errorf("host monitoring exceeded deadline %s", m.Config.MaxHostDisconnectionTime)
+					m.eventsHandler.NotifyInternalEvent(ctx, c.ID, host.ID, nil, fmt.Sprintf("host monitor deadline exceeded for host %s in cluster %s", host.ID.String(), c.ID.String()))
+					cancel()
+					continue
+				}
+				cancel()
+
+				duration := time.Since(startTime)
+				m.metricApi.MonitoredHostsDurationMs(ctx, *host.ID, c.ID, duration)
+				if err != nil {
+					log.WithError(err).Error("failed to refresh host state")
+				}
+				log.Debug("Finished refreshing host status")
+
+				//the refreshed role will be taken into account in the validations
+				//on the next monitor cycle. The roles will not be calculated until
+				//all the hosts in the cluster has inventory to avoid race condition
+				//with the reset auto-assign mechanism.
+				if canRefreshRoles {
+					log.Debug()
+					err = m.refreshRoleInternal(ctx, host, m.db, false)
 					if err != nil {
-						log.WithError(err).Errorf("failed to refresh host %s state", *host.ID)
-					}
-					//the refreshed role will be taken into account in the validations
-					//on the next monitor cycle. The roles will not be calculated until
-					//all the hosts in the cluster has inventory to avoid race condition
-					//with the reset auto-assign mechanism.
-					if canRefreshRoles {
-						err = m.refreshRoleInternal(ctx, host, m.db, false)
-						if err != nil {
-							log.WithError(err).Errorf("failed to refresh host %s role", *host.ID)
-						}
+						log.WithError(err).Error("failed to refresh host role")
 					}
 				}
 			}
 		}
+
+		m.log.Debug("Finished cluster host monitoring cycle")
 	}
-	return monitored
 }
 
-func (m *Manager) infraEnvHostMonitoring() int64 {
+func (m *Manager) infraEnvHostMonitoring() {
 	var (
-		monitored int64
 		requestID = requestid.NewID()
-		ctx       = requestid.ToContext(context.Background(), requestID)
+		ctx       = slowquery.WithScope(requestid.ToContext(context.Background(), requestID), slowquery.ScopeHostMonitor)
 		log       = requestid.RequestIDLogger(m.log, requestID)
 		infraEnvs []*common.InfraEnv
 		err       error
@@ -218,11 +287,23 @@ func (m *Manager) infraEnvHostMonitoring() int64 {
 			for _, host := range i.Hosts {
 				if !m.leaderElector.IsLeader() {
 					m.log.Debugf("Not a leader, exiting infra-env HostMonitoring")
-					return monitored
+					return
 				}
 				if funk.ContainsString(monitorStates, swag.StringValue(host.Status)) {
-					monitored += 1
-					err = m.refreshStatusInternal(ctx, &host.Host, nil, i, inventoryCache, m.db)
+					startTime := time.Now()
+					// Use a per-host deadline to avoid long-running operations
+					hCtx, cancel := context.WithTimeout(ctx, m.Config.MaxHostDisconnectionTime)
+					dbc := m.db.WithContext(hCtx)
+					err = m.refreshStatusInternal(hCtx, &host.Host, nil, i, inventoryCache, dbc)
+					if errors.Is(hCtx.Err(), context.DeadlineExceeded) {
+						m.log.WithField("infraEnv", i.ID.String()).WithField("host", host.ID.String()).Errorf("infra-env host monitoring exceeded deadline %s", m.Config.MaxHostDisconnectionTime)
+						m.eventsHandler.NotifyInternalEvent(ctx, nil, host.ID, i.ID, fmt.Sprintf("infra-env host monitor deadline exceeded for host %s in infra-env %s", host.ID.String(), i.ID.String()))
+						cancel()
+						continue
+					}
+					cancel()
+					duration := time.Since(startTime)
+					m.metricApi.MonitoredHostsDurationMs(ctx, *host.ID, nil, duration)
 					if err != nil {
 						log.WithError(err).Errorf("failed to refresh host %s state", *host.ID)
 					}
@@ -230,18 +311,18 @@ func (m *Manager) infraEnvHostMonitoring() int64 {
 			}
 		}
 	}
-	return monitored
 }
 
 func (m *Manager) HostMonitoring() {
-	var monitored int64
 	if !m.leaderElector.IsLeader() {
 		m.log.Debugf("Not a leader, exiting HostMonitoring")
 		return
 	}
+	slowquery.SetGoroutineScope(slowquery.ScopeHostMonitor, "")
+	defer slowquery.ClearGoroutineScope()
+
 	defer commonutils.MeasureOperation("HostMonitoring", m.log, m.metricApi)()
 	m.initMonitoringQueryGenerator()
-	monitored += m.clusterHostMonitoring()
-	monitored += m.infraEnvHostMonitoring()
-	m.metricApi.MonitoredHostsCount(monitored)
+	m.clusterHostMonitoring()
+	m.infraEnvHostMonitoring()
 }

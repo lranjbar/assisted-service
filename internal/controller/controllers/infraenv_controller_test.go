@@ -11,11 +11,11 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
-	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	"github.com/openshift/assisted-service/api/hiveextension/v1beta1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/internal/bminventory"
 	"github.com/openshift/assisted-service/internal/common"
@@ -26,6 +26,7 @@ import (
 	"github.com/openshift/assisted-service/restapi/operations/installer"
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	"github.com/pkg/errors"
+	"go.uber.org/mock/gomock"
 	"gorm.io/gorm"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -109,29 +110,71 @@ var _ = Describe("infraEnv reconcile", func() {
 			OsImages:            mockOSImages,
 			PullSecretHandler:   NewPullSecretHandler(c, c, mockInstallerInternal),
 			AuthType:            auth.TypeNone,
+			ImageServiceEnabled: true,
 		}
 		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
 		eventURL = fmt.Sprintf("%s/api/assisted-install/v2/events?infra_env_id=%s", ir.ServiceBaseURL, sId)
 		Expect(c.Create(ctx, pullSecret)).To(BeNil())
-		mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any()).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(ocpVersion)}, nil).AnyTimes()
-		mockOSImages.EXPECT().GetLatestOsImage(infraEnvArch).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(ocpVersion)}, nil).AnyTimes()
+		mockOSImages.EXPECT().GetOpenshiftVersions().Return([]string{"4.8"}).AnyTimes()
+		mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(ocpVersion)}, nil).AnyTimes()
 	})
 
 	AfterEach(func() {
 		mockCtrl.Finish()
 	})
 
-	It("none exiting infraEnv - delete", func() {
-		infraEnvImage := newInfraEnvImage("infraEnvImage", "namespace", aiv1beta1.InfraEnvSpec{})
-		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
-
-		noneExistingImage := newInfraEnvImage("image2", "namespace", aiv1beta1.InfraEnvSpec{})
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil)
-
-		result, err := ir.Reconcile(ctx, newInfraEnvRequest(noneExistingImage))
+	It("Happy flow - reconciling a non-existing infraEnv should be successful", func() {
+		nonexistingInfraEnv := newInfraEnvImage("nonexistingInfraEnv", "namespace", aiv1beta1.InfraEnvSpec{})
+		result, err := ir.Reconcile(ctx, newInfraEnvRequest(nonexistingInfraEnv))
 		Expect(err).To(BeNil())
 		Expect(result).To(Equal(ctrl.Result{}))
+	})
+
+	Context("Mirror registry", func() {
+
+		createUserMirrorRegistryConfigmap := func(registryToml string, certificate string) {
+			registryCM := newUserProvidedRegistryCM(registryToml, certificate)
+			Expect(c.Create(ctx, registryCM)).ShouldNot(HaveOccurred())
+		}
+
+		When("the user-provided valid image registry contains correct data", func() {
+			It("Successfully parse and set the given user configmap", func() {
+				createUserMirrorRegistryConfigmap(getSecureRegistryToml(), mirrorRegistryCertificate)
+
+				clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+				Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+				mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+				mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, gomock.Any()).
+					Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+						Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+						Expect(mirrorRegistryConfiguration).To(Not(BeNil()))
+						Expect(mirrorRegistryConfiguration.RegistriesConf).To(Equal(getSecureRegistryToml()))
+						Expect(mirrorRegistryConfiguration.CaBundleCrt).To(Equal(mirrorRegistryCertificate))
+					}).Return(
+					&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch, StaticNetworkConfig: "foobar"}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+				infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+					ClusterRef:        &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+					PullSecretRef:     &corev1.LocalObjectReference{Name: "pull-secret"},
+					MirrorRegistryRef: &v1beta1.MirrorRegistryConfigMapReference{Name: providedMirrorRegistryCMName, Namespace: testNamespace},
+				})
+				Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+				res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+				key := types.NamespacedName{
+					Namespace: testNamespace,
+					Name:      "infraEnvImage",
+				}
+
+				Expect(err).To(BeNil())
+				Expect(res).To(Equal(ctrl.Result{}))
+				Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+
+			})
+		})
+
 	})
 
 	It("create new infraEnv minimal-iso image - success", func() {
@@ -143,9 +186,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
 			}).Return(
@@ -168,8 +211,8 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(infraEnvImage.Status.ISODownloadURL).To(Equal(imageInfo.DownloadURL))
 		Expect(infraEnvImage.Status.InfraEnvDebugInfo.StaticNetworkDownloadURL).To(Equal(fmt.Sprintf("https://www.acme.com/api/assisted-install/v2/infra-envs/%s/downloads/files?file_name=static-network-config", &sId)))
 		Expect(infraEnvImage.Status.CreatedTime).ToNot(BeNil())
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.ImageStateCreated))
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreatedReason))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.InfraEnvAvailableMessage + ": Image has been created"))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.InfraEnvAvailableReason))
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
 		Expect(infraEnvImage.Status.AgentLabelSelector).To(Equal(metav1.LabelSelector{MatchLabels: map[string]string{aiv1beta1.InfraEnvNameLabel: "infraEnvImage"}}))
 
@@ -183,9 +226,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeFullIso))
 			}).Return(
@@ -195,9 +238,9 @@ var _ = Describe("infraEnv reconcile", func() {
 			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
 			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
 		})
+		infraEnvImage.Spec.ImageType = models.ImageTypeFullIso
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 
-		ir.Config.ImageType = models.ImageTypeFullIso
 		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).To(BeNil())
 		Expect(res).To(Equal(ctrl.Result{}))
@@ -209,8 +252,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
 		Expect(infraEnvImage.Status.ISODownloadURL).To(Equal(downloadURL))
 		Expect(infraEnvImage.Status.CreatedTime).ToNot(BeNil())
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.ImageStateCreated))
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreatedReason))
+		Expect(infraEnvImage.Spec.ImageType).To(Equal(models.ImageTypeFullIso))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.InfraEnvAvailableMessage + ": Image has been created"))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.InfraEnvAvailableReason))
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
 
 		By("validate events URL")
@@ -228,8 +272,8 @@ var _ = Describe("infraEnv reconcile", func() {
 			},
 		}
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Return(dbInfraEnv, nil).Times(1)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(dbInfraEnv, nil).Times(1)
 		kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
 			PullSecretRef:  &corev1.LocalObjectReference{Name: "pull-secret"},
 			IPXEScriptType: aiv1beta1.BootOrderControl,
@@ -286,8 +330,8 @@ var _ = Describe("infraEnv reconcile", func() {
 			},
 		}
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Return(dbInfraEnv, nil).Times(1)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(dbInfraEnv, nil).Times(1)
 		kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
 			PullSecretRef:  &corev1.LocalObjectReference{Name: "pull-secret"},
 			IPXEScriptType: aiv1beta1.DiscoveryImageAlways,
@@ -334,6 +378,40 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(scriptURL.Query().Has("ipxe_script_type")).To(BeFalse())
 	})
 
+	It("sets the discovery ignition boot artifact url", func() {
+		dbInfraEnv := &common.InfraEnv{
+			GeneratedAt: strfmt.DateTime(time.Now()),
+			InfraEnv: models.InfraEnv{
+				ID:              &sId,
+				CPUArchitecture: infraEnvArch,
+				DownloadURL:     "https://images.example.com/images/best-image",
+			},
+		}
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(dbInfraEnv, nil).Times(1)
+		kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, kubeInfraEnv)).To(Succeed())
+
+		_, err := ir.Reconcile(ctx, newInfraEnvRequest(kubeInfraEnv))
+		Expect(err).ToNot(HaveOccurred())
+
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "myInfraEnv",
+		}
+		Expect(c.Get(ctx, key, kubeInfraEnv)).To(BeNil())
+
+		ignitionURL, err := url.Parse(kubeInfraEnv.Status.BootArtifacts.DiscoveryIgnitionURL)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ignitionURL.Scheme).To(Equal("https"))
+		Expect(ignitionURL.Host).To(Equal("www.acme.com"))
+		Expect(ignitionURL.Path).To(Equal(fmt.Sprintf("/api/assisted-install/v2/infra-envs/%s/downloads/files", sId)))
+		Expect(ignitionURL.Query().Get("file_name")).To(Equal("discovery.ign"))
+	})
+
 	Context("discovery kernel arguments", func() {
 		encodeKernelArguments := func(kargs []aiv1beta1.KernelArgument) *string {
 			internalKargs := internalKernelArgs(kargs)
@@ -378,7 +456,7 @@ var _ = Describe("infraEnv reconcile", func() {
 				}
 				backendInfraEnv.KernelArguments = encodeKernelArguments(initialKargs)
 				mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil).Times(1)
-				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 				kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
 					PullSecretRef:   &corev1.LocalObjectReference{Name: "pull-secret"},
 					KernelArguments: initialKargs,
@@ -390,8 +468,8 @@ var _ = Describe("infraEnv reconcile", func() {
 				}
 
 				Expect(c.Get(ctx, key, kubeInfraEnv)).To(BeNil())
-				mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Times(1).DoAndReturn(
-					func(ctx context.Context, params installer.UpdateInfraEnvParams, _ *string) (*common.InfraEnv, error) {
+				mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Times(1).DoAndReturn(
+					func(ctx context.Context, params installer.UpdateInfraEnvParams, _ *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) (*common.InfraEnv, error) {
 						Expect(internalKernelArgs(updateKargs)).To(Equal(params.InfraEnvUpdateParams.KernelArguments))
 						return dbInfraEnv, nil
 					})
@@ -419,8 +497,8 @@ var _ = Describe("infraEnv reconcile", func() {
 			},
 		}
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Return(dbInfraEnv, nil).Times(1)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(dbInfraEnv, nil).Times(1)
 		kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
 			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
 		})
@@ -488,8 +566,8 @@ var _ = Describe("infraEnv reconcile", func() {
 				},
 			}
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil).AnyTimes()
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Return(dbInfraEnv, nil).Times(2)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(dbInfraEnv, nil).Times(2)
 
 			kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
 				PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
@@ -530,9 +608,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		expectedError := common.NewApiError(http.StatusInternalServerError, errors.New("server error"))
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 			}).Return(nil, expectedError).Times(1)
 
@@ -581,9 +659,9 @@ var _ = Describe("infraEnv reconcile", func() {
 			Name:      "infraEnvImage",
 		}
 		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		expectedState := fmt.Sprintf("%s: server error", aiv1beta1.ImageStateFailedToCreate)
+		expectedState := fmt.Sprintf("%s: server error", aiv1beta1.MissingClusterDeploymentReference)
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(expectedState))
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreationErrorReason))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.MissingClusterDeploymentReason))
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionUnknown))
 
 		By("validate events URL")
@@ -609,9 +687,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		}
 		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
 		expectedState := fmt.Sprintf("%s: cluster does not exist: clusterDeployment, check AgentClusterInstall conditions: name %s in namespace %s",
-			aiv1beta1.ImageStateFailedToCreate, clusterDeployment.Spec.ClusterInstallRef.Name, clusterDeployment.Namespace)
+			aiv1beta1.MissingClusterDeploymentReference, clusterDeployment.Spec.ClusterInstallRef.Name, clusterDeployment.Namespace)
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(expectedState))
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreationErrorReason))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.MissingClusterDeploymentReason))
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionUnknown))
 
 		By("validate events URL")
@@ -625,9 +703,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		expectedError := common.NewApiError(http.StatusConflict, errors.New("Another request to generate an image has been recently submitted. Please wait a few seconds and try again."))
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 			}).Return(nil, expectedError).Times(1)
 
@@ -662,9 +740,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		expectedClientError := common.NewApiError(http.StatusBadRequest, errors.New("client error"))
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil).Times(2)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 			}).Return(nil, expectedClientError).Times(1)
 		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
@@ -688,9 +766,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		// retry immediately
 
 		expectedConflictError := common.NewApiError(http.StatusConflict, errors.New("Another request to generate an image has been recently submitted. Please wait a few seconds and try again."))
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 			}).Return(nil, expectedConflictError).Times(1)
 		res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
@@ -706,9 +784,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		expectedError := common.NewApiError(http.StatusBadRequest, errors.New("client error"))
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 			}).Return(nil, expectedError).Times(1)
 		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
@@ -737,6 +815,60 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).To(HavePrefix(eventURL))
 	})
 
+	It("create and update infraenv image type", func() {
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		backendInfraEnv.Type = common.ImageTypePtr(models.ImageTypeMinimalIso)
+
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
+				Expect(params.InfraenvCreateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
+			}).Return(backendInfraEnv, nil)
+
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+
+		key := types.NamespacedName{
+			Namespace: infraEnvImage.Namespace,
+			Name:      infraEnvImage.Name,
+		}
+		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+
+		//Reconcile and make sure the image type was updated in spec
+		infraEnvImage.Spec.ImageType = models.ImageTypeFullIso
+		Expect(c.Update(ctx, infraEnvImage)).To(BeNil())
+
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).AnyTimes()
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil).AnyTimes()
+		mockInstallerInternal.EXPECT().GetInfraEnvHostsInternal(gomock.Any(), gomock.Any()).Return([]*common.Host{}, nil).AnyTimes()
+		mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeFullIso))
+			}).Return(
+			&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+		// Make sure the image type was updated in spec
+		res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+
+		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+		Expect(infraEnvImage.Spec.ImageType).To(Equal(models.ImageTypeFullIso))
+	})
+
 	It("create new image - clusterDeployment not exists", func() {
 		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
 			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
@@ -757,9 +889,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		expectedState := fmt.Sprintf(
 			"%s: failed to get clusterDeployment with name clusterDeployment in namespace %s: "+
 				"clusterdeployments.hive.openshift.io \"clusterDeployment\" not found",
-			aiv1beta1.ImageStateFailedToCreate, testNamespace)
+			aiv1beta1.MissingClusterDeploymentReference, testNamespace)
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(expectedState))
-		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreationErrorReason))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.MissingClusterDeploymentReason))
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionUnknown))
 
 		By("validate events URL")
@@ -782,9 +914,9 @@ var _ = Describe("infraEnv reconcile", func() {
 
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 				Expect(swag.StringValue(params.InfraEnvUpdateParams.Proxy.HTTPProxy)).To(Equal("http://192.168.1.2"))
 				Expect(swag.StringValue(params.InfraEnvUpdateParams.AdditionalNtpSources)).To(Equal("foo.com,bar.com"))
@@ -793,6 +925,92 @@ var _ = Describe("infraEnv reconcile", func() {
 		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).To(BeNil())
 		Expect(res).To(Equal(ctrl.Result{Requeue: false}))
+	})
+
+	It("create image with exclusive ntpSources", func() {
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace,
+			aiv1beta1.InfraEnvSpec{
+				NTPSources: []string{"ntp1.example.com", "ntp2.example.com"},
+				ClusterRef: &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+				PullSecretRef: &corev1.LocalObjectReference{
+					Name: "pull-secret",
+				},
+			})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+				Expect(swag.StringValue(params.InfraEnvUpdateParams.NtpSources)).To(Equal("ntp1.example.com,ntp2.example.com"))
+			}).Return(&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}}, nil).Times(1)
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: false}))
+	})
+
+	Context("update NTP sources", func() {
+		var notSent *string
+		DescribeTable("sends only the NTP fields that differ from the DB",
+			func(dbAdditional, dbExclusive string, specAdditional, specExclusive []string, expectedAdditional, expectedExclusive *string) {
+				dbInfraEnv := &common.InfraEnv{InfraEnv: models.InfraEnv{
+					ID:                   &sId,
+					AdditionalNtpSources: dbAdditional,
+					NtpSources:           dbExclusive,
+				}}
+				mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(dbInfraEnv, nil)
+				mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).DoAndReturn(
+					func(ctx context.Context, params installer.UpdateInfraEnvParams, _ *string, _ *common.MirrorRegistryConfiguration) (*common.InfraEnv, error) {
+						Expect(params.InfraEnvUpdateParams.AdditionalNtpSources).To(Equal(expectedAdditional))
+						Expect(params.InfraEnvUpdateParams.NtpSources).To(Equal(expectedExclusive))
+						return &common.InfraEnv{InfraEnv: models.InfraEnv{ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}}, nil
+					})
+				kubeInfraEnv := newInfraEnvImage("myInfraEnv", testNamespace, aiv1beta1.InfraEnvSpec{
+					PullSecretRef:        &corev1.LocalObjectReference{Name: "pull-secret"},
+					AdditionalNTPSources: specAdditional,
+					NTPSources:           specExclusive,
+				})
+				Expect(c.Create(ctx, kubeInfraEnv)).To(Succeed())
+
+				_, err := ir.Reconcile(ctx, newInfraEnvRequest(kubeInfraEnv))
+				Expect(err).ToNot(HaveOccurred())
+			},
+			Entry("switch from additionalNTPSources to ntpSources", "foo.com", "", nil, []string{"bar.com"}, swag.String(""), swag.String("bar.com")),
+			Entry("switch from ntpSources to additionalNTPSources", "", "bar.com", []string{"foo.com"}, nil, swag.String("foo.com"), swag.String("")),
+			Entry("unchanged ntpSources", "", "bar.com", nil, []string{"bar.com"}, notSent, notSent),
+		)
+	})
+
+	It("register new infraEnv with exclusive ntpSources", func() {
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
+				Expect(swag.StringValue(params.InfraenvCreateParams.NtpSources)).To(Equal("ntp1.example.com,ntp2.example.com"))
+			}).Return(backendInfraEnv, nil)
+
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+			NTPSources: []string{"ntp1.example.com", "ntp2.example.com"},
+			ClusterRef: &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+			PullSecretRef: &corev1.LocalObjectReference{
+				Name: "pull-secret",
+			},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
 	})
 
 	It("create image with ignition config override", func() {
@@ -810,9 +1028,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 				Expect(params.InfraEnvUpdateParams.IgnitionConfigOverride).To(Equal(ignitionConfigOverride))
 			}).Return(&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}}, nil).Times(1)
@@ -837,9 +1055,9 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 				Expect(params.InfraEnvUpdateParams.IgnitionConfigOverride).To(Equal(ignitionConfigOverride))
 			}).Return(nil, errors.Errorf("error")).Times(1)
@@ -864,8 +1082,8 @@ var _ = Describe("infraEnv reconcile", func() {
 
 		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).Return(nil, errors.Errorf("failure")).Times(1)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).Return(nil, errors.Errorf("failure")).Times(1)
 
 		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).ToNot(BeNil())
@@ -880,152 +1098,126 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionFalse))
 	})
 
-	It("Delete infraEnv with no hosts verify finalizer removed", func() {
-		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
-		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
-				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
-			}).Return(
-			&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
-		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
-			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
-			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+	Context("Deleting an InfraEnv", func() {
+		It("with no hosts should remove finalizers and return success", func() {
+			clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+			Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+			infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+				ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+				PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+			})
+			Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+			res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			key := types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      "infraEnvImage",
+			}
+			// Verify finalizer was added
+			Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+			Expect(infraEnvImage.Finalizers).ToNot(BeNil())
+			Expect(infraEnvImage.Finalizers[0]).To(Equal(InfraEnvFinalizerName))
+
+			// Delete InfraEnv, finalizer still exists
+			Expect(c.Delete(ctx, infraEnvImage)).To(BeNil())
+			Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+			Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
+			Expect(infraEnvImage.Finalizers).ToNot(BeNil())
+
+			// Reconcile and verify CR is deleted
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil)
+			res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			Expect(apierrors.IsNotFound(c.Get(ctx, key, infraEnvImage))).To(BeTrue())
 		})
-		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 
-		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(BeNil())
-		Expect(res).To(Equal(ctrl.Result{}))
+		It("with bound and unbound hosts should still allow InfraEnv deletion even if the Agents still exist", func() {
+			clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+			Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+			infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+				ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+				PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+			})
+			Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 
-		key := types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      "infraEnvImage",
-		}
-		// Verify finalizer was added
-		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		Expect(infraEnvImage.Finalizers).ToNot(BeNil())
-		Expect(infraEnvImage.Finalizers[0]).To(Equal(InfraEnvFinalizerName))
+			res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
 
-		//Delete InfraEnv, finalizer still exists
-		Expect(c.Delete(ctx, infraEnvImage)).To(BeNil())
-		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
-		Expect(infraEnvImage.Finalizers).ToNot(BeNil())
+			key := types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      "infraEnvImage",
+			}
+			// Delete InfraEnv, finalizer still exists
+			Expect(c.Delete(ctx, infraEnvImage)).To(BeNil())
+			Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+			Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
+			Expect(infraEnvImage.Finalizers).ToNot(BeNil())
+			mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil)
 
-		// Reconcile and verify CR is deleted
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().GetInfraEnvHostsInternal(gomock.Any(), gomock.Any()).Return([]*common.Host{}, nil)
-		mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil)
-		res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(BeNil())
-		Expect(res).To(Equal(ctrl.Result{}))
+			// Create hosts and agents
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			hostUnboundId := strfmt.UUID(uuid.New().String())
+			hostBoundId := strfmt.UUID(uuid.New().String())
 
-		Expect(apierrors.IsNotFound(c.Get(ctx, key, infraEnvImage))).To(BeTrue())
-	})
+			boundAgent := newAgent(hostBoundId.String(), testNamespace, aiv1beta1.AgentSpec{Approved: true, ClusterDeploymentName: &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace}})
+			boundAgent.Finalizers = []string{}
+			boundAgent.Labels = map[string]string{aiv1beta1.InfraEnvNameLabel: infraEnvImage.Name}
+			boundAgent.OwnerReferences = []metav1.OwnerReference{
+				{
+					APIVersion: infraEnvImage.APIVersion,
+					Kind:       infraEnvImage.Kind,
+					Name:       infraEnvImage.Name,
+					UID:        infraEnvImage.UID,
+				},
+			}
+			Expect(c.Create(ctx, boundAgent)).To(BeNil())
+			unboundAgent := newAgent(hostUnboundId.String(), testNamespace, aiv1beta1.AgentSpec{Approved: true})
+			unboundAgent.Finalizers = []string{}
+			unboundAgent.Labels = map[string]string{aiv1beta1.InfraEnvNameLabel: infraEnvImage.Name}
+			unboundAgent.OwnerReferences = []metav1.OwnerReference{
+				{
+					APIVersion: infraEnvImage.APIVersion,
+					Kind:       infraEnvImage.Kind,
+					Name:       infraEnvImage.Name,
+					UID:        infraEnvImage.UID,
+				},
+			}
+			Expect(c.Create(ctx, unboundAgent)).To(BeNil())
+			_, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+			Expect(err).To(BeNil())
 
-	It("Delete infraEnv with Unbound hosts verify hosts are deleted", func() {
-		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
-		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
-				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
-			}).Return(
-			&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
-		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
-			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
-			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+			// Verify that the InfraEnv CR is deleted
+			Expect(apierrors.IsNotFound(c.Get(ctx, key, infraEnvImage))).To(BeTrue())
+
+			// Verify that the agents still exist
+			Expect(apierrors.IsNotFound(c.Get(ctx, types.NamespacedName{Name: unboundAgent.Name, Namespace: testNamespace}, unboundAgent))).To(BeFalse())
+			Expect(apierrors.IsNotFound(c.Get(ctx, types.NamespacedName{Name: boundAgent.Name, Namespace: testNamespace}, boundAgent))).To(BeFalse())
 		})
-		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
-
-		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(BeNil())
-		Expect(res).To(Equal(ctrl.Result{}))
-
-		key := types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      "infraEnvImage",
-		}
-		//Delete InfraEnv, finalizer still exists
-		Expect(c.Delete(ctx, infraEnvImage)).To(BeNil())
-		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
-		Expect(infraEnvImage.Finalizers).ToNot(BeNil())
-
-		// Reconcile and verify only Bound Host is deleted
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		hostId := strfmt.UUID(uuid.New().String())
-		host := &common.Host{Host: models.Host{ID: &hostId, Status: swag.String(models.HostStatusKnownUnbound)}}
-		mockInstallerInternal.EXPECT().GetInfraEnvHostsInternal(gomock.Any(), gomock.Any()).Return([]*common.Host{host}, nil)
-		mockInstallerInternal.EXPECT().V2DeregisterHostInternal(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().DeregisterInfraEnvInternal(gomock.Any(), gomock.Any()).Return(nil)
-		res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(BeNil())
-		Expect(res).To(Equal(ctrl.Result{}))
-
-		// Verify that InfraEnv CR is deleted
-		Expect(apierrors.IsNotFound(c.Get(ctx, key, infraEnvImage))).To(BeTrue())
-	})
-
-	It("Delete infraEnv with Bound and Unbound hosts verify only Unbound hosts are deleted", func() {
-		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
-		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
-		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
-				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-				Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
-			}).Return(
-			&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
-		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
-			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
-			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
-		})
-		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
-
-		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(BeNil())
-		Expect(res).To(Equal(ctrl.Result{}))
-
-		key := types.NamespacedName{
-			Namespace: testNamespace,
-			Name:      "infraEnvImage",
-		}
-		//Delete InfraEnv, finalizer still exists
-		Expect(c.Delete(ctx, infraEnvImage)).To(BeNil())
-		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
-		Expect(infraEnvImage.Finalizers).ToNot(BeNil())
-
-		// Reconcile and verify Host are deleted
-		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-		hostUnboundId := strfmt.UUID(uuid.New().String())
-		hostBoundId := strfmt.UUID(uuid.New().String())
-		hostUnbound := &common.Host{Host: models.Host{ID: &hostUnboundId, InfraEnvID: *backendInfraEnv.ID, Status: swag.String(models.HostStatusKnownUnbound)}}
-		hostBound := &common.Host{Host: models.Host{ID: &hostBoundId, InfraEnvID: *backendInfraEnv.ID, Status: swag.String(models.HostStatusKnown)}}
-		mockInstallerInternal.EXPECT().GetInfraEnvHostsInternal(gomock.Any(), gomock.Any()).Return([]*common.Host{hostUnbound, hostBound}, nil)
-		mockInstallerInternal.EXPECT().V2DeregisterHostInternal(gomock.Any(), installer.V2DeregisterHostParams{
-			InfraEnvID: *backendInfraEnv.ID,
-			HostID:     hostUnboundId,
-		}, bminventory.NonInteractive).Return(nil)
-		res, err = ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
-		Expect(err).To(Not(BeNil()))
-		Expect(res).To(Equal(ctrl.Result{RequeueAfter: longerRequeueAfterOnError}))
-
-		//Verify that InfraEnv CR still exists with finalizer
-		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-		Expect(infraEnvImage.ObjectMeta.DeletionTimestamp.IsZero()).To(BeFalse())
-		Expect(infraEnvImage.Finalizers).ToNot(BeNil())
 	})
 
 	It("InfraEnv is created when doesn't exist in DB - custom OSImageVersion, no cluster ref", func() {
@@ -1040,12 +1232,12 @@ var _ = Describe("infraEnv reconcile", func() {
 		})
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-			Do(func(ctx context.Context, kubeKey *types.NamespacedName, params installer.RegisterInfraEnvParams) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
 				Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(osImageVersion))
 			}).Return(backendInfraEnv, nil)
-		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(osImageVersion)}, nil).AnyTimes()
+		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(osImageVersion)}, nil).AnyTimes()
 
 		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).To(BeNil())
@@ -1064,7 +1256,7 @@ var _ = Describe("infraEnv reconcile", func() {
 		})
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
-		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any()).Return(nil, gorm.ErrRecordNotFound).AnyTimes()
+		mockOSImages.EXPECT().GetOsImage(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, gorm.ErrRecordNotFound).AnyTimes()
 
 		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).To(BeNil())
@@ -1076,7 +1268,7 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionFalse))
 	})
 
-	It("InfraEnv is created when doesn't exist in DB - OSImageVersion not specified", func() {
+	It("InfraEnv is created when doesn't exist in DB - OSImageVersion and OsStream not specified", func() {
 		key := types.NamespacedName{
 			Namespace: testNamespace,
 			Name:      "infraEnvImage",
@@ -1086,10 +1278,11 @@ var _ = Describe("infraEnv reconcile", func() {
 		})
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-			Do(func(ctx context.Context, kubeKey *types.NamespacedName, params installer.RegisterInfraEnvParams) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
 				Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(""))
+				Expect(params.InfraenvCreateParams.OsStream).To(Equal(""))
 			}).Return(backendInfraEnv, nil)
 
 		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
@@ -1118,11 +1311,96 @@ var _ = Describe("infraEnv reconcile", func() {
 		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
 
 		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
-		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any()).
-			Do(func(ctx context.Context, kubeKey *types.NamespacedName, params installer.RegisterInfraEnvParams) {
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
 				Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(ocpVersion))
 			}).Return(backendInfraEnv, nil)
+
+		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(result).To(Equal(ctrl.Result{}))
+	})
+
+	It("InfraEnv is created with OS stream from spec", func() {
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		infraEnvImage := newInfraEnvImage(key.Name, testNamespace, aiv1beta1.InfraEnvSpec{
+			OSStream:      "rhel-10",
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
+				Expect(params.InfraenvCreateParams.OsStream).To(Equal("rhel-10"))
+			}).Return(backendInfraEnv, nil)
+
+		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(result).To(Equal(ctrl.Result{}))
+	})
+
+	It("InfraEnv is created with OS stream inherited from cluster", func() {
+		sId = strfmt.UUID(uuid.New().String())
+		backEndCluster = &common.Cluster{Cluster: models.Cluster{
+			ID:               &sId,
+			OpenshiftVersion: ocpVersion,
+			OsStream:         "rhel-9",
+		}}
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		infraEnvImage := newInfraEnvImage(key.Name, testNamespace, aiv1beta1.InfraEnvSpec{
+			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
+				Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(ocpVersion))
+				Expect(params.InfraenvCreateParams.OsStream).To(Equal("rhel-9"))
+			}).Return(backendInfraEnv, nil)
+
+		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(result).To(Equal(ctrl.Result{}))
+	})
+
+	It("validates OS image version against the selected OS stream", func() {
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		osImageVersion := "4.13"
+		infraEnvImage := newInfraEnvImage(key.Name, testNamespace, aiv1beta1.InfraEnvSpec{
+			OSImageVersion: osImageVersion,
+			OSStream:       "rhel-9",
+			PullSecretRef:  &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(nil, gorm.ErrRecordNotFound)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+		mockInstallerInternal.EXPECT().RegisterInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Do(func(ctx context.Context, kubeKey *types.NamespacedName, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration, params installer.RegisterInfraEnvParams) {
+				Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(osImageVersion))
+				Expect(params.InfraenvCreateParams.OsStream).To(Equal("rhel-9"))
+			}).Return(backendInfraEnv, nil)
+		mockOSImages.EXPECT().GetOsImage(osImageVersion, gomock.Any(), "rhel-9", gomock.Any()).Return(&models.OsImage{
+			CPUArchitecture:  swag.String(infraEnvArch),
+			OpenshiftVersion: swag.String(osImageVersion),
+		}, nil).Times(1)
 
 		result, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
 		Expect(err).To(BeNil())
@@ -1143,11 +1421,11 @@ var _ = Describe("infraEnv reconcile", func() {
 			Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil).Times(2)
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil).Times(2)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil).Times(2)
-			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-					Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
 				}).Return(
 				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(2)
 			infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
@@ -1188,10 +1466,11 @@ var _ = Describe("infraEnv reconcile", func() {
 			pullSecretString = "pull-secret-string"
 			cpuArch          = "x86_64"
 			openshiftVersion = "4.10.0-rc1"
+			osStream         = "rhel-10"
 			imageType        = "full-iso"
 		)
 		It("create new param - success", func() {
-			cluster := &common.Cluster{Cluster: models.Cluster{ID: &sId, CPUArchitecture: cpuArch, OpenshiftVersion: openshiftVersion}}
+			cluster := &common.Cluster{Cluster: models.Cluster{ID: &sId, CPUArchitecture: cpuArch, OpenshiftVersion: openshiftVersion, OsStream: osStream}}
 
 			infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
 				ClusterRef:    &aiv1beta1.ClusterReference{Name: clusterName, Namespace: testNamespace},
@@ -1208,12 +1487,13 @@ var _ = Describe("infraEnv reconcile", func() {
 				},
 				AdditionalTrustBundle: "AdditionalTrustBundle",
 			})
-			params := CreateInfraEnvParams(infraEnvImage, models.ImageType(imageType), pullSecretString, cluster.ID, cluster.OpenshiftVersion)
+			params := CreateInfraEnvParams(infraEnvImage, models.ImageType(imageType), pullSecretString, cluster.ID, cluster.OpenshiftVersion, cluster.OsStream)
 
 			Expect(params).ToNot(BeNil())
 			Expect(params.InfraenvCreateParams.ClusterID).To(Equal(cluster.ID))
 			Expect(params.InfraenvCreateParams.PullSecret).To(Equal(&pullSecretString))
 			Expect(params.InfraenvCreateParams.OpenshiftVersion).To(Equal(cluster.OpenshiftVersion))
+			Expect(params.InfraenvCreateParams.OsStream).To(Equal(osStream))
 			Expect(params.InfraenvCreateParams.CPUArchitecture).To(Equal(infraEnvImage.Spec.CpuArchitecture))
 			Expect(params.InfraenvCreateParams.IgnitionConfigOverride).To(Equal(infraEnvImage.Spec.IgnitionConfigOverride))
 			Expect(params.InfraenvCreateParams.SSHAuthorizedKey).To(Equal(&infraEnvImage.Spec.SSHAuthorizedKey))
@@ -1260,11 +1540,11 @@ var _ = Describe("infraEnv reconcile", func() {
 
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-					Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
 					Expect(params.InfraEnvUpdateParams.StaticNetworkConfig).To(Equal([]*models.HostStaticNetworkConfig{hostStaticNetworkConfig}))
 				}).Return(
 				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}}, nil).Times(1)
@@ -1284,8 +1564,7 @@ var _ = Describe("infraEnv reconcile", func() {
 				Name:      "infraEnvImage",
 			}
 			Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.ImageStateCreated))
-			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreatedReason))
+			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.InfraEnvAvailableReason))
 			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
 
 			// Remove nmstate selector from infraenv and reconcile again, this
@@ -1295,11 +1574,11 @@ var _ = Describe("infraEnv reconcile", func() {
 			// in the namespace when the selector is omitted.
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-					Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
 					Expect(params.InfraEnvUpdateParams.StaticNetworkConfig).To(BeEmpty())
 				}).Return(
 				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}}, nil).Times(1)
@@ -1311,8 +1590,8 @@ var _ = Describe("infraEnv reconcile", func() {
 			Expect(res).To(Equal(ctrl.Result{}))
 
 			Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
-			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(Equal(aiv1beta1.ImageStateCreated))
-			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreatedReason))
+			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Message).To(HavePrefix(aiv1beta1.InfraEnvAvailableMessage))
+			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.InfraEnvAvailableReason))
 			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
 		})
 
@@ -1332,11 +1611,11 @@ var _ = Describe("infraEnv reconcile", func() {
 			mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
 			expectedError := common.NewApiError(http.StatusBadRequest, errors.New("internal error"))
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any()).Return(nil)
-			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil).
-				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string) {
+			mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
-					Expect(params.InfraEnvUpdateParams.ImageType).To(Equal(models.ImageTypeMinimalIso))
+					Expect(string(params.InfraEnvUpdateParams.ImageType)).To(Equal(""))
 				}).Return(nil, expectedError).Times(1)
 
 			infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
@@ -1359,5 +1638,192 @@ var _ = Describe("infraEnv reconcile", func() {
 			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.ImageCreationErrorReason))
 			Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionFalse))
 		})
+	})
+})
+
+var _ = Describe("infraEnv reconcile with image service disabled", func() {
+	var (
+		c                     client.Client
+		ir                    *InfraEnvReconciler
+		mockCtrl              *gomock.Controller
+		mockInstallerInternal *bminventory.MockInstallerInternals
+		mockOSImages          *versions.MockOSImages
+		ctx                   = context.Background()
+		sId                   strfmt.UUID
+		backEndCluster        = &common.Cluster{Cluster: models.Cluster{ID: &sId}}
+		backendInfraEnv       = &common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId}}
+		downloadURL           = "https://downloadurl"
+		eventURL              string
+		infraEnvArch          = "x86_64"
+		ocpVersion            = "4.10"
+	)
+
+	BeforeEach(func() {
+		c = fakeclient.NewClientBuilder().WithScheme(scheme.Scheme).
+			WithStatusSubresource(&aiv1beta1.InfraEnv{}).Build()
+		mockCtrl = gomock.NewController(GinkgoT())
+		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
+		mockOSImages = versions.NewMockOSImages(mockCtrl)
+		sId = strfmt.UUID(uuid.New().String())
+		ir = &InfraEnvReconciler{
+			Client:              c,
+			Config:              InfraEnvConfig{ImageType: models.ImageTypeMinimalIso},
+			Log:                 common.GetTestLog(),
+			Installer:           mockInstallerInternal,
+			APIReader:           c,
+			ServiceBaseURL:      "https://www.acme.com",
+			ImageServiceBaseURL: "https://images.example.com",
+			OsImages:            mockOSImages,
+			PullSecretHandler:   NewPullSecretHandler(c, c, mockInstallerInternal),
+			AuthType:            auth.TypeNone,
+			ImageServiceEnabled: false,
+		}
+		pullSecret := getDefaultTestPullSecret("pull-secret", testNamespace)
+		eventURL = fmt.Sprintf("%s/api/assisted-install/v2/events?infra_env_id=%s", ir.ServiceBaseURL, sId)
+		Expect(c.Create(ctx, pullSecret)).To(BeNil())
+		mockOSImages.EXPECT().GetOpenshiftVersions().Return([]string{"4.8"}).AnyTimes()
+		mockOSImages.EXPECT().GetOsImageOrLatest(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&models.OsImage{CPUArchitecture: swag.String(infraEnvArch), OpenshiftVersion: swag.String(ocpVersion)}, nil).AnyTimes()
+	})
+
+	AfterEach(func() {
+		mockCtrl.Finish()
+	})
+
+	It("create new infraEnv - no URLs generated", func() {
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+			}).Return(
+			&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+			ClusterRef:    &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+
+		// Verify that no boot artifact URLs are set when image service is disabled
+		Expect(infraEnvImage.Status.BootArtifacts.KernelURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.RootfsURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.InitrdURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.IpxeScriptURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.DiscoveryIgnitionURL).To(BeEmpty())
+
+		// Verify that ISO download URL is not set when image service is disabled
+		Expect(infraEnvImage.Status.ISODownloadURL).To(BeEmpty())
+
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition)).NotTo(BeNil())
+
+		By("validate events URL is still populated")
+		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).NotTo(BeEmpty())
+		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).To(HavePrefix(eventURL))
+	})
+
+	It("create new infraEnv without cluster ref - no URLs generated", func() {
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace, aiv1beta1.InfraEnvSpec{
+			PullSecretRef: &corev1.LocalObjectReference{Name: "pull-secret"},
+		})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+			}).Return(
+			&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{}))
+
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+
+		// Verify that no boot artifact URLs are set when image service is disabled
+		Expect(infraEnvImage.Status.BootArtifacts.KernelURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.RootfsURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.InitrdURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.IpxeScriptURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.DiscoveryIgnitionURL).To(BeEmpty())
+
+		// Verify that ISO download URL is not set when image service is disabled
+		Expect(infraEnvImage.Status.ISODownloadURL).To(BeEmpty())
+
+		// Verify condition is still set to success
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Reason).To(Equal(aiv1beta1.InfraEnvAvailableReason))
+
+		By("validate events URL is still populated")
+		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).NotTo(BeEmpty())
+		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).To(HavePrefix(eventURL))
+	})
+
+	It("create new infraEnv with proxy and NTP sources - no URLs generated", func() {
+		clusterDeployment := newClusterDeployment("clusterDeployment", testNamespace, getDefaultClusterDeploymentSpec("clusterDeployment-test", "test-cluster-aci", "pull-secret"))
+		Expect(c.Create(ctx, clusterDeployment)).To(BeNil())
+		infraEnvImage := newInfraEnvImage("infraEnvImage", testNamespace,
+			aiv1beta1.InfraEnvSpec{
+				Proxy:                &aiv1beta1.Proxy{HTTPProxy: "http://192.168.1.2"},
+				AdditionalNTPSources: []string{"foo.com", "bar.com"},
+				ClusterRef:           &aiv1beta1.ClusterReference{Name: "clusterDeployment", Namespace: testNamespace},
+				PullSecretRef: &corev1.LocalObjectReference{
+					Name: "pull-secret",
+				},
+			})
+		Expect(c.Create(ctx, infraEnvImage)).To(BeNil())
+
+		mockInstallerInternal.EXPECT().GetClusterByKubeKey(gomock.Any()).Return(backEndCluster, nil)
+		mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+		mockInstallerInternal.EXPECT().ValidatePullSecret(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), nil, nil).
+			Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+				Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+				Expect(swag.StringValue(params.InfraEnvUpdateParams.Proxy.HTTPProxy)).To(Equal("http://192.168.1.2"))
+				Expect(swag.StringValue(params.InfraEnvUpdateParams.AdditionalNtpSources)).To(Equal("foo.com,bar.com"))
+			}).Return(&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: sId, ID: &sId, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+		res, err := ir.Reconcile(ctx, newInfraEnvRequest(infraEnvImage))
+		Expect(err).To(BeNil())
+		Expect(res).To(Equal(ctrl.Result{Requeue: false}))
+
+		key := types.NamespacedName{
+			Namespace: testNamespace,
+			Name:      "infraEnvImage",
+		}
+		Expect(c.Get(ctx, key, infraEnvImage)).To(BeNil())
+
+		Expect(conditionsv1.FindStatusCondition(infraEnvImage.Status.Conditions, aiv1beta1.ImageCreatedCondition).Status).To(Equal(corev1.ConditionTrue))
+
+		// Verify that no boot artifact URLs are set when image service is disabled
+		Expect(infraEnvImage.Status.BootArtifacts.KernelURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.RootfsURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.InitrdURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.IpxeScriptURL).To(BeEmpty())
+		Expect(infraEnvImage.Status.BootArtifacts.DiscoveryIgnitionURL).To(BeEmpty())
+
+		// Verify that ISO download URL is not set when image service is disabled
+		Expect(infraEnvImage.Status.ISODownloadURL).To(BeEmpty())
+
+		// Verify that eventsURL is generated
+		Expect(infraEnvImage.Status.InfraEnvDebugInfo.EventsURL).NotTo(BeEmpty())
 	})
 })

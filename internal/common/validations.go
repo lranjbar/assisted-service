@@ -4,7 +4,11 @@
 package common
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/go-openapi/swag"
+	"github.com/openshift/assisted-service/models"
 )
 
 // IsAgentCompatible checks if the given agent image is compatible with what the service expects.
@@ -12,8 +16,21 @@ func IsAgentCompatible(expectedImage, agentImage string) bool {
 	return agentImage == expectedImage
 }
 
-var NonIgnorableHostValidations []string = []string{"connected", "has-inventory", "machine-cidr-defined", "hostname-unique", "hostname-valid"}
-var NonIgnorableClusterValidations []string = []string{"api-vips-defined", "ingress-vips-defined", "all-hosts-are-ready-to-install", "sufficient-masters-count", "pull-secret-set", "cluster-preparation-succeeded"}
+var NonIgnorableHostValidations []string = []string{
+	string(models.HostValidationIDConnected),
+	string(models.HostValidationIDHasInventory),
+	string(models.HostValidationIDInventoryNotFullyTruncated),
+	string(models.HostValidationIDMachineCidrDefined),
+	string(models.HostValidationIDHostnameUnique),
+	string(models.HostValidationIDHostnameValid),
+}
+var NonIgnorableClusterValidations []string = []string{
+	string(models.ClusterValidationIDAPIVipsDefined),
+	string(models.ClusterValidationIDIngressVipsDefined),
+	string(models.ClusterValidationIDAllHostsAreReadyToInstall),
+	string(models.ClusterValidationIDSufficientMastersCount),
+	string(models.ClusterValidationIDPullSecretSet),
+}
 
 func ShouldIgnoreValidation(ignoredValidations []string, validationId string, nonIgnoribles []string) bool {
 	if !MayIgnoreValidation(validationId, nonIgnoribles) {
@@ -45,4 +62,32 @@ func MayIgnoreValidations(validationIDs []string, nonIgnorables []string) (bool,
 		}
 	}
 	return result, cantBeIgnored
+}
+
+// ParseCommaSeparatedUniqueValues splits a comma-separated string into a deduplicated slice
+// of trimmed values. It returns an error if any item is empty after trimming (e.g. "a,,b").
+// itemDescription is used in error messages to describe what the values represent.
+// Returns (nil, nil) when the input is empty or whitespace-only.
+func ParseCommaSeparatedUniqueValues(value string, itemDescription string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	result := make([]string, 0)
+	seen := make(map[string]struct{})
+
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			return nil, fmt.Errorf("empty %s found in '%s'", itemDescription, value)
+		}
+		if _, exists := seen[item]; exists {
+			continue
+		}
+		seen[item] = struct{}{}
+		result = append(result, item)
+	}
+
+	return result, nil
 }

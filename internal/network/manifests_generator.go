@@ -13,12 +13,15 @@ import (
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/internal/common"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
+	operatorcommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/tang"
 	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
 	"github.com/pkg/errors"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
-	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
 
@@ -30,18 +33,21 @@ type ManifestsGeneratorAPI interface {
 	AddTelemeterManifest(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error
 	AddSchedulableMastersManifest(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error
 	AddDiskEncryptionManifest(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error
+	AddNicReapply(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error
 	IsSNODNSMasqEnabled() bool
 }
 
 type Config struct {
 	ServiceBaseURL          string `envconfig:"SERVICE_BASE_URL"`
 	EnableSingleNodeDnsmasq bool   `envconfig:"ENABLE_SINGLE_NODE_DNSMASQ" default:"false"`
+	DiskEncryptionCipher    string `envconfig:"DISK_ENCRYPTION_CIPHER" default:""`
 }
 
 type ManifestsGenerator struct {
 	manifestsApi manifestsapi.ManifestsAPI
 	Config       Config
 	DB           *gorm.DB
+	systemInfo   system.SystemInfo
 }
 
 func NewManifestsGenerator(manifestsApi manifestsapi.ManifestsAPI, config Config, db *gorm.DB) *ManifestsGenerator {
@@ -49,11 +55,18 @@ func NewManifestsGenerator(manifestsApi manifestsapi.ManifestsAPI, config Config
 		manifestsApi: manifestsApi,
 		Config:       config,
 		DB:           db,
+		systemInfo:   system.NewLocalSystemInfo(),
 	}
 }
 
+const (
+	cipherAesXtsPlain64     = "aes-xts-plain64"
+	cipherAesCbcEssivSha256 = "aes-cbc-essiv:sha256"
+)
+
 const defaultChronyConf = `
 pool 0.rhel.pool.ntp.org iburst
+sourcedir /run/chrony-dhcp
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
 rtcsync
@@ -85,7 +98,9 @@ const snoDnsmasqConf = `#!/usr/bin/env bash
 # SNO_CLUSTER_NAME_OVERRIDE=<new cluster name>
 # SNO_BASE_DOMAIN_OVERRIDE=<your new base domain>
 # SNO_DNSMASQ_IP_OVERRIDE=<new ip>
-source /etc/default/sno_dnsmasq_configuration_overrides
+if [ -f /etc/default/sno_dnsmasq_configuration_overrides ]; then
+    source /etc/default/sno_dnsmasq_configuration_overrides
+fi
 
 HOST_IP=${SNO_DNSMASQ_IP_OVERRIDE:-"{{.HOST_IP}}"}
 CLUSTER_NAME=${SNO_CLUSTER_NAME_OVERRIDE:-"{{.CLUSTER_NAME}}"}
@@ -96,6 +111,7 @@ cat << EOF > /etc/dnsmasq.d/single-node.conf
 address=/apps.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
 address=/api-int.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
 address=/api.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
+{{if .RHODS_DASHBOARD_ENABLED}}address=/rhods-dashboard-redhat-ods-applications.apps.${CLUSTER_FULL_DOMAIN}/${HOST_IP}{{end}}
 EOF
 `
 
@@ -110,7 +126,9 @@ const forceDnsDispatcherScript = `#!/bin/bash
 # SNO_CLUSTER_NAME_OVERRIDE=<new cluster name>
 # SNO_BASE_DOMAIN_OVERRIDE=<your new base domain>
 # SNO_DNSMASQ_IP_OVERRIDE=<new ip>
-source /etc/default/sno_dnsmasq_configuration_overrides
+if [ -f /etc/default/sno_dnsmasq_configuration_overrides ]; then
+    source /etc/default/sno_dnsmasq_configuration_overrides
+fi
 
 HOST_IP=${SNO_DNSMASQ_IP_OVERRIDE:-"{{.HOST_IP}}"}
 CLUSTER_NAME=${SNO_CLUSTER_NAME_OVERRIDE:-"{{.CLUSTER_NAME}}"}
@@ -165,7 +183,7 @@ spec:
             [Unit]
             Description=Run dnsmasq to provide local dns for Single Node OpenShift
             Before=kubelet.service crio.service
-            After=network.target
+            After=network.target ovs-configuration.service
 
             [Service]
             TimeoutStartSec=30
@@ -183,22 +201,27 @@ const schedulableMastersManifestPatch = `---
   value: true
 `
 
+const exclusiveChronyConf = `
+sourcedir /run/chrony-dhcp
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony`
+
 func (m *ManifestsGenerator) createChronyManifestContent(c *common.Cluster, role models.HostRole, log logrus.FieldLogger) ([]byte, error) {
 	sources := make([]string, 0)
 
 	for _, host := range c.Hosts {
-		if host.NtpSources == "" {
-			continue
-		}
+		if host.NtpSources != "" {
+			var ntpSources []*models.NtpSource
+			if err := json.Unmarshal([]byte(host.NtpSources), &ntpSources); err != nil {
+				return nil, errors.Wrapf(err, "Failed to unmarshal %s", host.NtpSources)
+			}
 
-		var ntpSources []*models.NtpSource
-		if err := json.Unmarshal([]byte(host.NtpSources), &ntpSources); err != nil {
-			return nil, errors.Wrapf(err, "Failed to unmarshal %s", host.NtpSources)
-		}
-
-		for _, source := range ntpSources {
-			if !funk.Contains(sources, source.SourceName) {
-				sources = append(sources, source.SourceName)
+			for _, source := range ntpSources {
+				if !lo.Contains(sources, source.SourceName) {
+					sources = append(sources, source.SourceName)
+				}
 			}
 		}
 
@@ -212,13 +235,18 @@ func (m *ManifestsGenerator) createChronyManifestContent(c *common.Cluster, role
 			if source == "" {
 				continue
 			}
-			if !funk.Contains(sources, source) {
+			if !lo.Contains(sources, source) {
 				sources = append(sources, source)
 			}
 		}
 	}
 
-	content := defaultChronyConf[:]
+	var content string
+	if c.NtpSources != "" {
+		content = exclusiveChronyConf[:]
+	} else {
+		content = defaultChronyConf[:]
+	}
 
 	for _, source := range sources {
 		content += fmt.Sprintf("\nserver %s iburst", source)
@@ -233,7 +261,11 @@ func (m *ManifestsGenerator) createChronyManifestContent(c *common.Cluster, role
 }
 
 func (m *ManifestsGenerator) AddChronyManifest(ctx context.Context, log logrus.FieldLogger, cluster *common.Cluster) error {
-	for _, role := range []models.HostRole{models.HostRoleMaster, models.HostRoleWorker} {
+	roles := []models.HostRole{models.HostRoleMaster, models.HostRoleWorker}
+	if common.IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		roles = append(roles, models.HostRoleArbiter)
+	}
+	for _, role := range roles {
 		content, err := m.createChronyManifestContent(cluster, role, log)
 
 		if err != nil {
@@ -273,6 +305,7 @@ spec:
     storage:
       luks:
         - name: root
+          label: luks-root
           device: /dev/disk/by-partlabel/root
           clevis:
 		  {{- if eq .MODE "tpm" }}
@@ -284,7 +317,7 @@ spec:
                 thumbprint: {{ .Thumbprint }}
             {{- end }}
 		  {{- end }}
-          options: [--cipher, aes-cbc-essiv:sha256]
+          options: [--cipher, {{ .CIPHER }}]
           wipeVolume: true
       filesystems:
         - device: /dev/mapper/root
@@ -318,20 +351,17 @@ func (m *ManifestsGenerator) createDiskEncryptionManifest(ctx context.Context, l
 
 func (m *ManifestsGenerator) AddDiskEncryptionManifest(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error {
 
-	if swag.StringValue(c.DiskEncryption.EnableOn) == models.DiskEncryptionEnableOnNone {
+	if !common.IsConfigured(c.DiskEncryption) {
 		return nil
 	}
 
-	manifestParams := map[string]interface{}{}
+	manifestParams := map[string]interface{}{
+		"CIPHER": m.GetDiskEncryptionCipher(log),
+	}
 
-	switch *c.DiskEncryption.Mode {
-
-	case models.DiskEncryptionModeTpmv2:
-
+	if common.IsSetWithTpm(c.DiskEncryption) {
 		manifestParams["MODE"] = "tpm"
-
-	case models.DiskEncryptionModeTang:
-
+	} else if common.IsSetWithTang(c.DiskEncryption) {
 		tangServers, err := tang.UnmarshalTangServers(c.DiskEncryption.TangServers)
 		if err != nil {
 			log.WithError(err).Error("failed to unmarshal tang_server from cluster object")
@@ -342,29 +372,24 @@ func (m *ManifestsGenerator) AddDiskEncryptionManifest(ctx context.Context, log 
 		manifestParams["TANG_SERVERS"] = tangServers
 	}
 
-	switch *c.DiskEncryption.EnableOn {
+	diskEncryption := *c.DiskEncryption
 
-	case models.DiskEncryptionEnableOnAll:
-
+	if common.EnabledForRole(diskEncryption, models.HostRoleMaster) {
 		manifestParams["ROLE"] = "master"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
 		}
+	}
 
-		manifestParams["ROLE"] = "worker"
+	if common.EnabledForRole(diskEncryption, models.HostRoleArbiter) &&
+		common.IsClusterTopologyHighlyAvailableArbiter(c) {
+		manifestParams["ROLE"] = "arbiter"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
 		}
+	}
 
-	case models.DiskEncryptionEnableOnMasters:
-
-		manifestParams["ROLE"] = "master"
-		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
-			return err
-		}
-
-	case models.DiskEncryptionEnableOnWorkers:
-
+	if common.EnabledForRole(diskEncryption, models.HostRoleWorker) {
 		manifestParams["ROLE"] = "worker"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
@@ -419,14 +444,17 @@ func createDnsmasqForSingleNode(log logrus.FieldLogger, cluster *common.Cluster)
 		return nil, err
 	}
 
+	rhodsEnabled := operatorcommon.HasOperator(cluster.MonitoredOperators, openshiftai.Operator.Name)
+
 	var manifestParams = map[string]interface{}{
-		"CLUSTER_NAME": cluster.Cluster.Name,
-		"DNS_DOMAIN":   cluster.Cluster.BaseDNSDomain,
-		"HOST_IP":      hostIp,
+		"CLUSTER_NAME":            cluster.Cluster.Name,
+		"DNS_DOMAIN":              cluster.Cluster.BaseDNSDomain,
+		"HOST_IP":                 hostIp,
+		"RHODS_DASHBOARD_ENABLED": rhodsEnabled,
 	}
 
-	log.Infof("Creating dnsmasq manifest with values: cluster name: %q, domain - %q, host ip - %q",
-		cluster.Cluster.Name, cluster.Cluster.BaseDNSDomain, hostIp)
+	log.Infof("Creating dnsmasq manifest with values: cluster name: %q, domain - %q, host ip - %q, rhods dashboard enabled - %t",
+		cluster.Cluster.Name, cluster.Cluster.BaseDNSDomain, hostIp, rhodsEnabled)
 
 	content, err := fillTemplate(manifestParams, snoDnsmasqConf, log)
 	if err != nil {
@@ -465,6 +493,27 @@ func fillTemplate(manifestParams map[string]interface{}, templateData string, lo
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func (m *ManifestsGenerator) GetDiskEncryptionCipher(log logrus.FieldLogger) string {
+	if m.Config.DiskEncryptionCipher != "" {
+		log.Infof("Using explicitly configured disk encryption cipher: %s", m.Config.DiskEncryptionCipher)
+		return m.Config.DiskEncryptionCipher
+	}
+
+	fipsEnabled, err := m.systemInfo.FIPSEnabled()
+	if err != nil {
+		log.WithError(err).Warn("Failed to check FIPS status, using aes-cbc-essiv:sha256 cipher")
+		return cipherAesCbcEssivSha256
+	}
+
+	if fipsEnabled {
+		log.Info("FIPS is enabled, using aes-xts-plain64 cipher")
+		return cipherAesXtsPlain64
+	}
+
+	log.Info("FIPS is not enabled, using aes-cbc-essiv:sha256 cipher")
+	return cipherAesCbcEssivSha256
 }
 
 const (
@@ -522,6 +571,76 @@ func (m *ManifestsGenerator) AddTelemeterManifest(ctx context.Context, log logru
 		return err
 	}
 
+	return nil
+}
+
+const nicReapplyManifest = `
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: {{.ROLE}}
+  name: 50-{{.ROLE}}s-iscsi-nic-reapply
+spec:
+  config:
+    ignition:
+      version: 3.1.0
+    systemd:
+      units:
+        - name: iscsi-nic-reapply.service
+          enabled: true
+          contents: |
+            # This service is used to force the reconfiguration of the network interfaces
+            # on first boot when booting from an iSCSI volume because the DNS configuration
+            # is not propagated properly to the real root.
+            # This is a workaround for bug https://issues.redhat.com/browse/OCPBUGS-26580.
+            [Unit]
+            Description=Force reapply of network configuration on first boot when iSCSI boot volume is in use
+            After=NetworkManager.service
+
+            [Service]
+            Type=oneshot
+            ExecStart=-/bin/sh -c ' set -x; \
+            # Query to detect multipath iSCSI boot volumes \
+            MULTIPATH=".blockdevices[] | select(.tran == \\\"iscsi\\\") | select(.children) | .children[] | select(.children) | .children[].mountpoints | select(.) | index(\\\"/sysroot\\\")"; \
+            # Query to detect standalone iSCSI boot volumes \
+            ISCSI_ALONE=".blockdevices[] | select(.tran == \\\"iscsi\\\") | select(.children) | .children[].mountpoints | select(.) | index(\\\"/sysroot\\\")"; \
+            (lsblk -o NAME,TRAN,MOUNTPOINTS --json | jq -e "$MULTIPATH" > /dev/null) || (lsblk -o NAME,TRAN,MOUNTPOINTS --json | jq -e "$ISCSI_ALONE" > /dev/null); \
+            if [ $? = 0 ]; \
+            then \
+                echo "iSCSI OR multipath iSCSI boot volume detected, force network reconfiguration..."; \
+                nmcli -t -f DEVICE device status | xargs -l nmcli device reapply; \
+            fi'
+            ExecStartPost=-systemctl disable iscsi-nic-reapply.service
+
+            [Install]
+            WantedBy=multi-user.target
+`
+
+func (m *ManifestsGenerator) AddNicReapply(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error {
+	// Always add this manifest to support hosts with iSCSI boot drives, including day2 hosts.
+	// The manifest performs runtime detection and is a no-op on nodes without iSCSI.
+	log.Info("Adding NIC reapply manifest for iSCSI boot drive support")
+
+	manifestParamsList := []map[string]interface{}{
+		{"ROLE": "master"},
+		{"ROLE": "worker"},
+	}
+	if common.IsClusterTopologyHighlyAvailableArbiter(c) {
+		manifestParamsList = append(manifestParamsList, map[string]interface{}{"ROLE": "arbiter"})
+	}
+	for _, manifestParams := range manifestParamsList {
+		content, err := fillTemplate(manifestParams, nicReapplyManifest, log)
+		if err != nil {
+			log.WithError(err).Error("Failed to parse nic reapply template")
+			return err
+		}
+		manifestFilename := fmt.Sprintf("50-%ss-iscsi-nic-reapply.yaml", manifestParams["ROLE"])
+		if err := m.createManifests(ctx, c, manifestFilename, content); err != nil {
+			log.WithError(err).Error("Failed to create nic reqpply manifest")
+			return err
+		}
+	}
 	return nil
 }
 

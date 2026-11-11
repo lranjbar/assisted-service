@@ -3,32 +3,41 @@ package hardware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/feature"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
+	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/operators"
-	"github.com/openshift/assisted-service/internal/provider/external"
 	"github.com/openshift/assisted-service/internal/provider/registry"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
-	"github.com/thoas/go-funk"
 	"k8s.io/utils/ptr"
 )
 
 const (
-	tooSmallDiskTemplate       = "Disk is too small (disk only has %s, but %s are required)"
-	wrongDriveTypeTemplate     = "Drive type is %s, it must be one of %s."
-	wrongMultipathTypeTemplate = "Multipath device has path of type %s, it must be %s"
+	tooSmallDiskTemplate                    = "Disk is too small (disk only has %s, but %s are required)"
+	wrongDriveTypeTemplate                  = "Drive type is %s, it must be one of %s."
+	wrongMultipathTypeTemplate              = "Multipath device has path of unsupported type. It must be %s"
+	mixedTypesInMultipath                   = "Multipath device has paths of different types, but they must all be the same type"
+	diskIsMultipathMember                   = "Disk is a member of multipath device %s and is not eligible for installation. Use the multipath device instead."
+	wrongISCSINetworkTemplate               = "iSCSI host IP %s is the same as host IP, they must be different"
+	ErrsInIscsiDisableMultipathInstallation = "Installation on multipath device is not possible due to errors on at least one iSCSI disk"
+	iscsiHostIPNotAvailable                 = "Host IP address is not available"
+	iscsiNetworkInterfaceNotFound           = "Cannot find the network interface behind the default route"
+	iscsiHostIPParseErrorTemplate           = "Cannot parse iSCSI host IP %s: %w"
 )
 
 //go:generate mockgen -source=validator.go -package=hardware -destination=mock_validator.go
@@ -37,9 +46,9 @@ type Validator interface {
 	GetHostInstallationPath(host *models.Host) string
 	GetClusterHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirements, error)
 	GetInfraEnvHostRequirements(ctx context.Context, infraEnv *common.InfraEnv) (*models.ClusterHostRequirements, error)
-	DiskIsEligible(ctx context.Context, disk *models.Disk, infraEnv *common.InfraEnv, cluster *common.Cluster, host *models.Host, hostArchitecture string, allDisks []*models.Disk) ([]string, error)
+	DiskIsEligible(ctx context.Context, disk *models.Disk, infraEnv *common.InfraEnv, cluster *common.Cluster, host *models.Host, inventory *models.Inventory) ([]string, error)
 	ListEligibleDisks(inventory *models.Inventory) []*models.Disk
-	IsValidStorageDeviceType(disk *models.Disk, hostArchitecture string, openshiftVersion string, ociPlatformType bool) bool
+	IsValidStorageDeviceType(disk *models.Disk, hostArchitecture string, openshiftVersion string) bool
 	GetInstallationDiskSpeedThresholdMs(ctx context.Context, cluster *common.Cluster, host *models.Host) (int64, error)
 	// GetPreflightHardwareRequirements provides hardware (host) requirements that can be calculated only using cluster information.
 	// Returned information describe requirements coming from OCP and OLM operators.
@@ -51,7 +60,14 @@ func NewValidator(log logrus.FieldLogger, cfg ValidatorCfg, operatorsAPI operato
 	diskEligibilityMatchers := []*regexp.Regexp{
 		compileDiskReasonTemplate(tooSmallDiskTemplate, ".*", ".*"),
 		compileDiskReasonTemplate(wrongDriveTypeTemplate, ".*", ".*"),
-		compileDiskReasonTemplate(wrongMultipathTypeTemplate, ".*", ".*"),
+		compileDiskReasonTemplate(wrongMultipathTypeTemplate, ".*"),
+		compileDiskReasonTemplate(mixedTypesInMultipath),
+		compileDiskReasonTemplate(diskIsMultipathMember, ".*"),
+		compileDiskReasonTemplate(wrongISCSINetworkTemplate, ".*"),
+		compileDiskReasonTemplate(ErrsInIscsiDisableMultipathInstallation),
+		compileDiskReasonTemplate(iscsiHostIPNotAvailable),
+		compileDiskReasonTemplate(iscsiNetworkInterfaceNotFound),
+		compileDiskReasonTemplate(iscsiHostIPParseErrorTemplate, ".*", ".*"),
 	}
 
 	return &validator{
@@ -108,16 +124,21 @@ func isNvme(name string) bool {
 // it against a list of predicates. Returns all the reasons the disk
 // was found to be not eligible, or an empty slice if it was found to
 // be eligible
-func (v *validator) DiskIsEligible(ctx context.Context, disk *models.Disk, infraEnv *common.InfraEnv, cluster *common.Cluster, host *models.Host, hostArchitecture string, allDisks []*models.Disk) ([]string, error) {
+func (v *validator) DiskIsEligible(ctx context.Context, disk *models.Disk, infraEnv *common.InfraEnv, cluster *common.Cluster, host *models.Host, inventory *models.Inventory) ([]string, error) {
 	var requirements *models.ClusterHostRequirements
 	var err error
 	var clusterVersion string
 	if cluster != nil {
 		requirements, err = v.GetClusterHostRequirements(ctx, cluster, host)
 		clusterVersion = cluster.OpenshiftVersion
+		if common.IsDay2Cluster(cluster) {
+			// infer Openshift version from the infraEnv is case of day2
+			// because cluster.OpenshiftVersion will be empty
+			clusterVersion = infraEnv.OpenshiftVersion
+		}
 	} else {
 		requirements, err = v.GetInfraEnvHostRequirements(ctx, infraEnv)
-		clusterVersion = ""
+		clusterVersion = infraEnv.OpenshiftVersion
 	}
 	if err != nil {
 		return nil, err
@@ -127,39 +148,155 @@ func (v *validator) DiskIsEligible(ctx context.Context, disk *models.Disk, infra
 
 	minSizeBytes := conversions.GbToBytes(requirements.Total.DiskSizeGb)
 	if disk.SizeBytes < minSizeBytes {
+		hasStr := preciseHumanizeBytes(disk.SizeBytes)
+		reqStr := preciseHumanizeBytes(minSizeBytes)
+		if hasStr == reqStr {
+			delta := minSizeBytes - disk.SizeBytes
+			deltaStr := preciseHumanizeBytes(delta)
+			hasStr = fmt.Sprintf("%s (short by %s)", hasStr, deltaStr)
+		}
 		notEligibleReasons = append(notEligibleReasons,
 			fmt.Sprintf(
 				tooSmallDiskTemplate,
-				humanize.Bytes(uint64(disk.SizeBytes)), humanize.Bytes(uint64(minSizeBytes))))
+				hasStr, reqStr))
 	}
 
-	ociPlatformType, err := external.IsOciHost(host)
-	if err != nil {
-		return nil, err
-	}
-	if !v.IsValidStorageDeviceType(disk, hostArchitecture, clusterVersion, ociPlatformType) {
+	hostArchitecture := inventory.CPU.Architecture
+	if !v.IsValidStorageDeviceType(disk, hostArchitecture, clusterVersion) {
 		notEligibleReasons = append(notEligibleReasons,
-			fmt.Sprintf(wrongDriveTypeTemplate, disk.DriveType, strings.Join(v.getValidDeviceStorageTypes(hostArchitecture, clusterVersion, ociPlatformType), ", ")))
+			fmt.Sprintf(wrongDriveTypeTemplate, disk.DriveType, strings.Join(v.getValidDeviceStorageTypes(hostArchitecture, clusterVersion), ", ")))
 	}
 
-	// We only allow multipath if all paths are FC
+	// We do not allow FC or iSCSI disks that are members of a multipath device
+	if disk.DriveType == models.DriveTypeFC || disk.DriveType == models.DriveTypeISCSI {
+		err = hasMultipathHolder(disk, inventory)
+		if err != nil {
+			notEligibleReasons = append(notEligibleReasons, err.Error())
+		}
+	}
+
 	if disk.DriveType == models.DriveTypeMultipath {
-		for _, inventoryDisk := range allDisks {
-			if funk.ContainsString(strings.Split(inventoryDisk.Holders, ","), disk.Name) {
-				if inventoryDisk.DriveType != models.DriveTypeFC {
-					notEligibleReasons = append(notEligibleReasons,
-						fmt.Sprintf(wrongMultipathTypeTemplate, inventoryDisk.DriveType, string(models.DriveTypeFC)))
-					break
+		fcDisks := hostutil.GetDisksOfHolderByType(inventory.Disks, disk, models.DriveTypeFC)
+		iSCSIDisks := hostutil.GetDisksOfHolderByType(inventory.Disks, disk, models.DriveTypeISCSI)
+		// We only allow multipath if all paths are FC/ iSCSI
+		if len(fcDisks) == 0 && len(iSCSIDisks) == 0 {
+			notEligibleReasons = append(notEligibleReasons,
+				fmt.Sprintf(wrongMultipathTypeTemplate, strings.Join([]string{string(models.DriveTypeFC), string(models.DriveTypeISCSI)}, ", ")))
+			// Return since further checks are unnecessary
+			return notEligibleReasons, nil
+		}
+		// We only allow multipath if all paths are of the same type
+		if len(fcDisks) > 0 && len(fcDisks) != len(hostutil.GetAllDisksOfHolder(inventory.Disks, disk)) {
+			notEligibleReasons = append(notEligibleReasons, mixedTypesInMultipath)
+		} else if len(iSCSIDisks) > 0 && len(iSCSIDisks) != len(hostutil.GetAllDisksOfHolder(inventory.Disks, disk)) {
+			notEligibleReasons = append(notEligibleReasons, mixedTypesInMultipath)
+		}
+		for _, iSCSIDisk := range iSCSIDisks {
+			// If errors are detected on iSCSI disks, multipath is not allowed
+			if !lo.Contains(notEligibleReasons, ErrsInIscsiDisableMultipathInstallation) {
+				if iSCSIDisk.DriveType == models.DriveTypeISCSI {
+					// check if iSCSI boot drive is valid
+					isiSCSIValid := v.IsValidStorageDeviceType(iSCSIDisk, hostArchitecture, clusterVersion)
+					// Check if network is configured properly to install on iSCSI boot drive
+					err = v.isISCSINetworkingValid(iSCSIDisk, inventory, cluster)
+					if err != nil || !isiSCSIValid {
+						notEligibleReasons = append(notEligibleReasons, ErrsInIscsiDisableMultipathInstallation)
+					}
 				}
 			}
+		}
+	}
+
+	if disk.DriveType == models.DriveTypeISCSI {
+		// Check if network is configured properly to install on iSCSI boot drive
+		err = v.isISCSINetworkingValid(disk, inventory, cluster)
+		if err != nil {
+			notEligibleReasons = append(notEligibleReasons, err.Error())
 		}
 	}
 
 	return notEligibleReasons, nil
 }
 
-func (v *validator) IsValidStorageDeviceType(disk *models.Disk, hostArchitecture string, openshiftVersion string, ociPlatformType bool) bool {
-	return funk.ContainsString(v.getValidDeviceStorageTypes(hostArchitecture, openshiftVersion, ociPlatformType), string(disk.DriveType))
+// hasMultipathHolder checks if a disk is a member of a multipath volume by
+// looking for multipath devices in its holders list.
+func hasMultipathHolder(disk *models.Disk, inventory *models.Inventory) error {
+	if disk.Holders == "" {
+		return nil
+	}
+
+	multipathDiskNamesMap := make(map[string]struct{})
+	for _, inventoryDisk := range inventory.Disks {
+		if inventoryDisk.DriveType == models.DriveTypeMultipath {
+			multipathDiskNamesMap[inventoryDisk.Name] = struct{}{}
+		}
+	}
+
+	holders := strings.Split(disk.Holders, ",")
+	for _, holder := range holders {
+		if _, exists := multipathDiskNamesMap[holder]; exists {
+			return fmt.Errorf(diskIsMultipathMember, holder)
+		}
+	}
+	return nil
+}
+
+// isISCSINetworkingValid checks that the iSCSI disk is not connected through a
+// NIC the cluster will take over, since installation moves that NIC into br-ex
+// and tears the session down. The machine networks answer this directly; before
+// they are known the default route stands in, but only when the host owns a
+// single one, as a multi-homed host gets one per DHCP lease.
+func (v *validator) isISCSINetworkingValid(disk *models.Disk, inventory *models.Inventory, cluster *common.Cluster) error {
+	// get the IPv4 or the IPv6 of the interface connected to the iSCSI target
+	if disk.Iscsi == nil || disk.Iscsi.HostIPAddress == "" {
+		return errors.New(iscsiHostIPNotAvailable)
+	}
+
+	iSCSIHostIP, err := netip.ParseAddr(disk.Iscsi.HostIPAddress)
+	if err != nil {
+		return fmt.Errorf(iscsiHostIPParseErrorTemplate, disk.Iscsi.HostIPAddress, err)
+	}
+
+	if machineNetworks := network.MachineNetworksOfFamily(cluster, iSCSIHostIP.Is6()); len(machineNetworks) > 0 {
+		for _, machineIpnet := range machineNetworks {
+			if machineIpnet.Contains(net.IP(iSCSIHostIP.AsSlice())) {
+				return fmt.Errorf(wrongISCSINetworkTemplate, iSCSIHostIP.String())
+			}
+		}
+		return nil
+	}
+
+	defaultRoutes := network.GetDefaultRoutesByFamily(inventory.Routes, iSCSIHostIP.Is6())
+	if len(defaultRoutes) != 1 {
+		return nil
+	}
+
+	defaultInterface, ok := lo.Find(inventory.Interfaces, func(i *models.Interface) bool {
+		return i.Name == defaultRoutes[0].Interface
+	})
+	if !ok {
+		return errors.New(iscsiNetworkInterfaceNotFound)
+	}
+
+	// look if one of the IP assigned to the default interface interface
+	// corresponds to the IP used by host to connect on the iSCSI target
+	ips := defaultInterface.IPV4Addresses
+	if iSCSIHostIP.Is6() {
+		ips = defaultInterface.IPV6Addresses
+	}
+	_, ok = lo.Find(ips, func(ip string) bool {
+		prefix, err := netip.ParsePrefix(ip)
+		return err == nil && iSCSIHostIP.Compare(prefix.Addr()) == 0
+	})
+
+	if ok {
+		return fmt.Errorf(wrongISCSINetworkTemplate, iSCSIHostIP.String())
+	}
+	return nil
+}
+
+func (v *validator) IsValidStorageDeviceType(disk *models.Disk, hostArchitecture string, openshiftVersion string) bool {
+	return lo.Contains(v.getValidDeviceStorageTypes(hostArchitecture, openshiftVersion), string(disk.DriveType))
 }
 
 func (v *validator) purgeServiceReasons(reasons []string) []string {
@@ -180,13 +317,19 @@ func (v *validator) purgeServiceReasons(reasons []string) []string {
 }
 
 func (v *validator) ListEligibleDisks(inventory *models.Inventory) []*models.Disk {
-	eligibleDisks := funk.Filter(inventory.Disks, func(disk *models.Disk) bool {
+	eligibleDisks := lo.Filter(inventory.Disks, func(disk *models.Disk, index int) bool {
 		return disk.InstallationEligibility.Eligible
-	}).([]*models.Disk)
+	})
 
-	// Sorting list by size increase
+	// Sorting disks by installation preference
 	sort.Slice(eligibleDisks, func(i, j int) bool {
-		// 1. First, choose non-NVMe drives before NVMe drives (leave
+		// 1. Prefer bootable disks (installing to a non-bootable disk
+		// will result in a failed installation)
+		if eligibleDisks[i].Bootable != eligibleDisks[j].Bootable {
+			return eligibleDisks[i].Bootable
+		}
+
+		// 2. Choose non-NVMe drives before NVMe drives (leave
 		// the faster drives for workload storage)
 		isNvme1 := isNvme(eligibleDisks[i].Name)
 		isNvme2 := isNvme(eligibleDisks[j].Name)
@@ -196,19 +339,19 @@ func (v *validator) ListEligibleDisks(inventory *models.Inventory) []*models.Dis
 			return isNvme2
 		}
 
-		// 2. Sort by DriveType - HDD before SSD (leave the faster
+		// 3. Sort by DriveType - HDD before SSD (leave the faster
 		// drives for workload storage)
 		if v := strings.Compare(string(eligibleDisks[i].DriveType), string(eligibleDisks[j].DriveType)); v != 0 {
 			return v < 0
 		}
 
-		// 3. Sort according to disk size (use the smallest valid
+		// 4. Sort according to disk size (use the smallest valid
 		// disk size to leave more capacity for workload storage)
 		if eligibleDisks[i].SizeBytes != eligibleDisks[j].SizeBytes {
 			return eligibleDisks[i].SizeBytes < eligibleDisks[j].SizeBytes
 		}
 
-		// 4. Sort according to HCTL which indicates physical order
+		// 5. Sort according to HCTL which indicates physical order
 		// (increases the chance of booting from the correct disk
 		// after reboot)
 		return eligibleDisks[i].Hctl < eligibleDisks[j].Hctl
@@ -241,6 +384,10 @@ func (v *validator) GetInfraEnvHostRequirements(ctx context.Context, infraEnv *c
 	if err != nil {
 		return nil, err
 	}
+	arbiterOcpRequirements, err := v.getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv, models.HostRoleArbiter)
+	if err != nil {
+		return nil, err
+	}
 	workerOcpRequirements, err := v.getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv, models.HostRoleWorker)
 	if err != nil {
 		return nil, err
@@ -250,6 +397,9 @@ func (v *validator) GetInfraEnvHostRequirements(ctx context.Context, infraEnv *c
 	if workerOcpRequirements.DiskSizeGb > masterOcpRequirements.DiskSizeGb {
 		requirements = &masterOcpRequirements
 	}
+	if requirements.DiskSizeGb > arbiterOcpRequirements.DiskSizeGb {
+		requirements = &arbiterOcpRequirements
+	}
 
 	return &models.ClusterHostRequirements{
 		HostID:    "",
@@ -257,12 +407,6 @@ func (v *validator) GetInfraEnvHostRequirements(ctx context.Context, infraEnv *c
 		Operators: nil,
 		Total:     requirements,
 	}, nil
-}
-
-func isDiskEncryptionSetWithTpm(c *common.Cluster) bool {
-	return c.DiskEncryption != nil &&
-		swag.StringValue(c.DiskEncryption.EnableOn) != models.DiskEncryptionEnableOnNone &&
-		swag.StringValue(c.DiskEncryption.Mode) == models.DiskEncryptionModeTpmv2
 }
 
 func (v *validator) GetPreflightHardwareRequirements(ctx context.Context, cluster *common.Cluster) (*models.PreflightHardwareRequirements, error) {
@@ -274,17 +418,22 @@ func (v *validator) GetPreflightHardwareRequirements(ctx context.Context, cluste
 	if err != nil {
 		return nil, err
 	}
-	if isDiskEncryptionSetWithTpm(cluster) {
-		switch swag.StringValue(cluster.DiskEncryption.EnableOn) {
-		case models.DiskEncryptionEnableOnAll:
-			ocpRequirements.Master.Quantitative.TpmEnabledInBios = true
-			ocpRequirements.Worker.Quantitative.TpmEnabledInBios = true
-		case models.DiskEncryptionEnableOnMasters:
-			ocpRequirements.Master.Quantitative.TpmEnabledInBios = true
-		case models.DiskEncryptionEnableOnWorkers:
-			ocpRequirements.Worker.Quantitative.TpmEnabledInBios = true
-		default:
+	if common.IsSetWithTpm(cluster.DiskEncryption) {
+		diskEncryption := *cluster.DiskEncryption
+		if !common.EnabledForRole(diskEncryption, models.HostRoleMaster) &&
+			!common.EnabledForRole(diskEncryption, models.HostRoleArbiter) &&
+			!common.EnabledForRole(diskEncryption, models.HostRoleWorker) {
 			return nil, fmt.Errorf("disk-encryption is enabled on non-valid role: %s", swag.StringValue(cluster.DiskEncryption.EnableOn))
+		}
+
+		if common.EnabledForRole(diskEncryption, models.HostRoleMaster) {
+			ocpRequirements.Master.Quantitative.TpmEnabledInBios = true
+		}
+		if common.EnabledForRole(diskEncryption, models.HostRoleArbiter) {
+			ocpRequirements.Arbiter.Quantitative.TpmEnabledInBios = true
+		}
+		if common.EnabledForRole(diskEncryption, models.HostRoleWorker) {
+			ocpRequirements.Worker.Quantitative.TpmEnabledInBios = true
 		}
 	}
 
@@ -354,16 +503,20 @@ func (v *validator) getOCPClusterHostRoleRequirementsForVersion(cluster *common.
 
 	if common.GetEffectiveRole(host) == models.HostRoleMaster {
 		if common.IsSingleNodeCluster(cluster) {
-			return *requirements.SNORequirements, nil
+			return *toClusterHostRequirementsDetails(requirements.SNORequirements), nil
 		}
-		return *requirements.MasterRequirements, nil
+		return *toClusterHostRequirementsDetails(requirements.MasterRequirements), nil
+	}
+
+	if common.GetEffectiveRole(host) == models.HostRoleArbiter {
+		return *toClusterHostRequirementsDetails(requirements.ArbiterRequirements), nil
 	}
 
 	if v.isEdgeWorker(host) {
-		return *requirements.EdgeWorkerRequirements, nil
+		return *toClusterHostRequirementsDetails(requirements.EdgeWorkerRequirements), nil
 	}
 
-	return *requirements.WorkerRequirements, nil
+	return *toClusterHostRequirementsDetails(requirements.WorkerRequirements), nil
 }
 
 // There is no need to fail here, failed to get inventory just return false
@@ -376,7 +529,7 @@ func (v *validator) isEdgeWorker(host *models.Host) bool {
 		return false
 	}
 
-	return funk.Contains(v.edgeWorkersProductList, strings.ToLower(strings.ReplaceAll(inventory.SystemVendor.ProductName, " ", "")))
+	return lo.Contains(v.edgeWorkersProductList, strings.ToLower(strings.ReplaceAll(inventory.SystemVendor.ProductName, " ", "")))
 }
 
 func (v *validator) getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv *common.InfraEnv, role models.HostRole) (models.ClusterHostRequirementsDetails, error) {
@@ -386,10 +539,13 @@ func (v *validator) getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv *commo
 	}
 
 	if role == models.HostRoleMaster {
-		return *requirements.MasterRequirements, nil
+		return *toClusterHostRequirementsDetails(requirements.MasterRequirements), nil
+	}
+	if role == models.HostRoleArbiter {
+		return *toClusterHostRequirementsDetails(requirements.ArbiterRequirements), nil
 	}
 	if role == models.HostRoleWorker || role == models.HostRoleAutoAssign {
-		return *requirements.WorkerRequirements, nil
+		return *toClusterHostRequirementsDetails(requirements.WorkerRequirements), nil
 	}
 	return models.ClusterHostRequirementsDetails{}, fmt.Errorf("Invalid role for host %s", role)
 }
@@ -403,8 +559,11 @@ func (v *validator) getClusterPreflightOCPRequirements(cluster *common.Cluster) 
 		Master: &models.HostTypeHardwareRequirements{
 			Quantitative: v.getMasterRequirements(cluster, requirements),
 		},
+		Arbiter: &models.HostTypeHardwareRequirements{
+			Quantitative: toClusterHostRequirementsDetails(requirements.ArbiterRequirements),
+		},
 		Worker: &models.HostTypeHardwareRequirements{
-			Quantitative: requirements.WorkerRequirements,
+			Quantitative: toClusterHostRequirementsDetails(requirements.WorkerRequirements),
 		},
 	}, nil
 }
@@ -416,37 +575,47 @@ func (v *validator) getInfraEnvPreflightOCPRequirements(infraEnv *common.InfraEn
 	}
 	return &models.HostTypeHardwareRequirementsWrapper{
 		Master: &models.HostTypeHardwareRequirements{
-			Quantitative: requirements.MasterRequirements,
+			Quantitative: toClusterHostRequirementsDetails(requirements.MasterRequirements),
+		},
+		Arbiter: &models.HostTypeHardwareRequirements{
+			Quantitative: toClusterHostRequirementsDetails(requirements.ArbiterRequirements),
 		},
 		Worker: &models.HostTypeHardwareRequirements{
-			Quantitative: requirements.WorkerRequirements,
+			Quantitative: toClusterHostRequirementsDetails(requirements.WorkerRequirements),
 		},
 	}, nil
 }
 
 func (v *validator) getMasterRequirements(cluster *common.Cluster, requirements *models.VersionedHostRequirements) *models.ClusterHostRequirementsDetails {
 	if common.IsSingleNodeCluster(cluster) {
-		return requirements.SNORequirements
+		return toClusterHostRequirementsDetails(requirements.SNORequirements)
 	}
-	return requirements.MasterRequirements
+	return toClusterHostRequirementsDetails(requirements.MasterRequirements)
 }
 
 func (v *validator) getOCPRequirementsForVersion(openshiftVersion string) (*models.VersionedHostRequirements, error) {
 	return v.VersionedRequirements.GetVersionedHostRequirements(openshiftVersion)
 }
 
-func (v *validator) getValidDeviceStorageTypes(hostArchitecture string, openshiftVersion string, ociPlatformType bool) []string {
+func (v *validator) getValidDeviceStorageTypes(hostArchitecture string, openshiftVersion string) []string {
 	validTypes := []string{string(models.DriveTypeHDD), string(models.DriveTypeSSD), string(models.DriveTypeMultipath)}
 
-	if ociPlatformType {
-		isGreater, err := common.BaseVersionGreaterOrEqual("4.15.0", openshiftVersion)
-		if err == nil && isGreater {
-			validTypes = append(validTypes, string(models.DriveTypeISCSI))
-		}
+	isGreater, err := common.BaseVersionGreaterOrEqual("4.14.0", openshiftVersion)
+	if err == nil && isGreater {
+		validTypes = append(validTypes, string(models.DriveTypeRAID))
+	}
+
+	isGreater, err = common.BaseVersionGreaterOrEqual("4.15.0", openshiftVersion)
+	if err == nil && isGreater {
+		validTypes = append(validTypes, string(models.DriveTypeISCSI))
 	}
 
 	if hostArchitecture == models.ClusterCPUArchitectureS390x {
 		validTypes = append(validTypes, string(models.DriveTypeFC), string(models.DriveTypeECKDESE), string(models.DriveTypeECKD), string(models.DriveTypeFBA))
+	}
+
+	if hostArchitecture == models.ClusterCPUArchitectureX8664 {
+		validTypes = append(validTypes, string(models.DriveTypeFC))
 	}
 
 	return validTypes
@@ -458,4 +627,47 @@ func compileDiskReasonTemplate(template string, wildcards ...interface{}) *regex
 		panic(err)
 	}
 	return tmp
+}
+
+// preciseHumanizeBytes formats a byte size using SI units (KB, MB, GB, TB).
+// It displays one decimal place for non-integer values and rounds up to avoid
+// under-reporting the capacity in user-facing messages.
+func preciseHumanizeBytes(bytes int64) string {
+	const (
+		KB = 1000
+		MB = 1000 * KB
+		GB = 1000 * MB
+		TB = 1000 * GB
+	)
+
+	switch {
+	case bytes >= TB:
+		tb := float64(bytes) / float64(TB)
+		return formatUnitRoundedUp(tb, "TB")
+	case bytes >= GB:
+		gb := float64(bytes) / float64(GB)
+		return formatUnitRoundedUp(gb, "GB")
+	case bytes >= MB:
+		mb := float64(bytes) / float64(MB)
+		return formatUnitRoundedUp(mb, "MB")
+	case bytes >= KB:
+		kb := float64(bytes) / float64(KB)
+		return formatUnitRoundedUp(kb, "KB")
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// formatUnitRoundedUp returns either an integer or up to three-decimal string
+// for the given value and unit label, rounding up to the nearest thousandth.
+func formatUnitRoundedUp(value float64, unit string) string {
+	rounded := math.Ceil(value*1000) / 1000
+	if rounded == float64(int64(rounded)) {
+		return fmt.Sprintf("%d %s", int64(rounded), unit)
+	}
+	// Format with 3 decimals then trim trailing zeros and optional dot
+	str := fmt.Sprintf("%.3f", rounded)
+	str = strings.TrimRight(str, "0")
+	str = strings.TrimSuffix(str, ".")
+	return fmt.Sprintf("%s %s", str, unit)
 }
